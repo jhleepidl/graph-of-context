@@ -73,6 +73,10 @@ def summarize_runs(runs: List[Dict[str, Any]], limit: int, dataset_filter: str) 
         print("  temperature:", run.get("temperature"))
         print("  fold_every:", run.get("fold_every"))
         print("  goc_bundle_size:", run.get("goc_bundle_size"))
+        print("  goc_top_k:", run.get("goc_top_k"))
+        print("  goc_embed_model:", run.get("goc_embed_model"))
+        if "goc_end_of_thought_token" in run:
+            print("  goc_end_of_thought_token:", run.get("goc_end_of_thought_token"))
         print("  metrics:")
         metrics = run.get("metrics", {})
         for agent_name, agent_metric in metrics.items():

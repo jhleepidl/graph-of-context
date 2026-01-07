@@ -7,19 +7,36 @@ ReAct, AgentFold, Context-Folding, and GoC.
 
 import argparse
 import json
+import math
 import os
 import random
-import re
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
+from sentence_transformers import SentenceTransformer
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
 DATASET_DEFAULT = "graph_needle_test.jsonl"
 RESULTS_DEFAULT = "experiment_goc_runs.jsonl"
+DEFAULT_EMBED_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_EOT_TOKEN = "<end_of_thought>"
+MAX_ACTIVE_NODES = 5
+FOLD_GROUP_MIN = 2
+FOLD_GROUP_MAX = 3
+RETRY_MAX_ATTEMPTS = 5
+RETRY_MIN_SECONDS = 1
+RETRY_MAX_SECONDS = 20
 
 SYSTEM_PROMPT = (
     "You are a careful assistant. When asked for the key, respond with only "
@@ -31,8 +48,8 @@ FOLD_SUMMARY_PROMPT = (
 )
 
 GOC_SYSTEM_PROMPT = (
-    "You are a careful assistant. If the key is not visible, respond with "
-    "REQUEST_RETRIEVAL: KEY. Otherwise answer with only the exact key string."
+    "You are a careful assistant. When asked for the key, respond with only "
+    "the exact key string, e.g., KEY_1234."
 )
 
 
@@ -168,13 +185,30 @@ class LLMClient:
         self.model = model
         self.temperature = temperature
 
-    def chat(self, messages: List[Dict[str, Any]], max_tokens: int) -> Dict[str, Any]:
-        response = self.client.chat.completions.create(
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(RETRY_MAX_ATTEMPTS),
+        wait=wait_exponential(min=RETRY_MIN_SECONDS, max=RETRY_MAX_SECONDS),
+        retry=retry_if_exception_type(
+            (
+                APIError,
+                APIConnectionError,
+                APITimeoutError,
+                InternalServerError,
+                RateLimitError,
+            )
+        ),
+    )
+    def _chat_with_retry(self, messages: List[Dict[str, Any]], max_tokens: int):
+        return self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=self.temperature,
             max_tokens=max_tokens,
         )
+
+    def chat(self, messages: List[Dict[str, Any]], max_tokens: int) -> Dict[str, Any]:
+        response = self._chat_with_retry(messages, max_tokens)
         content = response.choices[0].message.content.strip()
         usage = getattr(response, "usage", None)
         usage_data = {
@@ -310,68 +344,237 @@ class BaselineContextFolding(AgentBase):
 @dataclass
 class SuperNode:
     node_id: str
+    level: int
     summary: str
     messages: List[Dict[str, Any]]
+    embedding: List[float]
+    children: List[str]
 
 
 class GoCAgent(AgentBase):
     name = "Ours_GoC"
 
-    def __init__(self, llm: LLMClient, bundle_size: int = 10) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        bundle_size: int = MAX_ACTIVE_NODES,
+        top_k: int = 2,
+        embed_model: str = DEFAULT_EMBED_MODEL,
+        end_of_thought_token: str = DEFAULT_EOT_TOKEN,
+    ) -> None:
         super().__init__(llm)
-        self.bundle_size = bundle_size
-        self.buffer: List[Dict[str, Any]] = []
-        self.supernodes: List[SuperNode] = []
+        self.max_active_nodes = bundle_size
+        self.top_k = top_k
+        self.embedder = SentenceTransformer(embed_model)
+        self.end_of_thought_token = end_of_thought_token
+        self.nodes: List[SuperNode] = []
+        self.active_nodes: List[SuperNode] = []
+        self.unfolded_nodes: set[str] = set()
 
     def reset(self) -> None:
         super().reset()
-        self.buffer = []
-        self.supernodes = []
+        self.nodes = []
+        self.active_nodes = []
+        self.unfolded_nodes = set()
 
     def add_step(self, content: str) -> None:
-        self.buffer.append({"role": "assistant", "content": content})
-        if len(self.buffer) >= self.bundle_size:
-            self._encapsulate_buffer()
+        segments = [content]
+        if self.end_of_thought_token:
+            segments = content.split(self.end_of_thought_token)
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                continue
+            node = self._create_leaf_node(segment)
+            self.nodes.append(node)
+            self.active_nodes.append(node)
+            self._fold_if_needed()
 
     def finalize(self) -> None:
-        if self.buffer:
-            self._encapsulate_buffer()
-
-    def _encapsulate_buffer(self) -> None:
-        # Topological Encapsulation: hide raw steps inside a SuperNode.
-        node_id = str(uuid.uuid4())
-        node_messages = list(self.buffer)
-        summary = f"Processed {len(node_messages)} steps"
-        self.supernodes.append(SuperNode(node_id=node_id, summary=summary, messages=node_messages))
-        self.history.append({"role": "assistant", "content": f"[SuperNode:{summary}]"})
-        self.buffer = []
-
-    def _retrieve_from_supernodes(self, query: str) -> Optional[Dict[str, Any]]:
-        if "KEY" not in query.upper():
-            return None
-        key_pattern = re.compile(r"KEY_\d+")
-        for node in self.supernodes:
-            for msg in node.messages:
-                match = key_pattern.search(msg.get("content", ""))
-                if match:
-                    return {"role": "assistant", "content": msg["content"]}
         return None
 
+    def _create_leaf_node(self, content: str) -> SuperNode:
+        messages = [{"role": "assistant", "content": content}]
+        summary = self._summarize_messages(messages)
+        embedding = self._embed_text(summary)
+        return SuperNode(
+            node_id=str(uuid.uuid4()),
+            level=0,
+            summary=summary,
+            messages=messages,
+            embedding=embedding,
+            children=[],
+        )
+
+    def _create_parent_node(self, level: int, children: List[SuperNode]) -> SuperNode:
+        combined_messages: List[Dict[str, Any]] = []
+        for child in children:
+            combined_messages.extend(child.messages)
+        summary = self._summarize_nodes(children, level)
+        embedding = self._embed_text(summary)
+        return SuperNode(
+            node_id=str(uuid.uuid4()),
+            level=level,
+            summary=summary,
+            messages=combined_messages,
+            embedding=embedding,
+            children=[child.node_id for child in children],
+        )
+
+    def _fold_if_needed(self) -> None:
+        if len(self.active_nodes) <= self.max_active_nodes:
+            return
+        folded = True
+        while len(self.active_nodes) > self.max_active_nodes and folded:
+            folded = self._fold_oldest_level(0, new_level=1)
+        self._fold_level1_if_needed()
+
+    def _fold_level1_if_needed(self) -> None:
+        while self._count_level(1) > self.max_active_nodes:
+            if not self._fold_oldest_level(1, new_level=2):
+                break
+
+    def _fold_oldest_level(self, level: int, new_level: int) -> bool:
+        indices = [i for i, node in enumerate(self.active_nodes) if node.level == level]
+        if len(indices) < FOLD_GROUP_MIN:
+            return False
+        group_size = min(FOLD_GROUP_MAX, len(indices))
+        selected_indices = indices[:group_size]
+        selected_nodes = [self.active_nodes[i] for i in selected_indices]
+        insert_at = selected_indices[0]
+        for idx in reversed(selected_indices):
+            self.active_nodes.pop(idx)
+        # Topological Encapsulation: fold older cycles into a higher-level node.
+        parent = self._create_parent_node(new_level, selected_nodes)
+        self.nodes.append(parent)
+        self.active_nodes.insert(insert_at, parent)
+        return True
+
+    def _count_level(self, level: int) -> int:
+        return sum(1 for node in self.active_nodes if node.level == level)
+
+    def _summarize_messages(self, messages: List[Dict[str, Any]]) -> str:
+        tools = []
+        saw_clue = False
+        for msg in messages:
+            content = msg.get("content", "")
+            if content.startswith("Tool "):
+                parts = content.split()
+                if len(parts) >= 2:
+                    tool_name = parts[1]
+                    tools.append(tool_name)
+                    if tool_name == "get_initial_clue":
+                        saw_clue = True
+        tools = tools[:5]
+        tool_list = ", ".join(tools) if tools else "none"
+        if saw_clue:
+            return (
+                f"Processed {len(messages)} steps; obtained a key clue; tools: {tool_list}"
+            )
+        return f"Processed {len(messages)} steps; tools: {tool_list}"
+
+    def _summarize_nodes(self, nodes: List[SuperNode], level: int) -> str:
+        saw_clue = any("key clue" in node.summary for node in nodes)
+        label = "SuperNode" if level == 1 else f"HyperNode L{level}"
+        if saw_clue:
+            return f"{label} of {len(nodes)} cycles; contains key clue"
+        return f"{label} of {len(nodes)} cycles"
+
+    def _embed_text(self, text: str) -> List[float]:
+        embedding = self.embedder.encode(text)
+        return embedding.tolist()
+
+    def _cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
+        dot = sum(a * b for a, b in zip(vec_a, vec_b))
+        norm_a = math.sqrt(sum(a * a for a in vec_a))
+        norm_b = math.sqrt(sum(b * b for b in vec_b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def _select_top_k_nodes(self, query: str) -> List[SuperNode]:
+        if not self.nodes:
+            return []
+        query_embedding = self._embed_text(query)
+        scored = []
+        for node in self.nodes:
+            if node.node_id in self.unfolded_nodes:
+                continue
+            score = self._cosine_similarity(query_embedding, node.embedding)
+            scored.append((score, node))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [node for _, node in scored[: self.top_k]]
+
+    def _build_node_markers(self, nodes: List[SuperNode]) -> List[Dict[str, Any]]:
+        markers = []
+        for node in nodes:
+            markers.append(
+                {"role": "assistant", "content": f"[Node L{node.level}:{node.summary}]"}
+            )
+        return markers
+
+    def _build_unfold_messages(self, nodes: List[SuperNode]) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+        for node in nodes:
+            if node.node_id in self.unfolded_nodes:
+                continue
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"[Node Unfold L{node.level}:{node.summary}]",
+                }
+            )
+            messages.extend(node.messages)
+            self.unfolded_nodes.add(node.node_id)
+        return messages
+
+    def _inject_before_last_user(
+        self,
+        base_messages: List[Dict[str, Any]],
+        extra_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not extra_messages:
+            return base_messages
+        for index in range(len(base_messages) - 1, -1, -1):
+            if base_messages[index].get("role") == "user":
+                return (
+                    base_messages[:index]
+                    + extra_messages
+                    + base_messages[index:]
+                )
+        return base_messages + extra_messages
+
+    def _build_context_messages(
+        self,
+        extra_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        base_messages = list(self.history)
+        node_markers = self._build_node_markers(self.active_nodes)
+        return self._inject_before_last_user(
+            base_messages,
+            node_markers + extra_messages,
+        )
+
+    def _latest_user_query(self) -> Optional[str]:
+        for msg in reversed(self.history):
+            if msg.get("role") == "user":
+                return msg.get("content", "")
+        return None
+
+    def get_visible_messages(self) -> List[Dict[str, Any]]:
+        return self._build_context_messages([])
+
     def answer(self) -> str:
-        messages = self.get_visible_messages()
-        first_result = self.llm.chat(messages, max_tokens=32)
-        first_response = first_result["content"]
-        if first_response.startswith("REQUEST_RETRIEVAL"):
-            retrieved = self._retrieve_from_supernodes(first_response)
-            if retrieved:
-                messages.append(retrieved)
-                second_result = self.llm.chat(messages, max_tokens=32)
-                prompt_tokens = second_result["usage"]["prompt_tokens"]
-                self.last_prompt_tokens = prompt_tokens or estimate_tokens(messages)
-                return second_result["content"]
-        prompt_tokens = first_result["usage"]["prompt_tokens"]
+        query = self._latest_user_query()
+        unfold_messages: List[Dict[str, Any]] = []
+        if query:
+            top_nodes = self._select_top_k_nodes(query)
+            unfold_messages = self._build_unfold_messages(top_nodes)
+        messages = self._build_context_messages(unfold_messages)
+        result = self.llm.chat(messages, max_tokens=32)
+        prompt_tokens = result["usage"]["prompt_tokens"]
         self.last_prompt_tokens = prompt_tokens or estimate_tokens(messages)
-        return first_response
+        return result["content"]
 
 
 def load_dataset(path: str) -> List[Dict[str, Any]]:
@@ -429,6 +632,9 @@ def run_experiment(
     temperature: float,
     fold_every: int,
     goc_bundle_size: int,
+    goc_top_k: int,
+    goc_embed_model: str,
+    goc_end_of_thought_token: str,
 ) -> Dict[str, Any]:
     cases = load_dataset(dataset_path)
     llm = LLMClient(model=model, temperature=temperature)
@@ -436,7 +642,13 @@ def run_experiment(
         BaselineReAct(llm),
         BaselineAgentFold(llm, fold_every=fold_every),
         BaselineContextFolding(llm),
-        GoCAgent(llm, bundle_size=goc_bundle_size),
+        GoCAgent(
+            llm,
+            bundle_size=goc_bundle_size,
+            top_k=goc_top_k,
+            embed_model=goc_embed_model,
+            end_of_thought_token=goc_end_of_thought_token,
+        ),
     ]
 
     results = {agent.name: {"correct": 0, "prompt_tokens": []} for agent in agents}
@@ -469,6 +681,9 @@ def run_experiment(
         "temperature": temperature,
         "fold_every": fold_every,
         "goc_bundle_size": goc_bundle_size,
+        "goc_top_k": goc_top_k,
+        "goc_embed_model": goc_embed_model,
+        "goc_end_of_thought_token": goc_end_of_thought_token,
         "metrics": metrics,
         "per_case": per_case,
     }
@@ -507,7 +722,10 @@ def main() -> None:
     run_parser.add_argument("--model", default="gpt-4o-mini")
     run_parser.add_argument("--temperature", type=float, default=0.2)
     run_parser.add_argument("--fold-every", type=int, default=5)
-    run_parser.add_argument("--goc-bundle-size", type=int, default=10)
+    run_parser.add_argument("--goc-bundle-size", type=int, default=MAX_ACTIVE_NODES)
+    run_parser.add_argument("--goc-top-k", type=int, default=2)
+    run_parser.add_argument("--goc-embed-model", default=DEFAULT_EMBED_MODEL)
+    run_parser.add_argument("--goc-eot-token", default=DEFAULT_EOT_TOKEN)
 
     args = parser.parse_args()
 
@@ -531,6 +749,9 @@ def main() -> None:
         temperature=args.temperature,
         fold_every=args.fold_every,
         goc_bundle_size=args.goc_bundle_size,
+        goc_top_k=args.goc_top_k,
+        goc_embed_model=args.goc_embed_model,
+        goc_end_of_thought_token=args.goc_eot_token,
     )
     append_results(args.results, run_data)
     print("Run complete. Metrics:")
