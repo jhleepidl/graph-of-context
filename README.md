@@ -68,20 +68,23 @@ Implemented in `experiment_goc.py`:
 - **Baseline_ContextFolding**: branches haystack steps and keeps only a branch return.
 - **Ours_GoC**: hierarchical folding + embedding-based retrieval.
 
-### GoC hierarchical folding (B-tree style)
-GoC maintains a list of active nodes (visible in context) and folds only after
-a completed Reasoning-Act-Observe cycle:
+### GoC recursive graph + task-driven clustering
+GoC maintains a recursive graph of context (L0 → L1 → L2 …) with task-driven
+merging and chronological rendering:
 - `MAX_ACTIVE_NODES = 5` (configurable via `--goc-bundle-size`)
-- When active nodes exceed the limit, the oldest 2-3 cycles are folded into a
-  Level-1 SuperNode.
-- If too many Level-1 nodes accumulate, they are folded into Level-2 HyperNodes.
+- Each step increments a global counter; nodes track `min_step`, `max_step`,
+  and `level` for timeline ordering.
+- New steps merge into the latest active node when dependency is high:
+  entity reuse (numbers/IDs/quotes), rare-noun overlap, and embedding cosine.
+- When active nodes exceed the limit, a bottom-up recursive fold groups adjacent
+  low-dependency nodes into higher-level SuperNodes (heterogeneous children).
 
 Each node stores:
-- `summary` + vector embedding (sentence-transformers)
-- full raw messages for later “unfold”
+- append-only `summary` + vector embedding (sentence-transformers)
+- full raw messages for visual “unfold” during rendering
 
-When the user asks a question, GoC embeds the query, retrieves top-k relevant
-nodes, and unfolds them into context before answering.
+When answering, GoC retrieves top-k relevant active nodes, visually unfolds
+them, then renders all nodes in chronological order before calling the LLM.
 
 ## Key CLI flags
 Run:
