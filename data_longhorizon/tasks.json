@@ -1,0 +1,185 @@
+[
+  {
+    "id": "TASK_0000",
+    "question": "You must use evidence from opened pages.\nGiven these projects: Project_0049, Project_0099, Project_0030, Project_0123, Project_0085, Project_0062, Project_0118, Project_0090, Project_0000, Project_0088, Project_0063, Project_0022.\nStep 1) Select projects whose code_name starts with 'Codename_H'.\nStep 2) Among the selected projects, choose the one with the largest key_number, and report its headquarters.\nAnswer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0049",
+      "Project_0099",
+      "Project_0030",
+      "Project_0123",
+      "Project_0085",
+      "Project_0062",
+      "Project_0118",
+      "Project_0090",
+      "Project_0000",
+      "Project_0088",
+      "Project_0063",
+      "Project_0022"
+    ],
+    "required": [
+      "code_name",
+      "key_number",
+      "headquarters"
+    ],
+    "answer": "Project_0085 | City_41",
+    "gold_docids": [
+      "D_TRUTH_0049",
+      "D_TRUTH_0099",
+      "D_TRUTH_0030",
+      "D_TRUTH_0123",
+      "D_TRUTH_0085",
+      "D_TRUTH_0062",
+      "D_TRUTH_0118",
+      "D_TRUTH_0090",
+      "D_TRUTH_0000",
+      "D_TRUTH_0088",
+      "D_TRUTH_0063",
+      "D_TRUTH_0022"
+    ],
+    "task_type": "two_phase"
+  },
+  {
+    "id": "TASK_0001",
+    "question": "You must use evidence from opened pages.\nGiven these projects: Project_0041, Project_0039, Project_0137, Project_0087, Project_0097, Project_0103, Project_0033, Project_0111, Project_0113, Project_0123, Project_0024, Project_0030.\nStep 1) Select projects whose code_name starts with 'Codename_E'.\nStep 2) Among the selected projects, choose the one with the largest key_number, and report its headquarters.\nAnswer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0041",
+      "Project_0039",
+      "Project_0137",
+      "Project_0087",
+      "Project_0097",
+      "Project_0103",
+      "Project_0033",
+      "Project_0111",
+      "Project_0113",
+      "Project_0123",
+      "Project_0024",
+      "Project_0030"
+    ],
+    "required": [
+      "code_name",
+      "key_number",
+      "headquarters"
+    ],
+    "answer": "Project_0041 | City_42",
+    "gold_docids": [
+      "D_TRUTH_0041",
+      "D_TRUTH_0039",
+      "D_TRUTH_0137",
+      "D_TRUTH_0087",
+      "D_TRUTH_0097",
+      "D_TRUTH_0103",
+      "D_TRUTH_0033",
+      "D_TRUTH_0111",
+      "D_TRUTH_0113",
+      "D_TRUTH_0123",
+      "D_TRUTH_0024",
+      "D_TRUTH_0030"
+    ],
+    "task_type": "two_phase"
+  },
+  {
+    "id": "TASK_0002",
+    "question": "You must use evidence from opened pages.\nGiven these projects: Project_0018, Project_0017, Project_0063, Project_0056, Project_0130, Project_0015, Project_0061, Project_0006, Project_0005, Project_0026, Project_0010, Project_0028.\nStep 1) Select projects whose code_name starts with 'Codename_J'.\nStep 2) Among the selected projects, choose the one with the largest key_number, and report its headquarters.\nAnswer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0018",
+      "Project_0017",
+      "Project_0063",
+      "Project_0056",
+      "Project_0130",
+      "Project_0015",
+      "Project_0061",
+      "Project_0006",
+      "Project_0005",
+      "Project_0026",
+      "Project_0010",
+      "Project_0028"
+    ],
+    "required": [
+      "code_name",
+      "key_number",
+      "headquarters"
+    ],
+    "answer": "Project_0056 | City_22",
+    "gold_docids": [
+      "D_TRUTH_0018",
+      "D_TRUTH_0017",
+      "D_TRUTH_0063",
+      "D_TRUTH_0056",
+      "D_TRUTH_0130",
+      "D_TRUTH_0015",
+      "D_TRUTH_0061",
+      "D_TRUTH_0006",
+      "D_TRUTH_0005",
+      "D_TRUTH_0026",
+      "D_TRUTH_0010",
+      "D_TRUTH_0028"
+    ],
+    "task_type": "two_phase"
+  },
+  {
+    "id": "TASK_0003",
+    "question": "You must use evidence from opened pages.\nGiven these projects: Project_0031, Project_0052, Project_0053, Project_0029, Project_0078, Project_0005, Project_0082, Project_0084, Project_0074, Project_0097, Project_0039, Project_0018.\nStep 1) Select projects whose code_name starts with 'Codename_M'.\nStep 2) Among the selected projects, choose the one with the largest key_number, and report its headquarters.\nAnswer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0031",
+      "Project_0052",
+      "Project_0053",
+      "Project_0029",
+      "Project_0078",
+      "Project_0005",
+      "Project_0082",
+      "Project_0084",
+      "Project_0074",
+      "Project_0097",
+      "Project_0039",
+      "Project_0018"
+    ],
+    "required": [
+      "code_name",
+      "key_number",
+      "headquarters"
+    ],
+    "answer": "Project_0074 | City_22",
+    "gold_docids": [
+      "D_TRUTH_0031",
+      "D_TRUTH_0052",
+      "D_TRUTH_0053",
+      "D_TRUTH_0029",
+      "D_TRUTH_0078",
+      "D_TRUTH_0005",
+      "D_TRUTH_0082",
+      "D_TRUTH_0084",
+      "D_TRUTH_0074",
+      "D_TRUTH_0097",
+      "D_TRUTH_0039",
+      "D_TRUTH_0018"
+    ],
+    "task_type": "two_phase"
+  },
+  {
+    "id": "TASK_0004",
+    "question": "You must use evidence from opened pages.\nStart from Project_0041. Open its OFFICIAL PROFILE and read the 'related_projects' list. Follow the chain for 5 hops by taking the FIRST listed related project each time.\nAmong all visited projects (including the start), which has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0041",
+      "Project_0125",
+      "Project_0097",
+      "Project_0108",
+      "Project_0119",
+      "Project_0054"
+    ],
+    "required": [
+      "related_projects",
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0054 | City_41",
+    "gold_docids": [
+      "D_TRUTH_0041",
+      "D_TRUTH_0125",
+      "D_TRUTH_0097",
+      "D_TRUTH_0108",
+      "D_TRUTH_0119",
+      "D_TRUTH_0054"
+    ],
+    "task_type": "hop"
+  }
+]

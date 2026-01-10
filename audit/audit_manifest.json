@@ -1,0 +1,7 @@
+{
+  "source_master": "sweeps_stage1/sweep_summary_synthetic_browsecomp_llm_20260109_200742.jsonl",
+  "selected_run_id": "20260109_200742_003",
+  "selected_results": "sweeps_stage1/20260109_200742_003/llm_results.jsonl",
+  "n_selected": 30,
+  "out_data_dir": "audit/data_audit"
+}

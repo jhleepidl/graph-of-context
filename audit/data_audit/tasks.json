@@ -1,0 +1,572 @@
+[
+  {
+    "id": "TASK_0000",
+    "question": "Given Project_0006, Project_0040, and Project_0043, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0006",
+      "Project_0040",
+      "Project_0043"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0040 | City_43",
+    "gold_docids": [
+      "D_TRUTH_0006",
+      "D_TRUTH_0040",
+      "D_TRUTH_0043"
+    ]
+  },
+  {
+    "id": "TASK_0001",
+    "question": "Given Project_0029, Project_0043, and Project_0055, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0029",
+      "Project_0043",
+      "Project_0055"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0043 | City_23",
+    "gold_docids": [
+      "D_TRUTH_0029",
+      "D_TRUTH_0043",
+      "D_TRUTH_0055"
+    ]
+  },
+  {
+    "id": "TASK_0002",
+    "question": "Given Project_0072, Project_0045, and Project_0053, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0072",
+      "Project_0045",
+      "Project_0053"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0053 | City_22",
+    "gold_docids": [
+      "D_TRUTH_0072",
+      "D_TRUTH_0045",
+      "D_TRUTH_0053"
+    ]
+  },
+  {
+    "id": "TASK_0003",
+    "question": "Given Project_0021, Project_0007, and Project_0079, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0021",
+      "Project_0007",
+      "Project_0079"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0079 | City_4",
+    "gold_docids": [
+      "D_TRUTH_0021",
+      "D_TRUTH_0007",
+      "D_TRUTH_0079"
+    ]
+  },
+  {
+    "id": "TASK_0004",
+    "question": "Given Project_0025, Project_0071, and Project_0020, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0025",
+      "Project_0071",
+      "Project_0020"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0025 | City_51",
+    "gold_docids": [
+      "D_TRUTH_0025",
+      "D_TRUTH_0071",
+      "D_TRUTH_0020"
+    ]
+  },
+  {
+    "id": "TASK_0005",
+    "question": "Given Project_0003, Project_0033, and Project_0045, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0003",
+      "Project_0033",
+      "Project_0045"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0045 | City_18",
+    "gold_docids": [
+      "D_TRUTH_0003",
+      "D_TRUTH_0033",
+      "D_TRUTH_0045"
+    ]
+  },
+  {
+    "id": "TASK_0006",
+    "question": "Given Project_0043, Project_0026, and Project_0070, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0043",
+      "Project_0026",
+      "Project_0070"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0043 | City_23",
+    "gold_docids": [
+      "D_TRUTH_0043",
+      "D_TRUTH_0026",
+      "D_TRUTH_0070"
+    ]
+  },
+  {
+    "id": "TASK_0007",
+    "question": "Given Project_0013, Project_0016, and Project_0008, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0013",
+      "Project_0016",
+      "Project_0008"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0008 | City_60",
+    "gold_docids": [
+      "D_TRUTH_0013",
+      "D_TRUTH_0016",
+      "D_TRUTH_0008"
+    ]
+  },
+  {
+    "id": "TASK_0008",
+    "question": "Given Project_0061, Project_0006, and Project_0044, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0061",
+      "Project_0006",
+      "Project_0044"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0006 | City_16",
+    "gold_docids": [
+      "D_TRUTH_0061",
+      "D_TRUTH_0006",
+      "D_TRUTH_0044"
+    ]
+  },
+  {
+    "id": "TASK_0010",
+    "question": "Given Project_0056, Project_0032, and Project_0048, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0056",
+      "Project_0032",
+      "Project_0048"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0048 | City_17",
+    "gold_docids": [
+      "D_TRUTH_0056",
+      "D_TRUTH_0032",
+      "D_TRUTH_0048"
+    ]
+  },
+  {
+    "id": "TASK_0011",
+    "question": "Given Project_0014, Project_0030, and Project_0029, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0014",
+      "Project_0030",
+      "Project_0029"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0014 | City_10",
+    "gold_docids": [
+      "D_TRUTH_0014",
+      "D_TRUTH_0030",
+      "D_TRUTH_0029"
+    ]
+  },
+  {
+    "id": "TASK_0012",
+    "question": "Given Project_0069, Project_0073, and Project_0014, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0069",
+      "Project_0073",
+      "Project_0014"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0014 | City_10",
+    "gold_docids": [
+      "D_TRUTH_0069",
+      "D_TRUTH_0073",
+      "D_TRUTH_0014"
+    ]
+  },
+  {
+    "id": "TASK_0013",
+    "question": "Given Project_0024, Project_0021, and Project_0019, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0024",
+      "Project_0021",
+      "Project_0019"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0019 | City_56",
+    "gold_docids": [
+      "D_TRUTH_0024",
+      "D_TRUTH_0021",
+      "D_TRUTH_0019"
+    ]
+  },
+  {
+    "id": "TASK_0015",
+    "question": "Given Project_0028, Project_0004, and Project_0044, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0028",
+      "Project_0004",
+      "Project_0044"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0004 | City_38",
+    "gold_docids": [
+      "D_TRUTH_0028",
+      "D_TRUTH_0004",
+      "D_TRUTH_0044"
+    ]
+  },
+  {
+    "id": "TASK_0016",
+    "question": "Given Project_0054, Project_0041, and Project_0009, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0054",
+      "Project_0041",
+      "Project_0009"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0054 | City_41",
+    "gold_docids": [
+      "D_TRUTH_0054",
+      "D_TRUTH_0041",
+      "D_TRUTH_0009"
+    ]
+  },
+  {
+    "id": "TASK_0018",
+    "question": "Given Project_0035, Project_0074, and Project_0038, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0035",
+      "Project_0074",
+      "Project_0038"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0035 | City_31",
+    "gold_docids": [
+      "D_TRUTH_0035",
+      "D_TRUTH_0074",
+      "D_TRUTH_0038"
+    ]
+  },
+  {
+    "id": "TASK_0020",
+    "question": "Given Project_0015, Project_0018, and Project_0014, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0015",
+      "Project_0018",
+      "Project_0014"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0018 | City_22",
+    "gold_docids": [
+      "D_TRUTH_0015",
+      "D_TRUTH_0018",
+      "D_TRUTH_0014"
+    ]
+  },
+  {
+    "id": "TASK_0021",
+    "question": "Given Project_0050, Project_0012, and Project_0060, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0050",
+      "Project_0012",
+      "Project_0060"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0012 | City_50",
+    "gold_docids": [
+      "D_TRUTH_0050",
+      "D_TRUTH_0012",
+      "D_TRUTH_0060"
+    ]
+  },
+  {
+    "id": "TASK_0022",
+    "question": "Given Project_0046, Project_0033, and Project_0036, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0046",
+      "Project_0033",
+      "Project_0036"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0046 | City_35",
+    "gold_docids": [
+      "D_TRUTH_0046",
+      "D_TRUTH_0033",
+      "D_TRUTH_0036"
+    ]
+  },
+  {
+    "id": "TASK_0023",
+    "question": "Given Project_0028, Project_0077, and Project_0006, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0028",
+      "Project_0077",
+      "Project_0006"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0077 | City_50",
+    "gold_docids": [
+      "D_TRUTH_0028",
+      "D_TRUTH_0077",
+      "D_TRUTH_0006"
+    ]
+  },
+  {
+    "id": "TASK_0024",
+    "question": "Given Project_0003, Project_0065, and Project_0023, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0003",
+      "Project_0065",
+      "Project_0023"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0023 | City_50",
+    "gold_docids": [
+      "D_TRUTH_0003",
+      "D_TRUTH_0065",
+      "D_TRUTH_0023"
+    ]
+  },
+  {
+    "id": "TASK_0026",
+    "question": "Given Project_0039, Project_0029, and Project_0010, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0039",
+      "Project_0029",
+      "Project_0010"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0029 | City_48",
+    "gold_docids": [
+      "D_TRUTH_0039",
+      "D_TRUTH_0029",
+      "D_TRUTH_0010"
+    ]
+  },
+  {
+    "id": "TASK_0028",
+    "question": "Given Project_0009, Project_0067, and Project_0066, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0009",
+      "Project_0067",
+      "Project_0066"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0067 | City_39",
+    "gold_docids": [
+      "D_TRUTH_0009",
+      "D_TRUTH_0067",
+      "D_TRUTH_0066"
+    ]
+  },
+  {
+    "id": "TASK_0029",
+    "question": "Given Project_0019, Project_0007, and Project_0015, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0019",
+      "Project_0007",
+      "Project_0015"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0019 | City_56",
+    "gold_docids": [
+      "D_TRUTH_0019",
+      "D_TRUTH_0007",
+      "D_TRUTH_0015"
+    ]
+  },
+  {
+    "id": "TASK_0030",
+    "question": "Given Project_0048, Project_0031, and Project_0019, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0048",
+      "Project_0031",
+      "Project_0019"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0048 | City_17",
+    "gold_docids": [
+      "D_TRUTH_0048",
+      "D_TRUTH_0031",
+      "D_TRUTH_0019"
+    ]
+  },
+  {
+    "id": "TASK_0031",
+    "question": "Given Project_0059, Project_0052, and Project_0016, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0059",
+      "Project_0052",
+      "Project_0016"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0059 | City_38",
+    "gold_docids": [
+      "D_TRUTH_0059",
+      "D_TRUTH_0052",
+      "D_TRUTH_0016"
+    ]
+  },
+  {
+    "id": "TASK_0033",
+    "question": "Given Project_0009, Project_0068, and Project_0039, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0009",
+      "Project_0068",
+      "Project_0039"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0068 | City_31",
+    "gold_docids": [
+      "D_TRUTH_0009",
+      "D_TRUTH_0068",
+      "D_TRUTH_0039"
+    ]
+  },
+  {
+    "id": "TASK_0034",
+    "question": "Given Project_0053, Project_0047, and Project_0039, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0053",
+      "Project_0047",
+      "Project_0039"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0053 | City_22",
+    "gold_docids": [
+      "D_TRUTH_0053",
+      "D_TRUTH_0047",
+      "D_TRUTH_0039"
+    ]
+  },
+  {
+    "id": "TASK_0035",
+    "question": "Given Project_0052, Project_0025, and Project_0026, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0052",
+      "Project_0025",
+      "Project_0026"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0025 | City_51",
+    "gold_docids": [
+      "D_TRUTH_0052",
+      "D_TRUTH_0025",
+      "D_TRUTH_0026"
+    ]
+  },
+  {
+    "id": "TASK_0036",
+    "question": "Given Project_0021, Project_0039, and Project_0075, which project has the earliest start_year, and what is its headquarters? Answer exactly as '<ProjectName> | <Headquarters>'.",
+    "entities": [
+      "Project_0021",
+      "Project_0039",
+      "Project_0075"
+    ],
+    "required": [
+      "start_year",
+      "headquarters"
+    ],
+    "answer": "Project_0075 | City_24",
+    "gold_docids": [
+      "D_TRUTH_0021",
+      "D_TRUTH_0039",
+      "D_TRUTH_0075"
+    ]
+  }
+]
