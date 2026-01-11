@@ -1,10 +1,11 @@
 __pycache__/
 *.pyc
-data/
+data*/
 results.jsonl
 report.md
 llm_results.jsonl
 llm_report.md
 .env
 sweep*/
-config/
+sweep_*.json
+failure_report/

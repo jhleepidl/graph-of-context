@@ -84,6 +84,10 @@ def _classify_one(row: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     invalid_blocks = int(ts.get("finish_invalid_project_blocked") or 0)
     premature_blocks = int(ts.get("premature_finish_blocked") or 0)
     salvaged = int(ts.get("finish_answer_salvaged") or 0)
+    cand_first = int(ts.get("candidate_first_overrides") or 0)
+    cyc_break = int(ts.get("search_cycle_break_overrides") or 0)
+    a_unfold_calls = int(ts.get("adaptive_unfold_calls") or 0)
+    a_unfold_acts = int(ts.get("adaptive_unfold_activated_nodes") or 0)
     docid_cov = float(row.get("docid_cov") or 0.0)
 
     flags: Dict[str, Any] = {
@@ -99,6 +103,10 @@ def _classify_one(row: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "finish_invalid_project_blocked": invalid_blocks,
         "finish_answer_salvaged": salvaged,
         "premature_finish_blocked": premature_blocks,
+        "candidate_first_overrides": cand_first,
+        "search_cycle_break_overrides": cyc_break,
+        "adaptive_unfold_calls": a_unfold_calls,
+        "adaptive_unfold_activated_nodes": a_unfold_acts,
         "docid_cov": docid_cov,
     }
 
@@ -109,6 +117,8 @@ def _classify_one(row: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if "max_steps reached" in (expl or "").lower():
         if cooled > 0 or blocked_search > 0 or dup_open_blocked > 0:
             return "no_finish_with_policy_intervention", flags
+        if cyc_break > 0:
+            return "no_finish_with_search_cycle_break", flags
         return "no_finish", flags
 
     if not pred:
@@ -135,6 +145,8 @@ def _classify_one(row: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if search_calls >= 4 and rep_search >= max(3, int(0.5 * search_calls)):
         if cooled > 0 or blocked_search > 0:
             return "search_loop_with_cooldown", flags
+        if cyc_break > 0:
+            return "search_loop_with_cycle_break", flags
         return "search_loop", flags
 
     # Heuristic: tool protocol misuse
@@ -213,6 +225,10 @@ def main() -> None:
                 "unproductive_searches": int(ts.get("unproductive_searches") or 0),
                 "duplicate_open_blocked": int(ts.get("duplicate_open_blocked") or 0),
                 "constraints_written": int(ts.get("constraints_written") or 0),
+                "candidate_first_overrides": int(ts.get("candidate_first_overrides") or 0),
+                "search_cycle_break_overrides": int(ts.get("search_cycle_break_overrides") or 0),
+                "adaptive_unfold_calls": int(ts.get("adaptive_unfold_calls") or 0),
+                "adaptive_unfold_activated_nodes": int(ts.get("adaptive_unfold_activated_nodes") or 0),
                 "tool_calls_proposed_total": int(ts.get("tool_calls_proposed_total") or 0),
                 "finish_answer_salvaged": int(ts.get("finish_answer_salvaged") or 0),
                 "finish_invalid_project_blocked": int(ts.get("finish_invalid_project_blocked") or 0),

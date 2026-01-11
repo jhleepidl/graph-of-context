@@ -7,6 +7,8 @@ class Task:
     id: str
     question: str
     answer: str
+    # Optional multi-turn prompts. If provided, `question` should typically be the first turn.
+    turns: Optional[List[str]] = None
     entities: Optional[List[str]] = None
     required: Optional[List[str]] = None
     gold_docids: Optional[List[str]] = None

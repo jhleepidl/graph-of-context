@@ -76,6 +76,16 @@ Outputs:
 Notes:
 - The LLM runner uses a strict **JSON-only tool-call protocol**. If your SDK supports it, `response_format={"type":"json_object"}` is used automatically.
 
+## Sweep configs (LLM)
+
+The repo includes example sweep configs under `configs/`:
+
+- `configs/sweep_longhorizon_latebinding_stage1_v25.json`: long-horizon + 2-turn late-binding tasks.
+- `configs/sweep_longhorizon_branchmerge_stage1_v26.json`: **long-horizon + 3-turn branch-merge late-binding tasks**.
+
+The v26 branch-merge tasks force two independent intermediate results (A_WINNER / B_WINNER) to be produced in separate turns via `return`,
+then require a final MERGE decision that depends on BOTH. This tends to amplify differences between GoC and ContextFolding-Discard under tight `budget_active`.
+
 
 
 ### LLM runner extra logging & JSON recovery

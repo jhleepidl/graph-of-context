@@ -36,6 +36,10 @@ def gen_entity(rng: random.Random, i: int) -> Dict[str, Any]:
         "name": name,
         "start_year": rng.randint(1995, 2024),
         "headquarters": f"City_{rng.randint(1, 60)}",
+        # Late-binding hidden attribute: placed deep in the official profile so it is typically
+        # missing from the truncated open_page observation unless the method can recover it.
+        "relocation_year": rng.randint(2005, 2025),
+        "relocation_city": f"City_{rng.randint(1, 60)}",
         "lead": f"Lead_{rand_word(rng, 4)}",
         "code_name": f"Codename_{rand_word(rng, 5)}",
         "key_number": rng.randint(10, 9999),
@@ -51,6 +55,9 @@ def doc_truth(entity: Dict[str, Any], docid: str) -> Dict[str, Any]:
         f"key_number: {entity['key_number']}\n"
         f"related_projects: {', '.join(entity.get('related_projects', []))}\n"
         f"description: {entity.get('description', '')}\n"
+        # Intentionally placed AFTER the long description so it usually falls outside the
+        # truncated open_page observation (max ~2500 chars) and requires recovery.
+        f"relocation_note: relocated_to {entity.get('relocation_city')} in {entity.get('relocation_year')}\n"
         f"NOTE: This document is authoritative."
     )
     return {"docid": docid, "url": f"https://local/{docid}", "title": f"{entity['name']} Official", "content": content}
@@ -61,6 +68,9 @@ def doc_distractor(entity: Dict[str, Any], docid: str, rng: random.Random) -> Di
     wrong_year = entity["start_year"] + rng.choice([-3, -2, -1, 1, 2, 3])
     # Make it rank high by repeating entity name and keywords
     repeats = " ".join([entity["name"]] * rng.randint(8, 14))
+    wrong_reloc_city = f"City_{rng.randint(61, 90)}"
+    wrong_reloc_year = int(entity.get("relocation_year", 2015)) + rng.choice([-3, -2, -1, 1, 2, 3])
+
     content = (
         f"{repeats}\n"
         f"start_year: {wrong_year}\n"
@@ -70,6 +80,7 @@ def doc_distractor(entity: Dict[str, Any], docid: str, rng: random.Random) -> Di
         f"key_number: {entity['key_number']}\n"
         f"related_projects: {', '.join(entity.get('related_projects', []))}\n"
         f"description: {entity.get('description', '')}\n"
+        f"relocation_note: relocated_to {wrong_reloc_city} in {wrong_reloc_year}\n"
         f"Rumor blog; may be outdated."
     )
     return {"docid": docid, "url": f"https://local/{docid}", "title": f"{entity['name']} Rumor", "content": content}
@@ -94,6 +105,17 @@ def make_corpus_and_tasks(
     n_projects_per_task: int = 10,
     hop_steps: int = 4,
     long_task_ratio: float = 0.7,
+    # Late-binding multi-turn tasks (optional)
+    late_binding: bool = False,
+    late_binding_ratio: float = 0.5,
+    late_binding_topn: int = 2,
+    # Branch-merge late-binding tasks (optional)
+    # These tasks create *two* independent sub-results in separate turns (A and B)
+    # and require the final answer to depend on BOTH. This stresses methods that
+    # discard or aggressively fold earlier intermediate artifacts.
+    branch_merge: bool = False,
+    branch_merge_ratio: float = 0.35,
+    branch_merge_group_min: int = 2,
 ):
     rng = random.Random(seed)
     entities = [gen_entity(rng, i) for i in range(n_entities)]
@@ -204,7 +226,9 @@ def make_corpus_and_tasks(
                 groups: Dict[str, List[Dict[str, Any]]] = {}
                 for e in es:
                     groups.setdefault(_code_initial(e), []).append(e)
-                candidates = [(c, lst) for c, lst in groups.items() if len(lst) >= 2]
+                # Prefer initials with enough matches. For branch-merge tasks we need >= 2 per group.
+                min_needed = 4 if branch_merge else 2
+                candidates = [(c, lst) for c, lst in groups.items() if len(lst) >= min_needed]
                 if candidates:
                     init, lst = rng.choice(candidates)
                     break
@@ -213,6 +237,144 @@ def make_corpus_and_tasks(
                 init = _code_initial(es[0])
 
             filtered = [e for e in es if _code_initial(e) == init]
+
+            # -----------------------------
+            # NEW: Branch-merge late-binding (3-turn)
+            # -----------------------------
+            if (
+                branch_merge
+                and late_binding
+                and (rng.random() < float(branch_merge_ratio))
+                and (len(filtered) >= 2 * int(branch_merge_group_min))
+            ):
+                # Split filtered set into two groups (A and B).
+                filtered_shuf = list(filtered)
+                rng.shuffle(filtered_shuf)
+                # Ensure both groups have at least branch_merge_group_min.
+                gmin = max(2, int(branch_merge_group_min))
+                cut = max(gmin, len(filtered_shuf) // 2)
+                group_a = filtered_shuf[:cut]
+                group_b = filtered_shuf[cut:]
+                if len(group_b) < gmin:
+                    # If split is imbalanced, rebalance.
+                    need = gmin - len(group_b)
+                    if need > 0 and len(group_a) > gmin:
+                        group_b = group_a[-need:] + group_b
+                        group_a = group_a[:-need]
+
+                # Still too small? fall back to standard late-binding or non-late-binding.
+                if len(group_a) >= gmin and len(group_b) >= gmin:
+                    a_winner = max(group_a, key=lambda x: x["key_number"])
+                    b_winner = max(group_b, key=lambda x: x["key_number"])
+                    # Final tie-breaker depends on hidden relocation_year (deep in doc) for BOTH winners.
+                    def _rel_y(e: Dict[str, Any]) -> int:
+                        return int(e.get("relocation_year", 0))
+                    if _rel_y(a_winner) != _rel_y(b_winner):
+                        target = a_winner if _rel_y(a_winner) > _rel_y(b_winner) else b_winner
+                    else:
+                        target = a_winner if int(a_winner["key_number"]) >= int(b_winner["key_number"]) else b_winner
+
+                    names = [e["name"] for e in es]
+                    group_a_names = [e["name"] for e in group_a]
+                    group_b_names = [e["name"] for e in group_b]
+
+                    q1 = (
+                        "MULTI-TURN TASK (part 1/3). Do NOT finish yet.\n"
+                        "You must use evidence from opened pages.\n"
+                        f"We will focus on GROUP A first. GROUP A projects: {', '.join(group_a_names)}.\n"
+                        f"Among GROUP A projects whose code_name starts with 'Codename_{init}', find the SINGLE project with the largest key_number.\n"
+                        "Open OFFICIAL PROFILE pages (prefer docid D_TRUTH_####) to verify.\n"
+                        "Then call the `return` tool with message exactly: 'A_WINNER: <ProjectName>'."
+                    )
+
+                    q2 = (
+                        "MULTI-TURN TASK (part 2/3). Do NOT finish yet.\n"
+                        "You must use evidence from opened pages.\n"
+                        f"Now focus on GROUP B. GROUP B projects: {', '.join(group_b_names)}.\n"
+                        f"Among GROUP B projects whose code_name starts with 'Codename_{init}', find the SINGLE project with the largest key_number.\n"
+                        "Open OFFICIAL PROFILE pages (prefer docid D_TRUTH_####) to verify.\n"
+                        "Then call the `return` tool with message exactly: 'B_WINNER: <ProjectName>'."
+                    )
+
+                    q3 = (
+                        "MULTI-TURN TASK (part 3/3) — MERGE (late binding):\n"
+                        "Using ONLY the A_WINNER and B_WINNER you returned earlier (do NOT redo global search over all projects),\n"
+                        "open BOTH winners' OFFICIAL PROFILE pages (docid D_TRUTH_####) and find the line `relocation_note:` (it is placed deep in the page).\n"
+                        "Choose the winner with the MOST RECENT relocation_year.\n"
+                        "Finish with the headquarters of that project.\n"
+                        "Answer exactly as '<ProjectName> | <Headquarters>'."
+                    )
+
+                    answer = f"{target['name']} | {target['headquarters']}"
+                    gold_docids = [_docid_for(n) for n in names]
+                    tasks.append({
+                        "id": f"TASK_{t:04d}",
+                        "question": q1,
+                        "turns": [q1, q2, q3],
+                        "entities": names,
+                        "required": ["code_name", "key_number", "relocation_note", "headquarters"],
+                        "answer": answer,
+                        "gold_docids": gold_docids,
+                        "task_type": "late_binding_branch_merge",
+                        "late_binding": {
+                            "init": init,
+                            "group_a": group_a_names,
+                            "group_b": group_b_names,
+                            "a_winner": a_winner["name"],
+                            "b_winner": b_winner["name"],
+                            "tie_breaker": "max(relocation_year) over {A_WINNER,B_WINNER}",
+                        },
+                    })
+                    continue
+
+            # Optionally turn some two_phase tasks into late-binding multi-turn tasks.
+            # The follow-up question depends on a hidden attribute (relocation_note) placed deep in the document,
+            # rewarding methods that can store tool observations losslessly and selectively recover later.
+            if late_binding and (len(filtered) >= max(2, int(late_binding_topn))) and (rng.random() < float(late_binding_ratio)):
+                topn = max(2, int(late_binding_topn))
+                # shortlist: top-N key_number among filtered
+                shortlist = sorted(filtered, key=lambda x: x["key_number"], reverse=True)[:topn]
+                # tie-breaker: most recent relocation_year among shortlist (hidden deep in the doc)
+                target = max(shortlist, key=lambda x: int(x.get("relocation_year", 0)))
+
+                names = [e["name"] for e in es]
+                shortlist_names = [e["name"] for e in shortlist]
+                q1 = (
+                    "You will receive a follow-up question later. Do NOT finish yet.\n"
+                    "You must use evidence from opened pages.\n"
+                    f"Given these projects: {', '.join(names)}.\n"
+                    f"Step 1) Select projects whose code_name starts with 'Codename_{init}'.\n"
+                    f"Step 2) Among the selected projects, SHORTLIST the TOP {topn} projects by key_number (highest first).\n"
+                    "Then call the `return` tool with a message listing the shortlisted project names (in order)."
+                )
+                q2 = (
+                    "FOLLOW-UP (late binding):\n"
+                    f"Using ONLY the shortlisted projects you identified earlier (do NOT redo global search over all projects),\n"
+                    f"open their OFFICIAL PROFILE pages (docid like D_TRUTH_####) and read the line `relocation_note:` which is placed deep in the page.\n"
+                    f"Choose the shortlisted project with the MOST RECENT relocation_year.\n"
+                    "Finally, finish with the headquarters of that project.\n"
+                    "Answer exactly as '<ProjectName> | <Headquarters>'."
+                )
+                answer = f"{target['name']} | {target['headquarters']}"
+                gold_docids = [_docid_for(n) for n in names]
+                tasks.append({
+                    "id": f"TASK_{t:04d}",
+                    "question": q1,
+                    "turns": [q1, q2],
+                    "entities": names,
+                    "required": ["code_name", "key_number", "relocation_note", "headquarters"],
+                    "answer": answer,
+                    "gold_docids": gold_docids,
+                    "task_type": "late_binding",
+                    "late_binding": {
+                        "init": init,
+                        "topn": topn,
+                        "shortlist": shortlist_names,
+                        "tie_breaker": "max(relocation_year)",
+                    },
+                })
+                continue
+
             winner = max(filtered, key=lambda x: x["key_number"])
             names = [e["name"] for e in es]
             q = (

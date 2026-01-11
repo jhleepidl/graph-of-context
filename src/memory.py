@@ -19,6 +19,8 @@ class MemoryNode:
     thread: str
     kind: str  # 'msg', 'tool', 'summary'
     text: str
+    # Optional lossless storage (e.g., full open_page content). Not counted against active budget.
+    storage_text: Optional[str] = None
     docids: List[str] = field(default_factory=list)
     token_len: int = 0
     step_idx: int = 0  # global, increasing
@@ -56,10 +58,10 @@ class MemoryManagerBase:
         self._global_step += 1
         return self._global_step
 
-    def add_node(self, thread: str, kind: str, text: str, docids: Optional[List[str]] = None) -> str:
+    def add_node(self, thread: str, kind: str, text: str, docids: Optional[List[str]] = None, storage_text: Optional[str] = None) -> str:
         nid = _new_id("N")
         step_idx = self._next_step()
-        n = MemoryNode(id=nid, thread=thread, kind=kind, text=text, docids=docids or [], step_idx=step_idx)
+        n = MemoryNode(id=nid, thread=thread, kind=kind, text=text, storage_text=storage_text, docids=docids or [], step_idx=step_idx)
         self.nodes[nid] = n
         return nid
 
@@ -112,13 +114,14 @@ class MemoryManagerBase:
     def _on_branch_return(self, bid: str, branch_nodes: List[str], ret_id: str):
         pass
 
-    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids: Optional[List[str]] = None):
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids: Optional[List[str]] = None, storage_text: Optional[str] = None):
         self._decay_ttl()
         nid = self.add_node(
             thread=self.current_thread,
             kind="tool",
             text=f"[TOOL:{tool_name}] args={args}\nobs={observation}",
-            docids=docids or []
+            docids=docids or [],
+            storage_text=storage_text,
         )
         self._on_branch_step(nid)
         self.maybe_fold()
@@ -170,8 +173,8 @@ class ContextFoldingDiscardMemory(MemoryManagerBase):
         self.branch_stack[-1] = (bid, [n for n in self.active if self.nodes[n].thread == bid])
         return bid
 
-    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None):
-        super().record_tool(tool_name, args, observation, docids=docids)
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None):
+        super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
         if self.branch_stack:
             bid, lst = self.branch_stack[-1]
             lst.append(self.active[-1])
@@ -320,8 +323,8 @@ class GoCMemory(MemoryManagerBase):
             self._add_edge("depends", nid, prev)
         self._last_in_thread[self.current_thread] = nid
 
-    def add_node(self, thread: str, kind: str, text: str, docids: Optional[List[str]] = None) -> str:
-        nid = super().add_node(thread=thread, kind=kind, text=text, docids=docids)
+    def add_node(self, thread: str, kind: str, text: str, docids: Optional[List[str]] = None, storage_text: Optional[str] = None) -> str:
+        nid = super().add_node(thread=thread, kind=kind, text=text, docids=docids, storage_text=storage_text)
         # graph updates
         self._link_sequential(nid)
         self._index_docids(nid)
@@ -330,11 +333,23 @@ class GoCMemory(MemoryManagerBase):
     # ---- storage index ----
     def _rebuild_storage_index(self):
         items: List[TextItem] = []
+
+        def _index_text(n: MemoryNode) -> str:
+            # For lossless storage nodes (e.g., open_page), index both the compact active text and
+            # a clipped version of the full content (head+tail) so late-bound facts near the end
+            # are retrievable without re-opening pages.
+            if not n.storage_text:
+                return n.text
+            full = n.storage_text
+            if len(full) > 8000:
+                full = full[:4000] + "\n...\n" + full[-4000:]
+            return n.text + "\n\n[FULL_CONTENT]\n" + full
+
         for nid in self.storage:
             n = self.nodes.get(nid)
             if not n:
                 continue
-            items.append(TextItem(id=nid, text=n.text, meta={"url": f"mem://{nid}", "title": n.kind}))
+            items.append(TextItem(id=nid, text=_index_text(n), meta={"url": f"mem://{nid}", "title": n.kind}))
         self._storage_retriever = build_retriever(self.storage_retriever_kind, items, faiss_dim=self.storage_faiss_dim) if items else None
 
     # ---- overrides to track branch nodes ----
@@ -343,8 +358,8 @@ class GoCMemory(MemoryManagerBase):
         self.branch_stack[-1] = (bid, [n for n in self.active if self.nodes[n].thread == bid])
         return bid
 
-    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None):
-        super().record_tool(tool_name, args, observation, docids=docids)
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None):
+        super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
         if self.branch_stack:
             bid, lst = self.branch_stack[-1]
             lst.append(self.active[-1])
@@ -687,6 +702,65 @@ class GoCMemory(MemoryManagerBase):
                 expanded.add(v)
         return expanded
 
+    def _extract_storage_snippet(self, full: str, query: str, max_chars: int = 900) -> str:
+        """Return a compact excerpt from full text that is likely relevant to the query.
+
+        This enables 'lossless storage + selective recovery': store the full open_page content
+        out-of-budget, then unfold only small relevant snippets back into ACTIVE_CONTEXT.
+        """
+        if not full:
+            return ""
+        q = (query or "").strip()
+        # Prefer a few stable keywords for late-binding tasks.
+        prefer = ["relocation_note", "relocation_year", "relocated_to", "relocation"]
+        terms: List[str] = [t for t in prefer if t in q.lower()]
+        if not terms:
+            toks = re.findall(r"[A-Za-z_]{4,}", q)
+            # de-dup, keep order
+            seen: Set[str] = set()
+            for t in toks:
+                tl = t.lower()
+                if tl in seen:
+                    continue
+                seen.add(tl)
+                terms.append(tl)
+                if len(terms) >= 6:
+                    break
+
+        hay = full
+        hay_low = hay.lower()
+        idx = -1
+        for t in terms:
+            i = hay_low.find(t)
+            if i >= 0:
+                idx = i
+                break
+        # Fallback: look for the field name directly
+        if idx < 0:
+            idx = hay_low.find("relocation_note")
+        if idx < 0:
+            idx = max(0, len(hay) - max_chars)
+
+        # Window around match
+        win = max_chars // 2
+        start = max(0, idx - win)
+        end = min(len(hay), idx + win)
+        snip = hay[start:end]
+
+        # Try to align to line boundaries for readability
+        s_nl = snip.rfind("\n", 0, min(200, len(snip)))
+        if s_nl > 0:
+            snip = snip[s_nl + 1 :]
+        e_nl = snip.find("\n", max(0, len(snip) - 200))
+        if e_nl > 0:
+            snip = snip[:e_nl]
+
+        if start > 0:
+            snip = "..." + snip
+        if end < len(hay):
+            snip = snip + "..."
+        return snip[:max_chars].strip()
+
     def unfold(self, query: str, k: int = None):
         if k is None:
             k = self.unfold_k
@@ -724,11 +798,33 @@ class GoCMemory(MemoryManagerBase):
                 break
 
         activated = []
+        # Activate nodes and, for lossless nodes, also materialize a small relevant snippet.
+        remaining = int(self.budget_unfold)
         for nid in sorted(chosen, key=lambda x: self.nodes[x].step_idx):
+            if nid not in self.nodes:
+                continue
+            n = self.nodes[nid]
             if nid not in self.active:
-                self.nodes[nid].ttl = self.ttl_unfold
+                cost = n.token_len
+                if remaining - cost < 0:
+                    continue
+                remaining -= cost
+                n.ttl = self.ttl_unfold
                 self.active.append(nid)
                 activated.append(nid)
+
+            # If we have full stored content, recover an excerpt likely to contain the late-bound fact.
+            if n.storage_text:
+                snip = self._extract_storage_snippet(n.storage_text, query=query, max_chars=900)
+                if snip:
+                    sn_text = f"[UNFOLD_SNIPPET from {nid}]\n{snip}"
+                    sn_cost = approx_token_count(sn_text)
+                    if remaining - sn_cost >= 0:
+                        sn_id = self.add_node(thread="main", kind="summary", text=sn_text, docids=list(n.docids))
+                        self.nodes[sn_id].ttl = self.ttl_unfold
+                        self.active.append(sn_id)
+                        activated.append(sn_id)
+                        remaining -= sn_cost
 
         # Re-order active nodes chronologically by step index so recovered nodes
         # do not end up at the very end of the context.

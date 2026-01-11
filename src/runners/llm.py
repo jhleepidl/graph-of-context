@@ -102,7 +102,7 @@ def run_llm(
         )
 
         for t in tasks:
-            out = agent.run(t.question, task_id=t.id, method=ms.name, run_tag=run_tag)
+            out = agent.run(t.question, user_turns=t.turns, task_id=t.id, method=ms.name, run_tag=run_tag)
             pred = (out.get("answer") or "").strip()
             expl = out.get("explanation") or ""
             ev = benchmark.evaluate(pred, expl, t)

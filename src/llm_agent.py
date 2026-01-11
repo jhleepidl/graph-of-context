@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import json
 import re
 from collections import Counter
+from collections import deque
 from pathlib import Path
 import time
 
@@ -86,6 +87,14 @@ class ToolLoopConfig:
     repeat_search_consecutive_threshold: int = 6
     auto_open_on_repeat_search: bool = True
 
+    # Break *cyclic* search loops (e.g., alternating between 2-3 queries)
+    # This catches non-consecutive repetition patterns that evade the simple streak counter.
+    search_cycle_breaker: bool = True
+    search_cycle_window: int = 10              # lookback window size
+    search_cycle_unique_max: int = 2           # if <= this many unique queries repeat
+    search_cycle_min_total: int = 8            # require at least this many recent searches
+    search_cycle_require_no_new_candidates: bool = True  # only trigger when searches yield no unopened docids
+
     # Open-page dedupe + fact header (P1, optional)
     open_page_dedupe: bool = True
     open_page_fact_header: bool = True
@@ -95,6 +104,13 @@ class ToolLoopConfig:
     open_given_projects_on_repeat_search: bool = True
     validate_answer_in_given_projects: bool = True
     max_finish_blocks_per_reason: int = 1
+
+    # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
+    # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
+    # those candidates' evidence before running global searches.
+    candidate_first: bool = True
+    candidate_first_min_open_pages: int = 3
+    candidate_first_override_global_search: bool = True
 
     max_json_retries: int = 2
 
@@ -106,6 +122,19 @@ class ToolLoopConfig:
     block_search_ttl_steps: int = 10          # how long to cooldown a blocked query (steps)
     duplicate_open_hard_block: bool = True    # if True, block duplicate open_page instead of caching
     max_consecutive_same_tool: int = 6        # if stuck repeating same tool, force a mode switch
+
+    # Adaptive unfolding (GoC only, but safe to call on other memories)
+    # The controller dynamically adjusts the unfold budget based on evidence coverage.
+    adaptive_unfold: bool = True
+    adaptive_unfold_min_step: int = 2
+    adaptive_unfold_max_calls: int = 10
+    adaptive_unfold_budget_max: int = 900
+    adaptive_unfold_buckets: Tuple[int, ...] = (0, 150, 300, 600, 900)
+
+    # Multi-turn (late-binding) task support
+    multi_turn_auto_inject: bool = True
+    multi_turn_min_step: int = 8
+    multi_turn_min_open_pages: int = 3
 
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
@@ -155,6 +184,15 @@ class ToolLoopLLMAgent:
         self._last_progress_step: int = 0                   # last step index with measurable progress
         self._last_exec_tool: Optional[str] = None          # executed tool name
         self._exec_tool_streak: int = 0                     # consecutive same executed tool
+
+        # Cyclic search-loop detection (alternating queries)
+        self._recent_search_norms = deque(maxlen=max(4, int(self.cfg.search_cycle_window)))
+        self._recent_search_newcand = deque(maxlen=max(4, int(self.cfg.search_cycle_window)))
+        self._last_loop_escape_step: Optional[int] = None
+
+        # Adaptive unfolding bookkeeping
+        self._adaptive_unfold_calls: int = 0
+        self._last_finish_block_reason: Optional[str] = None
 
         self._trace_fp = None
         self._trace_path: Optional[Path] = None
@@ -238,6 +276,221 @@ class ToolLoopLLMAgent:
                 return did
         return None
 
+    def _is_globalish_search(self, query: str) -> bool:
+        """Heuristic: a search that likely ranges over *all* projects rather than a given candidate set."""
+        ql = (query or "").lower()
+        if "project_" in ql:
+            return False
+        # If the question provides a candidate set, searches referencing attributes but not specific IDs
+        # are often global. Keep this heuristic lightweight (avoid overfitting to a single dataset).
+        attr_terms = ("code_name", "key_number", "start_year", "headquarters", "related_projects")
+        if any(t in ql for t in attr_terms) and ("project" in ql or "projects" in ql):
+            return True
+        if "list" in ql and "projects" in ql:
+            return True
+        return False
+
+    def _should_break_search_cycle(self, qnorm_next: str) -> bool:
+        """Detect cyclic search loops (e.g., alternating between 2-3 queries).
+
+        We trigger only when (a) recent queries are low-entropy (few unique) AND
+        (b) they have not been yielding new *unopened* docids.
+        """
+        if not self.cfg.search_cycle_breaker:
+            return False
+
+        win = int(self.cfg.search_cycle_window)
+        min_total = int(self.cfg.search_cycle_min_total)
+        uniq_max = int(self.cfg.search_cycle_unique_max)
+        if win <= 0 or min_total <= 0:
+            return False
+
+        norms = list(self._recent_search_norms)
+        newc = list(self._recent_search_newcand)
+        # Project the next query into the window; assume it won't magically create new candidates.
+        if qnorm_next:
+            norms = (norms + [qnorm_next])[-win:]
+            if self.cfg.search_cycle_require_no_new_candidates:
+                newc = (newc + [0])[-win:]
+        if len(norms) < min_total:
+            return False
+        if len(set(norms)) > uniq_max:
+            return False
+        if self.cfg.search_cycle_require_no_new_candidates:
+            if sum(1 for x in newc if x) > 0:
+                return False
+        return True
+
+    def _infer_required_fields(self, question: str) -> List[str]:
+        """Best-effort extraction of which fields are needed from the question."""
+        ql = (question or "").lower()
+        fields: List[str] = []
+        # Heuristics tailored to the benchmark schema but phrased as generic field-keyword matches.
+        if "headquarters" in ql or "hq" in ql:
+            fields.append("headquarters")
+        if "start_year" in ql or "start year" in ql or "earliest" in ql or "oldest" in ql:
+            fields.append("start_year")
+        if "code_name" in ql or "code name" in ql or "codename" in ql:
+            fields.append("code_name")
+        if "key_number" in ql or "key number" in ql:
+            fields.append("key_number")
+        if "related_projects" in ql or "related projects" in ql:
+            fields.append("related_projects")
+        # If no explicit hint, default to a small core set.
+        if not fields:
+            fields = ["start_year", "headquarters"]
+        # Stable order, dedupe
+        out = []
+        for f in fields:
+            if f not in out:
+                out.append(f)
+        return out
+
+    def _parse_facts_from_active(self) -> Dict[str, Dict[str, str]]:
+        """Extract (project -> {field -> value}) from ACTIVE_CONTEXT."""
+        txt = self.mem.get_active_text() or ""
+        proj_map: Dict[str, Dict[str, str]] = {}
+
+        # FACTS header format: "FACTS: project=Project_0001 | start_year=1999 | headquarters=City_01 ..."
+        for ln in txt.splitlines():
+            if "FACTS:" not in ln:
+                continue
+            # keep after FACTS:
+            seg = ln.split("FACTS:", 1)[-1]
+            parts = [p.strip() for p in seg.split("|") if p.strip()]
+            kv = {}
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    kv[k.strip().lower()] = v.strip()
+            proj = kv.get("project")
+            if proj and re.match(r"^Project_\d{4}$", proj):
+                d = proj_map.setdefault(proj, {})
+                for k, v in kv.items():
+                    if k in ("start_year", "headquarters", "code_name", "key_number", "related_projects") and v:
+                        d.setdefault(k, v)
+
+        # Also accept raw profile lines in open_page snippets
+        cur_proj = None
+        for ln in txt.splitlines():
+            m = re.search(r"\bProject_\d{4}\b", ln)
+            if m:
+                cur_proj = m.group(0)
+                proj_map.setdefault(cur_proj, {})
+            if not cur_proj:
+                continue
+            for key in ("start_year", "headquarters", "code_name", "key_number", "related_projects"):
+                m2 = re.search(rf"(?i)\b{key}\b\s*[:=]\s*([^\n]+)", ln)
+                if m2:
+                    v = m2.group(1).strip()
+                    if v:
+                        proj_map[cur_proj].setdefault(key, v)
+
+        return proj_map
+
+    def _coverage_and_missing(self, required_fields: List[str]) -> Tuple[float, List[Tuple[str, str]]]:
+        """Return (coverage_ratio, missing_pairs[(project, field)])."""
+        if not self.given_projects:
+            return 1.0, []
+        facts = self._parse_facts_from_active()
+        denom = max(1, len(self.given_projects) * max(1, len(required_fields)))
+        have = 0
+        missing: List[Tuple[str, str]] = []
+        for p in self.given_projects:
+            pf = facts.get(p, {})
+            for f in required_fields:
+                if pf.get(f):
+                    have += 1
+                else:
+                    missing.append((p, f))
+        return have / float(denom), missing
+
+    def _maybe_adaptive_unfold(self, step: int, question: str, *, method: str, run_tag: str, task_id: str):
+        """Controller-side adaptive unfolding.
+
+        Motivation: GoC stores pruned nodes in `storage` but needs an *unfold policy* to
+        recover relevant info. This keeps the policy lightweight and task-agnostic:
+          - prefer unfolding when evidence coverage is low
+          - allocate bigger unfold budget when coverage is low or we are stuck
+        """
+        if not self.cfg.adaptive_unfold:
+            return
+        if step < int(self.cfg.adaptive_unfold_min_step):
+            return
+        if self._adaptive_unfold_calls >= int(self.cfg.adaptive_unfold_max_calls):
+            return
+        if not hasattr(self.mem, "unfold"):
+            return
+        # Unfold is only meaningful when memory has storage/index (GoC), but safe to call otherwise.
+
+        required = self._infer_required_fields(question)
+        cov, missing = self._coverage_and_missing(required)
+
+        # Trigger: low coverage OR recent loop/finish-block signals
+        loopy = self._should_break_search_cycle("")  # based on current window
+        blocked_finish = bool(self._last_finish_block_reason)
+        if cov >= 0.85 and (not loopy) and (not blocked_finish):
+            return
+
+        # Choose unfold budget bucket
+        buckets = list(self.cfg.adaptive_unfold_buckets or (0, 150, 300, 600, 900))
+        buckets = sorted(set(int(b) for b in buckets if int(b) >= 0))
+        if not buckets:
+            buckets = [0]
+
+        if cov < 0.25:
+            target = max(buckets)
+        elif cov < 0.5:
+            target = max(b for b in buckets if b <= 600) if any(b <= 600 for b in buckets) else max(buckets)
+        elif cov < 0.75:
+            target = max(b for b in buckets if b <= 300) if any(b <= 300 for b in buckets) else max(buckets)
+        else:
+            target = max(b for b in buckets if b <= 150) if any(b <= 150 for b in buckets) else min(buckets)
+
+        if loopy or blocked_finish:
+            target = min(int(self.cfg.adaptive_unfold_budget_max), target + 150)
+        target = min(int(self.cfg.adaptive_unfold_budget_max), int(target))
+
+        # Pick unfold query: focus on the most missing (project, field) pair if available.
+        uq = ""
+        if missing:
+            p, f = missing[0]
+            uq = f"{p} {f}"
+        else:
+            uq = question
+
+        # Temporarily adjust budget_unfold for this call.
+        prev_budget = getattr(self.mem, "budget_unfold", None)
+        try:
+            if prev_budget is not None:
+                setattr(self.mem, "budget_unfold", target)
+            activated = self.mem.unfold(uq)  # type: ignore[attr-defined]
+        except Exception:
+            activated = []
+        finally:
+            if prev_budget is not None:
+                try:
+                    setattr(self.mem, "budget_unfold", prev_budget)
+                except Exception:
+                    pass
+
+        if activated:
+            self._adaptive_unfold_calls += 1
+            self.counters["adaptive_unfold_calls"] += 1
+            self.counters["adaptive_unfold_activated_nodes"] += int(len(activated))
+            self._trace({
+                "type": "adaptive_unfold",
+                "task_id": task_id,
+                "method": method,
+                "run_tag": run_tag,
+                "step": step,
+                "query": uq,
+                "budget": target,
+                "coverage": cov,
+                "activated": activated[:25],
+            })
+
+
     def _policy_rewrite_query(self, query: str) -> str:
         """Cheap, generic query diversification when a query is blocked/cooldown."""
         q = (query or "").strip()
@@ -288,6 +541,61 @@ class ToolLoopLLMAgent:
         if tool == "search":
             query = args.get("query") or ""
             qnorm = self._normalize_query(query)
+
+            # (v24) Candidate-first: if we were given an explicit candidate set, prefer
+            # opening candidate evidence over global searches early on.
+            if (
+                self.cfg.candidate_first
+                and self.cfg.candidate_first_override_global_search
+                and self.given_projects
+                and int(self.counters.get("open_page_calls", 0)) < int(self.cfg.candidate_first_min_open_pages)
+                and self._is_globalish_search(query)
+            ):
+                cand = self._policy_candidate_docid()
+                if cand:
+                    self.counters["policy_overrides"] += 1
+                    self.counters["candidate_first_overrides"] += 1
+                    self._last_loop_escape_step = step
+                    self._policy_record_constraint_once(
+                        key="candidate_first_mode",
+                        text=(
+                            "[CONSTRAINT] Candidate-first mode: the question provides a candidate set. "
+                            "Open candidate OFFICIAL PROFILE pages and extract FACTS before running global searches."
+                        ),
+                    )
+                    new_call = {"tool": "open_page", "args": {"docid": cand}}
+                    return new_call, {
+                        "reason": "candidate_first_open",
+                        "from": proposed_call,
+                        "to": new_call,
+                        "query": query,
+                        "opened_docid": cand,
+                    }
+
+            # (v24) Cyclic loop breaker: if we detect low-entropy query alternation without new candidates,
+            # force an evidence-opening action.
+            if self._should_break_search_cycle(qnorm):
+                cand = self._policy_candidate_docid()
+                if cand:
+                    self.counters["policy_overrides"] += 1
+                    self.counters["search_cycle_break_overrides"] += 1
+                    self._last_loop_escape_step = step
+                    self._policy_record_constraint_once(
+                        key="search_cycle_breaker",
+                        text=(
+                            "[CONSTRAINT] Detected a cyclic search loop (repeating a small set of queries with no new evidence). "
+                            "Stop searching and open new evidence documents instead."
+                        ),
+                    )
+                    new_call = {"tool": "open_page", "args": {"docid": cand}}
+                    return new_call, {
+                        "reason": "search_cycle_break_open",
+                        "from": proposed_call,
+                        "to": new_call,
+                        "query": query,
+                        "opened_docid": cand,
+                    }
+
             exp = self._blocked_queries.get(qnorm)
             if exp is not None and step < exp:
                 self.counters["policy_overrides"] += 1
@@ -336,9 +644,18 @@ class ToolLoopLLMAgent:
         qnorm = self._normalize_query(query)
         new_candidates = [d for d in (result_docids or []) if d and d not in self.opened_cache]
 
+        # Track recent search entropy / novelty for cyclic-loop detection.
+        try:
+            self._recent_search_norms.append(qnorm)
+            self._recent_search_newcand.append(1 if new_candidates else 0)
+        except Exception:
+            pass
+
         if new_candidates:
             # progress: we have at least one unopened candidate
             self._last_progress_step = step
+            # Clear any previous finish-block signal; we are making forward progress.
+            self._last_finish_block_reason = None
             # reset unproductive count (reward new evidence)
             if qnorm in self._unproductive_queries:
                 self._unproductive_queries[qnorm] = 0
@@ -457,7 +774,7 @@ class ToolLoopLLMAgent:
             " - Do NOT call `finish` until you have gathered evidence: at least 1 `open_page` and at least 1 docid cited.\n"
             " - The `finish.args.explanation` MUST include the evidence docids you used (e.g., 'Evidence docids: D_TRUTH_0001').\n"
             " - Do NOT call `finish` if you have not opened any page yet. Call search -> open_page first.\n"
-            " - Do NOT call `return` unless you previously called `branch` and you are currently inside that branch.\n"
+            " - `return` usage: (a) inside a branch to exit that branch, OR (b) in MAIN to request the next user follow-up if the task is multi-turn.\n"
             " - When you call `branch`, you MUST include args: {description, prompt}.\n"
             " - When you call `return`, you MUST include args: {message}.\n"
             " - Call `return` at most ONCE per branch. Never call return twice in a row.\n"
@@ -518,7 +835,15 @@ class ToolLoopLLMAgent:
 
         return None, attempt_logs
 
-    def run(self, user_question: str, *, task_id: str = "task", method: str = "method", run_tag: str = "run") -> Dict[str, Any]:
+    def run(
+        self,
+        user_question: str,
+        *,
+        user_turns: Optional[List[str]] = None,
+        task_id: str = "task",
+        method: str = "method",
+        run_tag: str = "run",
+    ) -> Dict[str, Any]:
         """Run one task.
 
         task_id/method/run_tag are used for logging and stdout progress only.
@@ -529,7 +854,17 @@ class ToolLoopLLMAgent:
         self.search_query_counts = Counter()
         self.evidence_docids = []
         self.opened_cache = {}
-        self.given_projects = self._extract_given_projects(user_question)
+        # Multi-turn support: allow the environment to deliver follow-up user turns.
+        turns: List[str] = [user_question]
+        if user_turns and isinstance(user_turns, list) and user_turns:
+            turns = [str(x) for x in user_turns if x is not None]
+            if not turns:
+                turns = [user_question]
+        current_user_prompt = turns[0]
+        pending_user_turns: List[str] = turns[1:]
+        self.counters["pending_user_turns_init"] = len(pending_user_turns)
+
+        self.given_projects = self._extract_given_projects(current_user_prompt)
         self._given_projects_open_idx = 0
         self._finish_block_counts = Counter()
         # reset failure-policy state
@@ -548,14 +883,30 @@ class ToolLoopLLMAgent:
         self._last_search_results = []
         self._last_search_repeat_streak = 0
         self._last_search_open_idx = 0
+        self._recent_search_norms = deque(maxlen=max(4, int(self.cfg.search_cycle_window)))
+        self._recent_search_newcand = deque(maxlen=max(4, int(self.cfg.search_cycle_window)))
+        self._last_loop_escape_step = None
+        self._adaptive_unfold_calls = 0
+        self._last_finish_block_reason = None
 
         self._open_trace(run_tag=run_tag, method=method, task_id=task_id)
 
         system = self._build_system_prompt()
         base_messages: List[Dict[str, str]] = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user_question},
+            {"role": "user", "content": current_user_prompt},
         ]
+
+        def _inject_next_user_turn(reason: str):
+            nonlocal current_user_prompt
+            if not pending_user_turns:
+                return False
+            nxt = pending_user_turns.pop(0)
+            base_messages.append({"role": "user", "content": nxt})
+            current_user_prompt = nxt
+            self.counters["user_followups_injected"] += 1
+            self.mem.record_summary(f"[USER_FOLLOWUP/{reason}] {nxt[:400]}", ttl=8)
+            return True
 
         start_time = time.time()
 
@@ -575,6 +926,20 @@ class ToolLoopLLMAgent:
                             "[SYSTEM] Deadline approaching. You MUST open at least one page (open_page) and then CALL finish with docid evidence." 
                         )
                     self._trace({"type":"deadline_nudge","task_id":task_id,"method":method,"run_tag":run_tag,"step":step+1})
+
+                # Multi-turn: optionally auto-inject follow-up user messages after the agent has done some work.
+                if pending_user_turns and self.cfg.multi_turn_auto_inject:
+                    oc = int(self.counters.get("open_page_calls", 0))
+                    if (step >= int(self.cfg.multi_turn_min_step)) and (oc >= int(self.cfg.multi_turn_min_open_pages)):
+                        _inject_next_user_turn("auto")
+
+                # GoC: proactively unfold relevant stored nodes when evidence coverage is low.
+                # This happens *before* building the prompt so the recovered nodes can be used by the model.
+                try:
+                    self._maybe_adaptive_unfold(step, current_user_prompt, method=method, run_tag=run_tag, task_id=task_id)
+                except Exception:
+                    # Never let unfolding crash the run.
+                    self.counters["adaptive_unfold_errors"] += 1
                 # Stateless prompting: we DO NOT accumulate prior ACTIVE_CONTEXT in messages.
                 ctx = self.mem.get_active_text()
                 ctx_tail = ctx[-8000:]
@@ -806,10 +1171,14 @@ class ToolLoopLLMAgent:
                         self.counters["open_page_cache_hits"] += 1
                         cached = self.opened_cache.get(docid, "")
                         obs = f"[CACHED] docid={docid} previously opened.\n\n" + self._compose_open_page_observation(cached)
-                        self.mem.record_tool("open_page", args, observation=obs[:2500], docids=[docid])
+                        # Store full content losslessly (for GoC), but keep a compact observation in ACTIVE_CONTEXT.
+                        self.mem.record_tool("open_page", args, observation=obs[:2500], docids=[docid], storage_text=cached)
 
                         if docid not in self.evidence_docids:
                             self.evidence_docids.append(docid)
+
+                        # Progress: evidence surfaced; clear any previous finish-block signal.
+                        self._last_finish_block_reason = None
 
                         self._trace({
                             "type": "tool",
@@ -830,13 +1199,18 @@ class ToolLoopLLMAgent:
 
                     content = (out.get("content") or "")
                     obs = self._compose_open_page_observation(content)
-                    self.mem.record_tool("open_page", args, observation=obs, docids=[out["docid"]])
+                    # Store full content losslessly (for GoC), but keep a compact observation in ACTIVE_CONTEXT.
+                    self.mem.record_tool("open_page", args, observation=obs, docids=[out["docid"]], storage_text=content)
 
                     # Cache opened content for auto-finish / analysis
                     self.opened_cache[out["docid"]] = content[:2500]
 
                     # Progress: opened a new evidence document
                     self._last_progress_step = step
+                    self._last_finish_block_reason = None
+
+                    # Progress: clear any previous finish-block signal.
+                    self._last_finish_block_reason = None
 
                     # Track evidence docids (opened pages) for finish auto-citation
                     opened = out.get("docid")
@@ -894,12 +1268,23 @@ class ToolLoopLLMAgent:
                             msg = ""
                         self.mem.return_from_branch(message=msg)
                     else:
-                        # Strong guidance to prevent repeated invalid returns.
-                        self.counters["return_in_main_ignored"] += 1
-                        self.mem.record_msg(
-                            "[SYSTEM] You are in MAIN (no active branch). `return` is invalid here. "
-                            "Next step MUST be one of: search, open_page, finish."
-                        )
+                        # Multi-turn tasks: allow `return` in MAIN to request the next user follow-up.
+                        if pending_user_turns:
+                            msg = args.get("message") or ""
+                            if msg:
+                                # Persist the agent's intermediate output (e.g., shortlist) so it can be reused.
+                                self.mem.record_summary(f"[ASSISTANT_RETURN] {msg[:800]}", ttl=12)
+                            injected = _inject_next_user_turn("return")
+                            if not injected:
+                                self.counters["return_in_main_ignored"] += 1
+                                self.mem.record_msg("[SYSTEM] No follow-up user turn is available. Continue with search/open_page/finish.")
+                        else:
+                            # Strong guidance to prevent repeated invalid returns.
+                            self.counters["return_in_main_ignored"] += 1
+                            self.mem.record_msg(
+                                "[SYSTEM] You are in MAIN (no active branch). `return` is invalid here. "
+                                "Next step MUST be one of: search, open_page, finish."
+                            )
                     self._trace({
                         "type": "tool",
                         "task_id": task_id,
@@ -915,8 +1300,22 @@ class ToolLoopLLMAgent:
                     # Finish gating: block premature finish (no evidence, too early, missing docids).
                     open_calls = int(self.counters.get("open_page_calls", 0))
 
+                    # Multi-turn tasks: do not allow finishing before follow-up turns are delivered.
+                    if pending_user_turns:
+                        self.counters["premature_finish_blocked"] += 1
+                        self._last_finish_block_reason = "pending_user_turns"
+                        self.mem.record_msg(
+                            "[SYSTEM] finish blocked: there is a follow-up user message pending. "
+                            "Call `return` to receive it (or continue until it is auto-injected)."
+                        )
+                        self._trace({"type": "finish_blocked", "task_id": task_id, "method": method, "run_tag": run_tag, "step": step, "reason": "pending_user_turns"})
+                        if self.cfg.verbose:
+                            print(f"[{run_tag}][{method}][{task_id}] BLOCK_FINISH reason=pending_user_turns", flush=True)
+                        continue
+
                     if (step + 1) < int(self.cfg.min_steps_before_finish):
                         self.counters["premature_finish_blocked"] += 1
+                        self._last_finish_block_reason = "min_steps"
                         self.mem.record_msg(
                             f"[SYSTEM] finish blocked: need at least {self.cfg.min_steps_before_finish} steps. "
                             "Next call should be search/open_page."
@@ -928,6 +1327,7 @@ class ToolLoopLLMAgent:
 
                     if open_calls < int(self.cfg.min_open_pages_before_finish):
                         self.counters["premature_finish_blocked"] += 1
+                        self._last_finish_block_reason = "no_open_page"
                         self.mem.record_msg(
                             f"[SYSTEM] finish blocked: need at least {self.cfg.min_open_pages_before_finish} open_page calls for evidence. "
                             "Next call MUST be search -> open_page."
@@ -980,6 +1380,7 @@ class ToolLoopLLMAgent:
 
                     if not ans:
                         self.counters["premature_finish_blocked"] += 1
+                        self._last_finish_block_reason = "empty_answer"
                         self.mem.record_msg("[SYSTEM] finish blocked: empty answer. Put the final answer into finish.args.answer (a non-empty short string).")
                         self.mem.record_msg('[SYSTEM] Example: {"tool":"finish","args":{"answer":"<SHORT ANSWER>","explanation":"Evidence docids: D_TRUTH_0001"}}')
                         self._trace({"type": "finish_blocked", "task_id": task_id, "method": method, "run_tag": run_tag, "step": step, "reason": "empty_answer"})
@@ -995,6 +1396,7 @@ class ToolLoopLLMAgent:
                         proj = m_proj.group(0) if m_proj else ""
                         if (not proj) or (proj not in allowed):
                             self.counters["finish_invalid_project_blocked"] += 1
+                            self._last_finish_block_reason = "invalid_project"
                             if self._should_block_finish("invalid_project"):
                                 self.mem.record_msg(
                                     "[SYSTEM] finish blocked: answer project must be one of the GIVEN projects from the question. "
@@ -1033,6 +1435,7 @@ class ToolLoopLLMAgent:
                                 else:
                                     # Fallback: block if we truly have no evidence docids recorded.
                                     self.counters["premature_finish_blocked"] += 1
+                                    self._last_finish_block_reason = "missing_docids_no_evidence"
                                     self.mem.record_msg("[SYSTEM] finish blocked: explanation missing evidence docids. Cite docids from open_page.")
                                     self.mem.record_msg("[SYSTEM] You attempted to finish without evidence docids, and no opened docids were recorded. Call open_page first.")
                                     self._trace({"type": "finish_blocked", "task_id": task_id, "method": method, "run_tag": run_tag, "step": step, "reason": "missing_docids_no_evidence"})
@@ -1063,6 +1466,11 @@ class ToolLoopLLMAgent:
                             "blocked_search_query": int(self.counters.get("blocked_search_query", 0)),
                             "unproductive_searches": int(self.counters.get("unproductive_searches", 0)),
                             "search_queries_cooled_down": int(self.counters.get("search_queries_cooled_down", 0)),
+                            "candidate_first_overrides": int(self.counters.get("candidate_first_overrides", 0)),
+                            "search_cycle_break_overrides": int(self.counters.get("search_cycle_break_overrides", 0)),
+                            "adaptive_unfold_calls": int(self.counters.get("adaptive_unfold_calls", 0)),
+                            "adaptive_unfold_activated_nodes": int(self.counters.get("adaptive_unfold_activated_nodes", 0)),
+                            "adaptive_unfold_errors": int(self.counters.get("adaptive_unfold_errors", 0)),
                             "mode_switch_overrides": int(self.counters.get("mode_switch_overrides", 0)),
                             "return_calls": int(self.counters.get("tool_calls_return", 0)),
                             "return_in_main_ignored": int(self.counters.get("return_in_main_ignored", 0)),
@@ -1124,6 +1532,11 @@ class ToolLoopLLMAgent:
                     "blocked_search_query": int(self.counters.get("blocked_search_query", 0)),
                     "unproductive_searches": int(self.counters.get("unproductive_searches", 0)),
                     "search_queries_cooled_down": int(self.counters.get("search_queries_cooled_down", 0)),
+                    "candidate_first_overrides": int(self.counters.get("candidate_first_overrides", 0)),
+                    "search_cycle_break_overrides": int(self.counters.get("search_cycle_break_overrides", 0)),
+                    "adaptive_unfold_calls": int(self.counters.get("adaptive_unfold_calls", 0)),
+                    "adaptive_unfold_activated_nodes": int(self.counters.get("adaptive_unfold_activated_nodes", 0)),
+                    "adaptive_unfold_errors": int(self.counters.get("adaptive_unfold_errors", 0)),
                     "mode_switch_overrides": int(self.counters.get("mode_switch_overrides", 0)),
                     "repeated_search_count": int(self.counters["repeated_search_count"]),
                     "unique_search_queries": int(len(self.search_query_counts)),

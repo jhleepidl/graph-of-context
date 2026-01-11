@@ -42,6 +42,14 @@ class SyntheticBrowseComp(Benchmark):
             n_projects_per_task=int(kwargs.get("n_projects_per_task", 10)),
             hop_steps=int(kwargs.get("hop_steps", 4)),
             long_task_ratio=float(kwargs.get("long_task_ratio", 0.7)),
+            # Late-binding multi-turn extension
+            late_binding=bool(kwargs.get("late_binding", False)),
+            late_binding_ratio=float(kwargs.get("late_binding_ratio", 0.5)),
+            late_binding_topn=int(kwargs.get("late_binding_topn", 2)),
+            # Branch-merge late-binding extension
+            branch_merge=bool(kwargs.get("branch_merge", False)),
+            branch_merge_ratio=float(kwargs.get("branch_merge_ratio", 0.35)),
+            branch_merge_group_min=int(kwargs.get("branch_merge_group_min", 2)),
         )
         return {
             "corpus_path": str(corpus_path),
@@ -60,9 +68,12 @@ class SyntheticBrowseComp(Benchmark):
             raw = raw[:limit]
         out: List[Task] = []
         for r in raw:
+            turns = r.get("turns")
+            q0 = r.get("question") or (turns[0] if isinstance(turns, list) and turns else "")
             out.append(Task(
                 id=r["id"],
-                question=r["question"],
+                question=q0,
+                turns=turns,
                 answer=r["answer"],
                 entities=r.get("entities"),
                 required=r.get("required"),
