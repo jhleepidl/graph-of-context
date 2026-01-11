@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import json
 import re
+import hashlib
 from collections import Counter
 from collections import deque
 from pathlib import Path
@@ -165,7 +166,11 @@ class ToolLoopLLMAgent:
 
         # Evidence / anti-loop helpers
         self.evidence_docids: List[str] = []  # ordered unique docids opened via open_page
-        self.opened_cache: Dict[str, str] = {}  # docid -> opened page content (truncated)
+        # Lossless store of opened documents (full content). This is NOT injected verbatim into the prompt.
+        self.opened_cache: Dict[str, str] = {}  # docid -> full page content
+        # Cache per-view opens so we can dedupe exact repeats while still allowing tail/find/offset views.
+        # key -> cached view snippet (for tracing / cached observations)
+        self.opened_view_cache: Dict[str, str] = {}
         self.given_projects: List[str] = []
         self._given_projects_open_idx: int = 0
         self._finish_block_counts: Counter = Counter()
@@ -181,6 +186,7 @@ class ToolLoopLLMAgent:
         self._blocked_queries: Dict[str, int] = {}          # normalized query -> expires_step
         self._unproductive_queries: Counter = Counter()     # normalized query -> count(no-new-doc)
         self._constraints_written: set = set()              # keys to avoid spamming duplicates
+        self._failures_written: set = set()                 # keys to avoid spamming failure nodes
         self._last_progress_step: int = 0                   # last step index with measurable progress
         self._last_exec_tool: Optional[str] = None          # executed tool name
         self._exec_tool_streak: int = 0                     # consecutive same executed tool
@@ -246,7 +252,21 @@ class ToolLoopLLMAgent:
     # =========================
     # Learn-from-failure policy
     # =========================
-    def _policy_record_constraint_once(self, key: str, text: str):
+    def _sig(self, prefix: str, payload: str) -> str:
+        """Stable short signature used as a pseudo-docid for GoC doc_ref linking."""
+        s = (payload or "").encode("utf-8", errors="ignore")
+        h = hashlib.md5(s).hexdigest()[:12]
+        prefix = re.sub(r"[^A-Z0-9_]+", "_", (prefix or "SIG").upper())
+        return f"SIG_{prefix}_{h}"
+
+    def _sig_search_docid(self, query: str) -> str:
+        return self._sig("SEARCH", self._normalize_query(query))
+
+    def _sig_open_docid(self, docid: str) -> str:
+        # docid is already stable; include it in the signature for trace readability.
+        return f"SIG_OPEN_{docid}"
+
+    def _policy_record_constraint_once(self, key: str, text: str, *, docids: Optional[List[str]] = None):
         """Record a durable constraint note once.
 
         We store constraints as SUMMARY nodes so GoC retains them as anchors during pruning.
@@ -257,11 +277,29 @@ class ToolLoopLLMAgent:
             return
         self._constraints_written.add(key)
         try:
-            self.mem.record_summary(text)
+            self.mem.record_summary(text, docids=docids)
             self.counters["constraints_written"] += 1
         except Exception:
             # Never let constraint recording crash the run
             self.counters["constraints_write_errors"] += 1
+
+    def _policy_record_failure_once(self, key: str, text: str, *, docids: Optional[List[str]] = None):
+        """Record a failure trace node once.
+
+        Failure traces are stored as SUMMARY nodes with [FAIL] prefix so GoC can
+        keep them as anchors in ACTIVE_CONTEXT and also connect them via doc_ref
+        to related tool steps (using signature docids).
+        """
+        if not self.cfg.enable_failure_policy:
+            return
+        if key in self._failures_written:
+            return
+        self._failures_written.add(key)
+        try:
+            self.mem.record_summary(text, docids=docids)
+            self.counters["failure_nodes_written"] += 1
+        except Exception:
+            self.counters["failure_nodes_write_errors"] += 1
 
     def _policy_candidate_docid(self) -> Optional[str]:
         """Pick a reasonable next docid to open to escape loops."""
@@ -524,12 +562,22 @@ class ToolLoopLLMAgent:
                 self.counters["policy_overrides"] += 1
                 self.counters["duplicate_open_blocked"] += 1
                 cand = self._policy_candidate_docid()
+                sig = self._sig_open_docid(docid)
+                self._policy_record_failure_once(
+                    key=f"fail_dup_open:{docid}",
+                    text=(
+                        f"[FAIL] Repeated open_page attempted for docid={docid} (already opened). "
+                        "This pattern often causes thrashing; reuse cached FACTS and move to NEW evidence."
+                    ),
+                    docids=[sig, docid],
+                )
                 self._policy_record_constraint_once(
                     key=f"dup_open:{docid}",
                     text=(
                         f"[CONSTRAINT] Duplicate open_page blocked for docid={docid}. "
                         "Use cached FACTS from ACTIVE_CONTEXT and pick a NEW evidence docid instead."
                     ),
+                    docids=[sig, docid],
                 )
                 if cand:
                     new_call = {"tool": "open_page", "args": {"docid": cand}}
@@ -607,6 +655,7 @@ class ToolLoopLLMAgent:
                         f"[CONSTRAINT] Search query on cooldown (too many no-progress repeats): '{query}'. "
                         "Use a different query or open a new evidence document instead."
                     ),
+                    docids=[self._sig_search_docid(query)],
                 )
                 if cand:
                     new_call = {"tool": "open_page", "args": {"docid": cand}}
@@ -665,17 +714,37 @@ class ToolLoopLLMAgent:
         self._unproductive_queries[qnorm] += 1
         self.counters["unproductive_searches"] += 1
 
+        sig = self._sig_search_docid(query)
+        if self._unproductive_queries[qnorm] == 1:
+            self._policy_record_failure_once(
+                key=f"fail_search_nonew:{qnorm}",
+                text=(
+                    f"[FAIL] Search returned no new (unopened) evidence candidates for query: '{query}'. "
+                    "Repeating the same search is unlikely to help; change the query or open a new docid."
+                ),
+                docids=[sig],
+            )
+
         if self._unproductive_queries[qnorm] >= int(self.cfg.unproductive_search_threshold):
             # Cooldown this query to prevent repetition
             exp = step + int(self.cfg.block_search_ttl_steps)
             self._blocked_queries[qnorm] = exp
             self.counters["search_queries_cooled_down"] += 1
+            self._policy_record_failure_once(
+                key=f"fail_search_cooldown:{qnorm}:{exp}",
+                text=(
+                    f"[FAIL] Search entered cooldown after repeated no-progress attempts: '{query}'. "
+                    "This is a strong signal to stop repeating this query and switch strategy."
+                ),
+                docids=[sig],
+            )
             self._policy_record_constraint_once(
                 key=f"cooldown:{qnorm}:{exp}",
                 text=(
                     f"[CONSTRAINT] Query produced no new evidence repeatedly; cooling down: '{query}'. "
                     "Use a different query OR open new evidence docids instead of repeating this search."
                 ),
+                docids=[sig],
             )
 
 
@@ -739,6 +808,91 @@ class ToolLoopLLMAgent:
             header = header[:max_chars].rstrip()
         return header
 
+    def _open_view_key(self, docid: Optional[str], url: Optional[str], args: Dict[str, Any]) -> str:
+        """Stable key for deduping *views* of an opened page.
+
+        We intentionally allow reopening the same doc with a different view
+        (e.g., head vs tail vs find(...) snippets) while still deduping
+        exact repeats to avoid wasting active context.
+        """
+        section = (args.get("section") or "head")
+        find = (args.get("find") or "")
+        offset = args.get("offset")
+        max_chars = args.get("max_chars")
+        find_window = args.get("find_window")
+        # Keep it short but unique.
+        return "|".join([
+            f"docid={docid or ''}",
+            f"url={url or ''}",
+            f"section={section}",
+            f"find={find}",
+            f"offset={'' if offset is None else int(offset)}",
+            f"max_chars={'' if max_chars is None else int(max_chars)}",
+            f"find_window={'' if find_window is None else int(find_window)}",
+        ])
+
+    def _select_open_page_view(self, full_content: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a *view* of a page (head/tail/offset/find) for prompt memory."""
+        content = full_content or ""
+        section = (args.get("section") or "head").lower()
+        find = args.get("find")
+
+        # Keep views reasonably small; we still apply a final 2500-char cap later.
+        max_chars = int(args.get("max_chars", 1800))
+        max_chars = max(200, min(6000, max_chars))
+
+        offset = args.get("offset")
+        if offset is not None:
+            try:
+                off = max(0, int(offset))
+            except Exception:
+                off = 0
+            view = content[off: off + max_chars]
+            return {"view": view, "tag": f"[VIEW offset={off} max_chars={max_chars}]"}
+
+        if find:
+            pat = str(find)
+            hay_low = content.lower()
+            pat_low = pat.lower()
+            idx = hay_low.find(pat_low)
+            win = int(args.get("find_window", 800))
+            win = max(200, min(4000, win))
+            if idx >= 0:
+                start = max(0, idx - win // 2)
+                end = min(len(content), idx + len(pat) + win // 2)
+                # Expand to line boundaries when possible.
+                lb = content.rfind("\n", 0, start)
+                if lb >= 0:
+                    start = lb + 1
+                rb = content.find("\n", end)
+                if rb >= 0:
+                    end = rb
+                view = content[start:end]
+                return {"view": view, "tag": f"[FIND '{pat}' FOUND]"}
+            # Not found: fall back to tail since tasks often hide the line deep.
+            section = "tail"
+            not_found_tag = f"[FIND '{pat}' NOT FOUND → showing tail]"
+            # continue into tail logic with this tag
+            if section == "tail":
+                view = content[-max_chars:] if len(content) > max_chars else content
+                return {"view": view, "tag": not_found_tag}
+
+        if section == "tail":
+            view = content[-max_chars:] if len(content) > max_chars else content
+            return {"view": view, "tag": f"[VIEW tail max_chars={max_chars}]"}
+
+        # default: head
+        view = content[:max_chars]
+        return {"view": view, "tag": f"[VIEW head max_chars={max_chars}]"}
+
+    def _authority_prefix(self, full_content: str) -> str:
+        """Heuristic authority hint to reduce distractor evidence without docid-based cheating."""
+        first = (full_content or "").splitlines()[:1]
+        first_line = first[0] if first else ""
+        if "OFFICIAL PROFILE" in first_line:
+            return "SOURCE: OFFICIAL PROFILE (authoritative)"
+        return "WARNING: NOT OFFICIAL PROFILE TEMPLATE (low-authority; may be distractor)."
+
     def _compose_open_page_observation(self, content: str) -> str:
         """Observation text stored into memory for open_page."""
         max_len = 2500
@@ -753,6 +907,36 @@ class ToolLoopLLMAgent:
         reserve = len(header) + 2  # header + blank line
         body_snip = body[: max(0, max_len - reserve)]
         return header + "\n\n" + body_snip
+
+    def _compose_open_page_observation_view(self, full_content: str, view_content: str, prefix: str, tag: str) -> str:
+        """Compose the open_page observation stored in ACTIVE_CONTEXT.
+
+        - full_content is stored losslessly in storage; used for FACT HEADER extraction.
+        - view_content is what we show the model (head/tail/find snippet).
+        """
+        max_len = 2500
+        lines: List[str] = []
+        if prefix:
+            lines.append(prefix)
+        if tag:
+            lines.append(tag)
+
+        header = ""
+        if self.cfg.open_page_fact_header:
+            header = self._make_fact_header(full_content or "", max_chars=int(self.cfg.fact_header_max_chars))
+            if header:
+                lines.append(header)
+
+        # Separator before body
+        if lines:
+            lines.append("")
+
+        body = view_content or ""
+        # Compute remaining budget
+        pre = "\n".join(lines)
+        rem = max(0, max_len - len(pre))
+        body_snip = body[:rem]
+        return (pre + body_snip)[:max_len]
 
     def _should_block_finish(self, reason: str) -> bool:
         """Block finish at most N times per reason to avoid infinite loops."""
@@ -782,6 +966,9 @@ class ToolLoopLLMAgent:
             "\n"
             "Guidance:\n"
             " - Use search -> open_page to gather evidence docids.\n"
+            " - `open_page` supports optional args for deep facts: {section: 'head'|'tail', find: '<pattern>', offset: <int>, max_chars: <int>, find_window: <int>}.\n"
+            "   Example: {\"tool\":\"open_page\",\"args\":{\"docid\":\"D_TRUTH_0001\",\"find\":\"relocation_note\"}}\n"
+            "   Or: {\"tool\":\"open_page\",\"args\":{\"docid\":\"D_TRUTH_0001\",\"section\":\"tail\"}}\n"
             " - Always cite evidence by including docids in explanation.\n"
         )
 
@@ -1080,12 +1267,20 @@ class ToolLoopLLMAgent:
                             if self.cfg.open_page_dedupe and docid_to_open in self.opened_cache:
                                 self.counters["open_page_cache_hits"] += 1
                                 cached = self.opened_cache.get(docid_to_open, "")
-                                obs = f"[CACHED] docid={docid_to_open} previously opened.\n\n" + self._compose_open_page_observation(cached)
+                                prefix = self._authority_prefix(cached) if cached else ""
+                                view = self._select_open_page_view(cached, {"section": "head"})
+                                view_content = view.get("view") or ""
+                                tag = "[POLICY OVERRIDE] " + (view.get("tag") or "")
+                                obs = self._compose_open_page_observation_view(cached, view_content, prefix, tag)
+                                # Cache the view so exact repeats are deduped.
+                                view_key = self._open_view_key(docid_to_open, None, {"section": "head"})
+                                self.opened_view_cache[view_key] = view_content
                                 self.mem.record_tool(
                                     "open_page",
-                                    {"docid": docid_to_open},
-                                    observation=obs[:2500],
-                                    docids=[docid_to_open],
+                                    {"docid": docid_to_open, "section": "head"},
+                                    observation=obs,
+                                    docids=[docid_to_open, self._sig_open_docid(docid_to_open)],
+                                    storage_text=cached,
                                 )
                                 # Treat policy-driven evidence surfacing as progress to break stuck-mode heuristics.
                                 self._last_progress_step = step
@@ -1095,16 +1290,23 @@ class ToolLoopLLMAgent:
                                 outp = self.tools.open_page(docid=docid_to_open)
                                 self.counters["open_page_calls"] += 1
                                 content = (outp.get("content") or "")
-                                # Cache opened content (truncated) for later auto-finish / analysis
-                                self.opened_cache[outp["docid"]] = content[:2500]
+                                # Cache opened content losslessly (full) for later analysis/unfold.
+                                self.opened_cache[outp["docid"]] = content
                                 if outp["docid"] not in self.evidence_docids:
                                     self.evidence_docids.append(outp["docid"])
-                                obs = self._compose_open_page_observation(content)
+                                prefix = self._authority_prefix(content) if content else ""
+                                view = self._select_open_page_view(content, {"section": "head"})
+                                view_content = view.get("view") or ""
+                                tag = "[POLICY OVERRIDE] " + (view.get("tag") or "")
+                                obs = self._compose_open_page_observation_view(content, view_content, prefix, tag)
+                                view_key = self._open_view_key(outp["docid"], None, {"section": "head"})
+                                self.opened_view_cache[view_key] = view_content
                                 self.mem.record_tool(
                                     "open_page",
-                                    {"docid": docid_to_open},
+                                    {"docid": docid_to_open, "section": "head"},
                                     observation=obs,
-                                    docids=[outp["docid"]],
+                                    docids=[outp["docid"], self._sig_open_docid(outp["docid"])],
+                                    storage_text=content,
                                 )
                                 self._last_progress_step = step
 
@@ -1142,7 +1344,13 @@ class ToolLoopLLMAgent:
                     self.counters["search_calls"] += 1
 
                     # Record into memory (active context)
-                    self.mem.record_tool("search", args, observation=str([x["docid"] for x in out]))
+                    sig = self._sig_search_docid(query)
+                    self.mem.record_tool(
+                        "search",
+                        args,
+                        observation=str([x["docid"] for x in out]),
+                        docids=[sig],
+                    )
 
                     self._trace({
                         "type": "tool",
@@ -1166,18 +1374,30 @@ class ToolLoopLLMAgent:
                             "tool":"open_page","args":args,"malformed":True
                         })
                         continue
-                    # v21: avoid wasting context budget on duplicate open_page calls
-                    if self.cfg.open_page_dedupe and docid and (docid in self.opened_cache):
-                        self.counters["open_page_cache_hits"] += 1
-                        cached = self.opened_cache.get(docid, "")
-                        obs = f"[CACHED] docid={docid} previously opened.\n\n" + self._compose_open_page_observation(cached)
-                        # Store full content losslessly (for GoC), but keep a compact observation in ACTIVE_CONTEXT.
-                        self.mem.record_tool("open_page", args, observation=obs[:2500], docids=[docid], storage_text=cached)
 
-                        if docid not in self.evidence_docids:
+                    view_key = self._open_view_key(docid, url, args)
+
+                    # Dedupe exact repeats of the *same view* (head/tail/find/offset).
+                    if self.cfg.open_page_dedupe and view_key in self.opened_view_cache:
+                        self.counters["open_page_cache_hits"] += 1
+                        full_content = self.opened_cache.get(docid, "") if docid else ""
+                        view_content = self.opened_view_cache.get(view_key, "")
+                        prefix = self._authority_prefix(full_content) if full_content else ""
+                        obs = self._compose_open_page_observation_view(full_content or view_content, view_content, prefix, "[CACHED VIEW]")
+
+                        self.mem.record_tool(
+                            "open_page",
+                            args,
+                            observation=obs,
+                            docids=[docid, self._sig_open_docid(docid)] if docid else [],
+                            storage_text=full_content or None,
+                        )
+
+                        if docid and docid not in self.evidence_docids:
                             self.evidence_docids.append(docid)
 
-                        # Progress: evidence surfaced; clear any previous finish-block signal.
+                        # Treat cached view surfacing as progress to avoid stuck-mode false positives.
+                        self._last_progress_step = step
                         self._last_finish_block_reason = None
 
                         self._trace({
@@ -1187,36 +1407,56 @@ class ToolLoopLLMAgent:
                             "run_tag": run_tag,
                             "step": step,
                             "tool": "open_page",
-                            "args": {"docid": docid, "url": args.get("url")},
+                            "args": {**args},
                             "opened_docid": docid,
                             "cached": True,
-                            "content_preview": cached[:800],
+                            "view_key": view_key,
+                            "content_preview": view_content[:800],
                         })
                         continue
 
-                    out = self.tools.open_page(docid=docid, url=url)
-                    self.counters["open_page_calls"] += 1
+                    # Fetch full content (lossless) either from cache or by calling env.
+                    cached_doc = False
+                    full_content = ""
+                    if docid and docid in self.opened_cache:
+                        cached_doc = True
+                        self.counters["open_page_cache_hits"] += 1
+                        full_content = self.opened_cache.get(docid, "")
+                    else:
+                        out = self.tools.open_page(docid=docid, url=url)
+                        self.counters["open_page_calls"] += 1
+                        full_content = (out.get("content") or "")
+                        # Canonicalize ids
+                        docid = out.get("docid") or docid
+                        url = out.get("url") or url
+                        if docid:
+                            self.opened_cache[docid] = full_content
 
-                    content = (out.get("content") or "")
-                    obs = self._compose_open_page_observation(content)
+                    prefix = self._authority_prefix(full_content)
+                    view = self._select_open_page_view(full_content, args)
+                    view_content = view.get("view") or ""
+                    tag = view.get("tag") or ""
+
+                    obs = self._compose_open_page_observation_view(full_content, view_content, prefix, tag)
+
                     # Store full content losslessly (for GoC), but keep a compact observation in ACTIVE_CONTEXT.
-                    self.mem.record_tool("open_page", args, observation=obs, docids=[out["docid"]], storage_text=content)
+                    self.mem.record_tool(
+                        "open_page",
+                        args,
+                        observation=obs,
+                        docids=[docid, self._sig_open_docid(docid)] if docid else [],
+                        storage_text=full_content,
+                    )
 
-                    # Cache opened content for auto-finish / analysis
-                    self.opened_cache[out["docid"]] = content[:2500]
+                    # Cache per-view so exact repeats are deduped, but different views are allowed.
+                    self.opened_view_cache[view_key] = view_content
 
-                    # Progress: opened a new evidence document
+                    # Progress: opened/surfaced evidence
                     self._last_progress_step = step
                     self._last_finish_block_reason = None
 
-                    # Progress: clear any previous finish-block signal.
-                    self._last_finish_block_reason = None
-
-                    # Track evidence docids (opened pages) for finish auto-citation
-                    opened = out.get("docid")
-                    if opened:
-                        if opened not in self.evidence_docids:
-                            self.evidence_docids.append(opened)
+                    if docid and docid not in self.evidence_docids:
+                        self.evidence_docids.append(docid)
 
                     self._trace({
                         "type": "tool",
@@ -1225,11 +1465,15 @@ class ToolLoopLLMAgent:
                         "run_tag": run_tag,
                         "step": step,
                         "tool": "open_page",
-                        "args": {"docid": out.get("docid"), "url": args.get("url")},
-                        "opened_docid": out.get("docid"),
-                        "cached": False,
-                        "content_preview": content[:800],
+                        "args": {**args, "docid": docid, "url": url},
+                        "opened_docid": docid,
+                        "cached": bool(cached_doc),
+                        "view_key": view_key,
+                        "view_tag": tag,
+                        "content_preview": view_content[:800],
                     })
+
+
 
 
                 elif tool == "branch":

@@ -8,6 +8,43 @@ from .utils import approx_token_count, tokenize
 from .retrievers.base import TextItem, TextRetriever
 from .retrievers.factory import build_retriever
 
+
+class RRFMultiRetriever:
+    """Combine multiple retrievers with Reciprocal Rank Fusion (RRF).
+
+    We use RRF because raw scores across independently-built BM25/FAISS indices
+    are not reliably comparable. RRF is rank-based and cheap.
+    """
+
+    def __init__(self, retrievers: List[TextRetriever], *, k0: int = 60):
+        self.retrievers = [r for r in (retrievers or []) if r is not None]
+        self.k0 = int(k0)
+
+    def search(self, query: str, topk: int = 10) -> List[Tuple[str, float]]:
+        topk = max(1, int(topk))
+        if not self.retrievers:
+            return []
+        # Pull a bit more from each segment then fuse.
+        per = max(10, topk * 3)
+        scores: Dict[str, float] = {}
+        for r in self.retrievers:
+            try:
+                hits = r.search(query, topk=per)
+            except Exception:
+                hits = []
+            for rank, (nid, _raw) in enumerate(hits):
+                scores[nid] = scores.get(nid, 0.0) + 1.0 / float(self.k0 + rank + 1)
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
+
+    def size(self) -> int:
+        s = 0
+        for r in self.retrievers:
+            try:
+                s += int(r.size())
+            except Exception:
+                pass
+        return s
+
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
@@ -270,6 +307,21 @@ class GoCMemory(MemoryManagerBase):
     # preserved but not active
     storage: List[str] = field(default_factory=list)
     _storage_retriever: Optional[TextRetriever] = None
+    _storage_segments: List[Tuple[List[str], TextRetriever]] = field(default_factory=list)
+    _storage_buffer: List[str] = field(default_factory=list)
+    _storage_buffer_retriever: Optional[TextRetriever] = None
+    _storage_indexed: Set[str] = field(default_factory=set)
+
+    # Incremental / segmented storage indexing (LSM-style)
+    storage_segment_size: int = 120          # buffer size before creating a new segment index
+    storage_max_segments: int = 12           # max segment indices before compacting into a cold archive
+    storage_hot_segments: int = 3            # keep these most-recent segments "hot" (richer indexing)
+
+    # Folding policy (connectivity / cut-minimization)
+    fold_window_max: int = 40               # consider this many oldest ACTIVE nodes as fold candidates
+    fold_max_chunk: int = 10                # maximum folded nodes per fold op
+    fold_w_internal: float = 1.0            # reward edges within the chunk
+    fold_w_cut: float = 1.4                 # penalize edges from chunk to remaining ACTIVE
 
     # storage retrieval backend
     storage_retriever_kind: str = "bm25"
@@ -286,6 +338,10 @@ class GoCMemory(MemoryManagerBase):
         super().reset()
         self.storage = []
         self._storage_retriever = None
+        self._storage_segments = []
+        self._storage_buffer = []
+        self._storage_buffer_retriever = None
+        self._storage_indexed = set()
         self.docid_to_nodes = {}
         self.edges_out = {"depends": {}, "doc_ref": {}, "seq": {}}
         self.edges_in = {"depends": {}, "doc_ref": {}, "seq": {}}
@@ -331,26 +387,107 @@ class GoCMemory(MemoryManagerBase):
         return nid
 
     # ---- storage index ----
-    def _rebuild_storage_index(self):
+    def _index_text(self, n: MemoryNode, *, include_full: bool) -> str:
+        """Text representation used for storage indexing.
+
+        - include_full=True: index clipped head+tail of full content when available.
+        - include_full=False: index only compact text ("cold" archive).
+        """
+        if not n:
+            return ""
+        if (not include_full) or (not n.storage_text):
+            return n.text
+        full = n.storage_text
+        if len(full) > 8000:
+            full = full[:4000] + "\n...\n" + full[-4000:]
+        return n.text + "\n\n[FULL_CONTENT]\n" + full
+
+    def _build_storage_segment(self, nids: List[str], *, include_full: bool) -> Optional[TextRetriever]:
         items: List[TextItem] = []
-
-        def _index_text(n: MemoryNode) -> str:
-            # For lossless storage nodes (e.g., open_page), index both the compact active text and
-            # a clipped version of the full content (head+tail) so late-bound facts near the end
-            # are retrievable without re-opening pages.
-            if not n.storage_text:
-                return n.text
-            full = n.storage_text
-            if len(full) > 8000:
-                full = full[:4000] + "\n...\n" + full[-4000:]
-            return n.text + "\n\n[FULL_CONTENT]\n" + full
-
-        for nid in self.storage:
+        for nid in nids:
             n = self.nodes.get(nid)
             if not n:
                 continue
-            items.append(TextItem(id=nid, text=_index_text(n), meta={"url": f"mem://{nid}", "title": n.kind}))
-        self._storage_retriever = build_retriever(self.storage_retriever_kind, items, faiss_dim=self.storage_faiss_dim) if items else None
+            items.append(TextItem(id=nid, text=self._index_text(n, include_full=include_full), meta={"url": f"mem://{nid}", "title": n.kind}))
+        return build_retriever(self.storage_retriever_kind, items, faiss_dim=self.storage_faiss_dim) if items else None
+
+    def _refresh_storage_retriever(self):
+        segs = [r for (_ids, r) in (self._storage_segments or []) if r is not None]
+        if self._storage_buffer_retriever is not None:
+            segs = segs + [self._storage_buffer_retriever]
+        self._storage_retriever = RRFMultiRetriever(segs) if segs else None
+
+    def _flush_storage_buffer(self, *, force: bool = False):
+        if not self._storage_buffer:
+            return
+        if (not force) and len(self._storage_buffer) < int(self.storage_segment_size):
+            return
+        nids = list(self._storage_buffer)
+        self._storage_buffer = []
+        self._storage_buffer_retriever = None
+        retr = self._build_storage_segment(nids, include_full=True)
+        if retr is not None:
+            self._storage_segments.append((nids, retr))
+
+    def _compact_storage_segments(self):
+        """Compact old segments into a single cold archive segment.
+
+        This prevents unbounded index rebuilds while keeping recent segments richer.
+        """
+        max_segs = int(self.storage_max_segments)
+        hot = max(1, int(self.storage_hot_segments))
+        if len(self._storage_segments) <= max_segs:
+            return
+        # Keep last `hot` segments as-is; compact the rest.
+        keep_tail = self._storage_segments[-hot:]
+        to_merge = self._storage_segments[:-hot]
+        merge_ids: List[str] = []
+        for ids, _r in to_merge:
+            merge_ids.extend(ids)
+        # Build a compressed cold index (no full content).
+        cold = self._build_storage_segment(merge_ids, include_full=False) if merge_ids else None
+        new_segments: List[Tuple[List[str], TextRetriever]] = []
+        if cold is not None:
+            new_segments.append((merge_ids, cold))
+        new_segments.extend(keep_tail)
+        self._storage_segments = new_segments
+
+    def _ensure_storage_index(self, *, force_flush: bool = False):
+        # Ensure the newest stored nodes are searchable immediately:
+        #  - if the buffer isn't large enough to flush to a permanent segment,
+        #    keep a small "buffer retriever" over the buffer.
+        #  - periodically flush to segments and compact older segments.
+        if force_flush:
+            self._flush_storage_buffer(force=True)
+        else:
+            self._flush_storage_buffer(force=False)
+            if self._storage_buffer:
+                self._storage_buffer_retriever = self._build_storage_segment(list(self._storage_buffer), include_full=True)
+            else:
+                self._storage_buffer_retriever = None
+
+        self._compact_storage_segments()
+        self._refresh_storage_retriever()
+
+    def _storage_index_add(self, nids: List[str], *, force_flush: bool = False):
+        """Incrementally add storage nodes into the segmented index."""
+        if not nids:
+            return
+        for nid in nids:
+            if nid in self._storage_indexed:
+                continue
+            if nid not in self.nodes:
+                continue
+            self._storage_indexed.add(nid)
+            self._storage_buffer.append(nid)
+        self._ensure_storage_index(force_flush=force_flush)
+
+    def _rebuild_storage_index(self):
+        """Full rebuild (fallback / debug)."""
+        self._storage_segments = []
+        self._storage_buffer = []
+        self._storage_indexed = set()
+        self._storage_index_add(list(self.storage), force_flush=True)
 
     # ---- overrides to track branch nodes ----
     def branch(self, description: str, prompt: str) -> str:
@@ -398,7 +535,8 @@ class GoCMemory(MemoryManagerBase):
 
         self.active.append(proxy_id)
 
-        self._rebuild_storage_index()
+        # Incrementally index newly stored nodes.
+        self._storage_index_add(list(to_remove), force_flush=False)
         self.maybe_fold()
 
     
@@ -581,36 +719,75 @@ class GoCMemory(MemoryManagerBase):
         return proxy_id
 
     def _replace_prefix_with_proxy(self, chunk: List[str], proxy_id: str):
-        """Replace the prefix `chunk` in ACTIVE with the proxy node, keep proxy ACTIVE."""
+        """Replace `chunk` nodes in ACTIVE with a proxy node.
+
+        Unlike range-based folding, GoC folding may pick a *non-contiguous* chunk.
+        We insert the proxy at the earliest position of any removed node.
+        """
         if not chunk:
             return
-        # Expect chunk to be a prefix of active (we construct it that way)
-        k = len(chunk)
-        if self.active[:k] != chunk:
-            # Fallback: remove any occurrences of chunk members
-            remaining = [nid for nid in self.active if nid not in set(chunk)]
-            self.active = [proxy_id] + remaining
-        else:
-            self.active = [proxy_id] + self.active[k:]
+
+        chunk_set = set(chunk)
+        positions = [i for i, nid in enumerate(self.active) if nid in chunk_set]
+        if not positions:
+            return
+        ins = min(positions)
+        # Remove chunk nodes
+        self.active = [nid for nid in self.active if nid not in chunk_set]
+        # Insert proxy once
+        if proxy_id not in self.active:
+            self.active.insert(ins, proxy_id)
+
+    def _is_anchor_node(self, nid: str) -> bool:
+        """Anchor nodes should remain in ACTIVE_CONTEXT as long as possible.
+
+        We treat failure traces and deterministic constraints as anchors.
+        """
+        n = self.nodes.get(nid)
+        if not n or n.kind != "summary":
+            return False
+        t = (n.text or "").lstrip()
+        return t.startswith("[FAIL]") or t.startswith("[CONSTRAINT]")
+
+    def _active_neighbors(self, nid: str, active_set: Set[str], etypes: Tuple[str, ...] = ("depends", "doc_ref")) -> Set[str]:
+        """Undirected neighbors within ACTIVE for fold heuristics."""
+        out: Set[str] = set()
+        for et in etypes:
+            out |= set(self.edges_out.get(et, {}).get(nid, set()))
+            out |= set(self.edges_in.get(et, {}).get(nid, set()))
+        return out & active_set
 
     def _prune_oldest_non_summary_to_storage(self):
-        """As a last resort, remove the oldest NON-summary node (keep summaries as anchors)."""
+        """As a last resort, prune the oldest node while preserving anchors."""
         if len(self.active) <= 1:
             return
         # protect the most recent node
         prefix = self.active[:-1]
+
+        # 1) Prefer pruning non-summary, non-anchor nodes.
         idx = None
         for i, nid in enumerate(prefix):
             n = self.nodes.get(nid)
-            if n and n.kind != "summary":
+            if not n or self._is_anchor_node(nid):
+                continue
+            if n.kind != "summary":
                 idx = i
                 break
+
+        # 2) Else prune the oldest non-anchor summary.
         if idx is None:
-            # if everything is summary, prune the oldest summary
+            for i, nid in enumerate(prefix):
+                if nid in self.nodes and (not self._is_anchor_node(nid)):
+                    idx = i
+                    break
+
+        # 3) If everything is an anchor, prune the oldest anchor as a last-last resort.
+        if idx is None:
             idx = 0
         nid = self.active.pop(idx)
         if nid in self.nodes and nid not in self.storage:
             self.storage.append(nid)
+            self._storage_index_add([nid], force_flush=False)
 
     # ---- folding: keep removed nodes in storage for recovery ----
     def maybe_fold(self):
@@ -627,33 +804,69 @@ class GoCMemory(MemoryManagerBase):
 
         # Fold until under budget (or we cannot make progress)
         safety = 0
+        newly_stored: List[str] = []
         while self.active_tokens() > self.budget_active and len(self.active) > 1 and safety < 50:
             safety += 1
             overflow = self.active_tokens() - self.budget_active
-            # We keep the most recent node to preserve immediate context.
+            # Keep the most recent node to preserve immediate context.
             prefix = self.active[:-1]
             if not prefix:
                 break
 
             # Target: remove at least overflow tokens, plus a small buffer.
             target_remove = max(overflow + 50, int(self.budget_active * 0.25))
-            max_chunk = 8
+            max_chunk = int(self.fold_max_chunk or 10)
 
-            chunk: List[str] = []
-            removed = 0
-            for nid in prefix:
-                if nid not in self.nodes:
-                    continue
-                chunk.append(nid)
-                removed += self.nodes[nid].token_len
-                if removed >= target_remove or len(chunk) >= max_chunk:
+            # Candidate window: oldest nodes only (avoid folding the latest context).
+            window = [nid for nid in prefix if nid in self.nodes][: max(1, int(self.fold_window_max))]
+            candidates = [nid for nid in window if not self._is_anchor_node(nid)]
+
+            if not candidates:
+                # Nothing foldable in the window; prune (will preserve anchors if possible).
+                self._prune_oldest_non_summary_to_storage()
+                continue
+
+            active_set = set(self.active)
+            pos = {nid: i for i, nid in enumerate(candidates)}
+            neigh = {nid: self._active_neighbors(nid, active_set) for nid in candidates}
+
+            # Seed with the oldest candidate.
+            chunk: List[str] = [candidates[0]]
+            chunk_set: Set[str] = set(chunk)
+            removed = int(self.nodes[chunk[0]].token_len)
+
+            # Greedy expansion: prefer high internal connectivity + low cut to remaining ACTIVE.
+            while removed < target_remove and len(chunk) < max_chunk:
+                best_v: Optional[str] = None
+                best_score = -1e18
+                best_tok = -1
+
+                for v in candidates:
+                    if v in chunk_set:
+                        continue
+                    nbr = neigh.get(v, set())
+                    internal = len(nbr & chunk_set)
+                    cut = len(nbr - chunk_set)
+                    # Slight bias towards older nodes (smaller pos) to keep chronology stable.
+                    age_bonus = 0.05 * (1.0 - (pos.get(v, 0) / max(1.0, float(len(candidates) - 1))))
+                    score = float(self.fold_w_internal) * float(internal) - float(self.fold_w_cut) * float(cut) + age_bonus
+                    tok = int(self.nodes[v].token_len)
+                    if (score > best_score) or (abs(score - best_score) < 1e-9 and tok > best_tok):
+                        best_score = score
+                        best_tok = tok
+                        best_v = v
+
+                if best_v is None:
                     break
+                chunk.append(best_v)
+                chunk_set.add(best_v)
+                removed += int(self.nodes[best_v].token_len)
 
-            # Allow single-node folding if the oldest node is huge (common with long descriptions).
+            # Allow single-node folding only if it meaningfully helps.
             if len(chunk) == 1:
                 n0 = self.nodes.get(chunk[0])
                 if not n0 or (n0.token_len < int(self.budget_active * 0.40) and removed < target_remove):
-                    chunk = []  # fall back to prune
+                    chunk = []
 
             if chunk:
                 before = self.active_tokens()
@@ -664,6 +877,7 @@ class GoCMemory(MemoryManagerBase):
                 for nid in chunk:
                     if nid in self.nodes and nid not in self.storage:
                         self.storage.append(nid)
+                        newly_stored.append(nid)
                 after = self.active_tokens()
                 # If folding didn't reduce anything (should be rare), prune one node to avoid infinite loops.
                 if after >= before:
@@ -673,7 +887,11 @@ class GoCMemory(MemoryManagerBase):
             # Fallback pruning: keep summaries as anchors
             self._prune_oldest_non_summary_to_storage()
 
-        self._rebuild_storage_index()
+        # Incrementally index any newly stored nodes (buffer retriever keeps them searchable immediately).
+        if newly_stored:
+            self._storage_index_add(newly_stored, force_flush=False)
+        else:
+            self._ensure_storage_index(force_flush=False)
 
     # ---- minimal-closure unfold ----
     def _dep_closure(self, seeds: List[str], depth: int) -> Set[str]:

@@ -299,7 +299,8 @@ def make_corpus_and_tasks(
                     q3 = (
                         "MULTI-TURN TASK (part 3/3) — MERGE (late binding):\n"
                         "Using ONLY the A_WINNER and B_WINNER you returned earlier (do NOT redo global search over all projects),\n"
-                        "open BOTH winners' OFFICIAL PROFILE pages (docid D_TRUTH_####) and find the line `relocation_note:` (it is placed deep in the page).\n"
+                        "open BOTH winners' OFFICIAL PROFILE pages (use the page that starts with '<Project> OFFICIAL PROFILE') and locate the line `relocation_note:` which is placed deep in the page.\n"
+                        "Tip: use open_page with args find='relocation_note' (or section='tail') to access deep lines.\n"
                         "Choose the winner with the MOST RECENT relocation_year.\n"
                         "Finish with the headquarters of that project.\n"
                         "Answer exactly as '<ProjectName> | <Headquarters>'."
@@ -350,7 +351,8 @@ def make_corpus_and_tasks(
                 q2 = (
                     "FOLLOW-UP (late binding):\n"
                     f"Using ONLY the shortlisted projects you identified earlier (do NOT redo global search over all projects),\n"
-                    f"open their OFFICIAL PROFILE pages (docid like D_TRUTH_####) and read the line `relocation_note:` which is placed deep in the page.\n"
+                    f"open their OFFICIAL PROFILE pages (use the page that starts with '<Project> OFFICIAL PROFILE') and read the line `relocation_note:` which is placed deep in the page.\n"
+                    "Tip: use open_page with args find='relocation_note' (or section='tail') to access deep lines.\n"
                     f"Choose the shortlisted project with the MOST RECENT relocation_year.\n"
                     "Finally, finish with the headquarters of that project.\n"
                     "Answer exactly as '<ProjectName> | <Headquarters>'."
