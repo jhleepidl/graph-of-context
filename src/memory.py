@@ -4,6 +4,9 @@ from typing import List, Dict, Any, Optional, Tuple, Set
 import uuid
 import re
 
+# Network flow / min-cut for token-weighted folding.
+import networkx as nx
+
 from .utils import approx_token_count, tokenize
 from .retrievers.base import TextItem, TextRetriever
 from .retrievers.factory import build_retriever
@@ -319,7 +322,19 @@ class GoCMemory(MemoryManagerBase):
 
     # Folding policy (connectivity / cut-minimization)
     fold_window_max: int = 40               # consider this many oldest ACTIVE nodes as fold candidates
-    fold_max_chunk: int = 10                # maximum folded nodes per fold op
+    fold_max_chunk: int = 10                # (soft) cap for folded nodes per fold op (min-cut may exceed; we post-process)
+
+    # Token-weighted min-cut folding (default): choose a subset that (a) removes enough tokens
+    # while (b) minimizing cross edges (cut) to the remaining ACTIVE context.
+    fold_method: str = "mincut"             # "mincut" or "greedy" (fallback)
+    fold_edge_w_depends: float = 1.0
+    fold_edge_w_docref: float = 1.0
+    fold_edge_w_seq: float = 0.2
+    fold_mincut_lambda_init: float = 1e-3
+    fold_mincut_lambda_max: float = 1e6
+    fold_mincut_iters: int = 22
+
+    # Greedy folding weights (kept as fallback / debugging)
     fold_w_internal: float = 1.0            # reward edges within the chunk
     fold_w_cut: float = 1.4                 # penalize edges from chunk to remaining ACTIVE
 
@@ -757,6 +772,191 @@ class GoCMemory(MemoryManagerBase):
             out |= set(self.edges_in.get(et, {}).get(nid, set()))
         return out & active_set
 
+    # ---- token-weighted min-cut folding ----
+    def _cut_edge_weight(self, u: str, v: str) -> float:
+        """Undirected edge weight between two nodes, aggregating edge types.
+
+        We purposefully treat edges as *undirected* for folding: fold should group
+        tightly connected nodes regardless of direction.
+        """
+        w = 0.0
+        # depends
+        if (v in self.edges_out.get("depends", {}).get(u, set())) or (u in self.edges_out.get("depends", {}).get(v, set())):
+            w += float(self.fold_edge_w_depends)
+        # doc_ref
+        if (v in self.edges_out.get("doc_ref", {}).get(u, set())) or (u in self.edges_out.get("doc_ref", {}).get(v, set())):
+            w += float(self.fold_edge_w_docref)
+        # seq
+        if (v in self.edges_out.get("seq", {}).get(u, set())) or (u in self.edges_out.get("seq", {}).get(v, set())):
+            w += float(self.fold_edge_w_seq)
+        return w
+
+    def _active_cut_weight_to_outside(self, nid: str, candidates_set: Set[str], active_set: Set[str]) -> float:
+        """Total undirected edge weight from `nid` to ACTIVE nodes outside candidates."""
+        w = 0.0
+        for et, ew in (
+            ("depends", float(self.fold_edge_w_depends)),
+            ("doc_ref", float(self.fold_edge_w_docref)),
+            ("seq", float(self.fold_edge_w_seq)),
+        ):
+            outs = set(self.edges_out.get(et, {}).get(nid, set()))
+            ins = set(self.edges_in.get(et, {}).get(nid, set()))
+            nbrs = (outs | ins) & active_set
+            outside = nbrs - candidates_set
+            if outside:
+                w += ew * float(len(outside))
+        return w
+
+    def _select_fold_chunk_mincut(
+        self,
+        candidates: List[str],
+        *,
+        active_set: Set[str],
+        target_remove: int,
+        seed: str,
+    ) -> List[str]:
+        """Select a fold chunk using token-weighted s-t min-cut.
+
+        We solve a family of min-cut problems parameterized by `lambda`:
+
+            minimize  cut(S)  +  sum_{v in T} lambda * token(v)
+
+        where S is the SOURCE side (folded), T is the SINK side (kept).
+        This encourages moving token-heavy nodes into S while paying the cut edges.
+
+        We then search lambda so that token(S) >= target_remove.
+        """
+        candidates_set = set(candidates)
+        if seed not in candidates_set:
+            return []
+
+        # Special nodes
+        SRC = "__SRC__"
+        SNK = "__SNK__"
+        KEEP = "__KEEP__"  # represents all ACTIVE nodes outside `candidates`
+
+        INF = 1e12
+
+        # Precompute pair weights among candidates (sparse) and outside-cut weights.
+        pair_w: Dict[Tuple[str, str], float] = {}
+        # Use edges_out keys to avoid O(n^2).
+        for u in candidates:
+            for et in ("depends", "doc_ref", "seq"):
+                for v in self.edges_out.get(et, {}).get(u, set()):
+                    if v not in candidates_set or v == u:
+                        continue
+                    a, b = (u, v) if u < v else (v, u)
+                    pair_w[(a, b)] = pair_w.get((a, b), 0.0) + float(
+                        self.fold_edge_w_depends if et == "depends" else self.fold_edge_w_docref if et == "doc_ref" else self.fold_edge_w_seq
+                    )
+            # Include inbound edges too (treat as undirected).
+            for et in ("depends", "doc_ref", "seq"):
+                for v in self.edges_in.get(et, {}).get(u, set()):
+                    if v not in candidates_set or v == u:
+                        continue
+                    a, b = (u, v) if u < v else (v, u)
+                    pair_w[(a, b)] = pair_w.get((a, b), 0.0) + float(
+                        self.fold_edge_w_depends if et == "depends" else self.fold_edge_w_docref if et == "doc_ref" else self.fold_edge_w_seq
+                    )
+
+        outside_w: Dict[str, float] = {}
+        for u in candidates:
+            outside_w[u] = self._active_cut_weight_to_outside(u, candidates_set, active_set)
+
+        # Build and solve min-cut for a given lambda.
+        def solve(lam: float) -> Tuple[List[str], float, int]:
+            lam = float(max(0.0, lam))
+            G = nx.DiGraph()
+            G.add_node(SRC)
+            G.add_node(SNK)
+            G.add_node(KEEP)
+            # Force KEEP to be on sink side.
+            G.add_edge(KEEP, SNK, capacity=INF)
+
+            # Candidate-candidate symmetric edges.
+            for (a, b), w in pair_w.items():
+                if w <= 0:
+                    continue
+                G.add_edge(a, b, capacity=w)
+                G.add_edge(b, a, capacity=w)
+
+            # Candidate-KEEP edges representing cut to outside ACTIVE.
+            for u, w in outside_w.items():
+                if w <= 0:
+                    continue
+                G.add_edge(u, KEEP, capacity=w)
+                G.add_edge(KEEP, u, capacity=w)
+
+            # Unary token penalty for leaving node on sink side.
+            for u in candidates:
+                if u == seed:
+                    continue
+                tok = float(self.nodes[u].token_len) if u in self.nodes else 0.0
+                # If u ends up in sink side, edge SRC->u is cut and paid.
+                cap = lam * tok
+                if cap > 0:
+                    G.add_edge(SRC, u, capacity=cap)
+                else:
+                    # Ensure node exists in graph.
+                    G.add_node(u)
+
+            # Force seed to SOURCE side.
+            G.add_edge(SRC, seed, capacity=INF)
+
+            try:
+                cut_value, (S, T) = nx.minimum_cut(G, SRC, SNK, capacity="capacity")
+            except Exception:
+                return ([], float("inf"), 0)
+
+            chunk = [u for u in S if (u in candidates_set)]
+            tok_sum = sum(int(self.nodes[u].token_len) for u in chunk if u in self.nodes)
+            return (chunk, float(cut_value), int(tok_sum))
+
+        # Quick feasibility: if even max lambda can't hit target, take all candidates.
+        lam_lo = 0.0
+        lam_hi = float(self.fold_mincut_lambda_init)
+        best_over: Optional[Tuple[List[str], float, int, float]] = None  # (chunk, cut, tok, lam)
+
+        # Escalate lambda until we satisfy target or hit max.
+        for _ in range(40):
+            chunk, cutv, tok = solve(lam_hi)
+            if tok >= target_remove and chunk:
+                best_over = (chunk, cutv, tok, lam_hi)
+                break
+            lam_hi *= 2.0
+            if lam_hi > float(self.fold_mincut_lambda_max):
+                break
+
+        if best_over is None:
+            # Not enough removable tokens in candidates; fold all candidates (still avoids anchors).
+            return list(candidates)
+
+        # Binary search for the smallest lambda achieving target_remove.
+        lam_best = best_over[3]
+        chunk_best, cut_best, tok_best = best_over[0], best_over[1], best_over[2]
+        for _ in range(int(self.fold_mincut_iters)):
+            lam_mid = 0.5 * (lam_lo + lam_hi)
+            chunk, cutv, tok = solve(lam_mid)
+            if not chunk:
+                lam_lo = lam_mid
+                continue
+            if tok >= target_remove:
+                lam_hi = lam_mid
+                lam_best, chunk_best, cut_best, tok_best = lam_mid, chunk, cutv, tok
+            else:
+                lam_lo = lam_mid
+
+        # Local refinement: try a few lambdas around the boundary and keep the lowest cut.
+        lam_grid = sorted({lam_best, lam_best * 0.7, lam_best * 1.4, lam_hi, lam_lo})
+        best = (chunk_best, cut_best, tok_best)
+        for lam in lam_grid:
+            chunk, cutv, tok = solve(lam)
+            if chunk and tok >= target_remove:
+                if cutv < best[1] or (abs(cutv - best[1]) < 1e-9 and tok < best[2]):
+                    best = (chunk, cutv, tok)
+
+        return list(best[0])
+
     def _prune_oldest_non_summary_to_storage(self):
         """As a last resort, prune the oldest node while preserving anchors."""
         if len(self.active) <= 1:
@@ -827,40 +1027,85 @@ class GoCMemory(MemoryManagerBase):
                 continue
 
             active_set = set(self.active)
-            pos = {nid: i for i, nid in enumerate(candidates)}
-            neigh = {nid: self._active_neighbors(nid, active_set) for nid in candidates}
+            seed = candidates[0]
 
-            # Seed with the oldest candidate.
-            chunk: List[str] = [candidates[0]]
-            chunk_set: Set[str] = set(chunk)
-            removed = int(self.nodes[chunk[0]].token_len)
+            # Select chunk: token-weighted min-cut (default) or greedy fallback.
+            chunk: List[str] = []
+            if str(self.fold_method).lower() == "mincut":
+                chunk = self._select_fold_chunk_mincut(
+                    candidates,
+                    active_set=active_set,
+                    target_remove=int(target_remove),
+                    seed=seed,
+                )
+                # Keep deterministic ordering based on ACTIVE chronology.
+                chunk_set = set(chunk)
+                chunk = [nid for nid in candidates if nid in chunk_set]
 
-            # Greedy expansion: prefer high internal connectivity + low cut to remaining ACTIVE.
-            while removed < target_remove and len(chunk) < max_chunk:
-                best_v: Optional[str] = None
-                best_score = -1e18
-                best_tok = -1
+                # Soft cap: if min-cut returns a very large set, shrink it while trying
+                # to retain connectivity and satisfy the token target.
+                hard_max = max(20, int(max_chunk) * 4)
+                if len(chunk) > hard_max:
+                    # Rank by internal connectivity (within chunk) then token mass.
+                    ch_set = set(chunk)
+                    def _internal_deg(u: str) -> int:
+                        return len(self._active_neighbors(u, ch_set, ("depends", "doc_ref", "seq")))
 
-                for v in candidates:
-                    if v in chunk_set:
-                        continue
-                    nbr = neigh.get(v, set())
-                    internal = len(nbr & chunk_set)
-                    cut = len(nbr - chunk_set)
-                    # Slight bias towards older nodes (smaller pos) to keep chronology stable.
-                    age_bonus = 0.05 * (1.0 - (pos.get(v, 0) / max(1.0, float(len(candidates) - 1))))
-                    score = float(self.fold_w_internal) * float(internal) - float(self.fold_w_cut) * float(cut) + age_bonus
-                    tok = int(self.nodes[v].token_len)
-                    if (score > best_score) or (abs(score - best_score) < 1e-9 and tok > best_tok):
-                        best_score = score
-                        best_tok = tok
-                        best_v = v
+                    keep: List[str] = [seed] if seed in ch_set else [chunk[0]]
+                    kept_set = set(keep)
+                    removed = sum(int(self.nodes[u].token_len) for u in keep if u in self.nodes)
+                    rest = [u for u in chunk if u not in kept_set]
+                    rest.sort(key=lambda u: (_internal_deg(u), int(self.nodes[u].token_len) if u in self.nodes else 0), reverse=True)
+                    for u in rest:
+                        if len(keep) >= hard_max and removed >= target_remove:
+                            break
+                        keep.append(u)
+                        kept_set.add(u)
+                        removed += int(self.nodes[u].token_len) if u in self.nodes else 0
+                        if len(keep) >= hard_max and removed >= target_remove:
+                            break
+                    chunk = keep
 
-                if best_v is None:
-                    break
-                chunk.append(best_v)
-                chunk_set.add(best_v)
-                removed += int(self.nodes[best_v].token_len)
+            else:
+                pos = {nid: i for i, nid in enumerate(candidates)}
+                neigh = {nid: self._active_neighbors(nid, active_set) for nid in candidates}
+
+                # Seed with the oldest candidate.
+                chunk = [seed]
+                chunk_set = set(chunk)
+                removed = int(self.nodes[seed].token_len)
+
+                # Greedy expansion: prefer high internal connectivity + low cut to remaining ACTIVE.
+                while removed < target_remove and len(chunk) < max_chunk:
+                    best_v: Optional[str] = None
+                    best_score = -1e18
+                    best_tok = -1
+
+                    for v in candidates:
+                        if v in chunk_set:
+                            continue
+                        nbr = neigh.get(v, set())
+                        internal = len(nbr & chunk_set)
+                        cut = len(nbr - chunk_set)
+                        # Slight bias towards older nodes (smaller pos) to keep chronology stable.
+                        age_bonus = 0.05 * (1.0 - (pos.get(v, 0) / max(1.0, float(len(candidates) - 1))))
+                        score = float(self.fold_w_internal) * float(internal) - float(self.fold_w_cut) * float(cut) + age_bonus
+                        tok = int(self.nodes[v].token_len)
+                        if (score > best_score) or (abs(score - best_score) < 1e-9 and tok > best_tok):
+                            best_score = score
+                            best_tok = tok
+                            best_v = v
+
+                    if best_v is None:
+                        break
+                    chunk.append(best_v)
+                    chunk_set.add(best_v)
+                    removed += int(self.nodes[best_v].token_len)
+
+            removed = sum(int(self.nodes[u].token_len) for u in chunk if u in self.nodes)
+
+            # Compute removed token mass (used for gating / logging).
+            removed = sum(int(self.nodes[nid].token_len) for nid in chunk if nid in self.nodes)
 
             # Allow single-node folding only if it meaningfully helps.
             if len(chunk) == 1:

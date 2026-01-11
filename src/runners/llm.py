@@ -52,6 +52,10 @@ def run_llm(
     # Debug
     verbose_steps: bool = False,
     log_dir: Optional[str] = None,
+
+    # Prompt/log truncation (chars). 0 means "no extra truncation".
+    prompt_context_chars: int = 0,
+    log_context_chars: int = 2500,
 ) -> Dict[str, Any]:
     tools = benchmark.build_tools(data_dir, retriever_kind=retriever_kind, faiss_dim=faiss_dim)
     tasks = benchmark.load_tasks(data_dir, limit=task_limit)
@@ -98,6 +102,8 @@ def run_llm(
                 validate_answer_in_given_projects=validate_answer_in_given_projects,
                 verbose=verbose_steps,
                 log_dir=log_dir,
+                prompt_context_chars=prompt_context_chars,
+                log_context_chars=log_context_chars,
             ),
         )
 

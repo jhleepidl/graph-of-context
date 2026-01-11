@@ -284,6 +284,7 @@ def make_corpus_and_tasks(
                         f"We will focus on GROUP A first. GROUP A projects: {', '.join(group_a_names)}.\n"
                         f"Among GROUP A projects whose code_name starts with 'Codename_{init}', find the SINGLE project with the largest key_number.\n"
                         "Open OFFICIAL PROFILE pages (prefer docid D_TRUTH_####) to verify.\n"
+                        "IMPORTANT: Once you identify the winner, open the winner's OFFICIAL PROFILE again using open_page with args find='relocation_note' (or section='tail') to capture the `relocation_note:` line now (you will need it later).\n"
                         "Then call the `return` tool with message exactly: 'A_WINNER: <ProjectName>'."
                     )
 
@@ -293,6 +294,7 @@ def make_corpus_and_tasks(
                         f"Now focus on GROUP B. GROUP B projects: {', '.join(group_b_names)}.\n"
                         f"Among GROUP B projects whose code_name starts with 'Codename_{init}', find the SINGLE project with the largest key_number.\n"
                         "Open OFFICIAL PROFILE pages (prefer docid D_TRUTH_####) to verify.\n"
+                        "IMPORTANT: Once you identify the winner, open the winner's OFFICIAL PROFILE again using open_page with args find='relocation_note' (or section='tail') to capture the `relocation_note:` line now (you will need it later).\n"
                         "Then call the `return` tool with message exactly: 'B_WINNER: <ProjectName>'."
                     )
 

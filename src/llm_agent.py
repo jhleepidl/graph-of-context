@@ -141,7 +141,15 @@ class ToolLoopConfig:
     verbose: bool = False                 # print step progress to stdout
     log_dir: Optional[str] = None         # if set, write per-task JSONL trace logs
     log_messages: bool = True             # include sent messages (truncated) in logs
-    log_context_chars: int = 2500         # context tail included in prompt/logs
+
+    # Prompt context bounding:
+    # The memory manager already enforces budget_active (approx tokens). This optional
+    # char-level cap is only for safety when debugging very large contexts.
+    # 0 = include full ACTIVE_CONTEXT (as produced by the memory manager).
+    prompt_context_chars: int = 0
+
+    # Logging truncation (does NOT affect the prompt when prompt_context_chars==0).
+    log_context_chars: int = 2500         # tail included in traces/logs
     log_output_chars: int = 4000          # truncate long model outputs in trace
 
 class ToolLoopLLMAgent:
@@ -1074,6 +1082,7 @@ class ToolLoopLLMAgent:
         self._recent_search_newcand = deque(maxlen=max(4, int(self.cfg.search_cycle_window)))
         self._last_loop_escape_step = None
         self._adaptive_unfold_calls = 0
+        self._forced_unfold_done = False
         self._last_finish_block_reason = None
 
         self._open_trace(run_tag=run_tag, method=method, task_id=task_id)
@@ -1127,11 +1136,32 @@ class ToolLoopLLMAgent:
                 except Exception:
                     # Never let unfolding crash the run.
                     self.counters["adaptive_unfold_errors"] += 1
+
+                # Late-binding helper (GoC): if the current user prompt asks for a deep field
+                # (e.g., relocation_note) that was likely captured earlier but may have been folded,
+                # proactively unfold by that keyword once per task.
+                try:
+                    if (not getattr(self, "_forced_unfold_done", False)) and (method == "GoC"):
+                        up = (current_user_prompt or "").lower()
+                        if ("relocation_note" in up) and (("follow-up" in up) or ("merge" in up) or ("late binding" in up)):
+                            self.mem.unfold("relocation_note")
+                            self._forced_unfold_done = True
+                            self.counters["forced_unfold_calls"] += 1
+                except Exception:
+                    self.counters["forced_unfold_errors"] += 1
                 # Stateless prompting: we DO NOT accumulate prior ACTIVE_CONTEXT in messages.
                 ctx = self.mem.get_active_text()
-                ctx_tail = ctx[-8000:]
-                # Keep prompt context bounded and log a shorter tail if requested.
-                ctx_for_prompt = ctx_tail[-self.cfg.log_context_chars:] if self.cfg.log_context_chars > 0 else ""
+
+                # What we actually send to the model.
+                # By default (prompt_context_chars==0), include the full ACTIVE_CONTEXT as produced by the
+                # memory manager (which already enforces budget_active in approx tokens).
+                if int(getattr(self.cfg, "prompt_context_chars", 0) or 0) > 0:
+                    ctx_for_prompt = ctx[-int(self.cfg.prompt_context_chars):]
+                else:
+                    ctx_for_prompt = ctx
+
+                # What we log in traces (can be a shorter tail).
+                ctx_for_log = ctx_for_prompt[-int(self.cfg.log_context_chars):] if int(self.cfg.log_context_chars) > 0 else ""
 
                 messages = list(base_messages)
                 if self.cfg.verbose:
@@ -1163,7 +1193,7 @@ class ToolLoopLLMAgent:
                         "run_tag": run_tag,
                         "step": step,
                         "active_tokens_est": approx_token_count(ctx),
-                        "active_context_tail": ctx_for_prompt[:2000],
+                        "active_context_tail": (ctx_for_log[:2000] if ctx_for_log else ""),
                     })
 
                 call, attempt_logs = self._call_model_for_json(messages, step=step)

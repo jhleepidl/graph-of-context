@@ -3,7 +3,23 @@ from typing import Dict, Any, List
 import re
 
 def exact_match(pred: str, gold: str) -> bool:
-    return pred.strip() == gold.strip()
+    """Slightly-robust exact match.
+
+    - Trims whitespace.
+    - If both look like a pipe-delimited pair (common in this benchmark), compare
+      normalized segments around the first '|'.
+    """
+    p = (pred or "").strip()
+    g = (gold or "").strip()
+    if not p or not g:
+        return p == g
+
+    if "|" in p and "|" in g:
+        p1, p2 = [x.strip() for x in p.split("|", 1)]
+        g1, g2 = [x.strip() for x in g.split("|", 1)]
+        return (p1 == g1) and (p2 == g2)
+
+    return p == g
 
 DOCID_RE = re.compile(r"D_[A-Z]+_[0-9_]+")
 

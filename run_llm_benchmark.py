@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--verbose_steps", action="store_true")
     ap.add_argument("--log_dir", type=str, default=None)
 
+    ap.add_argument("--prompt_context_chars", type=int, default=0)
+    ap.add_argument("--log_context_chars", type=int, default=2500)
+
     ap.add_argument("--out_results", type=str, default="llm_results.jsonl")
     ap.add_argument("--out_report", type=str, default="llm_report.md")
 

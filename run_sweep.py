@@ -166,6 +166,8 @@ def main():
                 faiss_dim=int(params.get("faiss_dim", 384)),
                 verbose_steps=bool(params.get("verbose_steps", False)),
                 log_dir=str(run_dir / "traces") if params.get("log_traces", False) else None,
+                prompt_context_chars=int(params.get("prompt_context_chars", 0) or 0),
+                log_context_chars=int(params.get("log_context_chars", 2500) or 2500),
             )
             summary = _summarize_jsonl(run_dir / "llm_results.jsonl", runner="llm")
         else:

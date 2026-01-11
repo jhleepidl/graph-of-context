@@ -45,6 +45,8 @@ def main():
     # debugging
     ap.add_argument("--verbose_steps", action="store_true", help="Print per-step progress to stdout (LLM runner only).")
     ap.add_argument("--log_dir", type=str, default=None, help="If set, write per-task LLM prompt/output traces as JSONL files into this directory.")
+    ap.add_argument("--prompt_context_chars", type=int, default=0, help="Optional char-level truncation for ACTIVE_CONTEXT in the LLM prompt (0 = no extra truncation).")
+    ap.add_argument("--log_context_chars", type=int, default=2500, help="Char-level tail truncation for traces/logs (does not affect prompt when prompt_context_chars==0).")
 
     args = ap.parse_args()
 
@@ -103,6 +105,8 @@ def main():
             faiss_dim=args.faiss_dim,
             verbose_steps=args.verbose_steps,
             log_dir=args.log_dir,
+            prompt_context_chars=args.prompt_context_chars,
+            log_context_chars=args.log_context_chars,
         )
 
     print("Done:", res)
