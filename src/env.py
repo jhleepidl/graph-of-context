@@ -32,6 +32,26 @@ class CorpusEnv:
         retriever = build_retriever(retriever_kind, items, faiss_dim=faiss_dim)
         return cls(corpus=corpus, retriever=retriever)
 
+    @classmethod
+    def from_docs(cls, docs: List[Dict[str, Any]], retriever_kind: str = "bm25", faiss_dim: int = 384) -> "CorpusEnv":
+        """Build an in-memory corpus environment from a list of doc dicts.
+
+        Each doc must have: docid, content. Optional: title, url.
+
+        This is used for task-scoped benchmarks where each task has its own
+        (small) context set, and we want to avoid cross-task leakage.
+        """
+        corpus = list(docs or [])
+        items: List[TextItem] = []
+        for d in corpus:
+            items.append(TextItem(
+                id=d["docid"],
+                text=d.get("content", "") or "",
+                meta={"url": d.get("url", ""), "title": d.get("title", "")},
+            ))
+        retriever = build_retriever(retriever_kind, items, faiss_dim=faiss_dim)
+        return cls(corpus=corpus, retriever=retriever)
+
     def search(self, query: str, topk: int = 10) -> List[Dict[str, Any]]:
         hits = self.retriever.search(query, topk=topk)
         out = []

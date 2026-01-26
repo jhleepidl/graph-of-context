@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
 import csv
+import re
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
@@ -170,6 +171,7 @@ def main():
                     trace_dir = d
                     break
             if trace_dir:
+                name_re = re.compile(r"^trace_(?P<run_tag>\d{8}_\d{6})_(?P<method>.+)_(?P<task_id>TASK_\d+)$")
                 for tf in trace_dir.glob("trace_*.jsonl"):
                     steps = 0
                     json_fail = 0
@@ -178,13 +180,18 @@ def main():
                     searches = 0
                     opens = 0
                     finish_seen = False
+                    adaptive_unfolds = 0
+                    folds = 0
+                    policy_events = 0
+                    active_tokens_samples = []
 
                     for line in tf.read_text(encoding="utf-8").splitlines():
                         line = line.strip()
                         if not line:
                             continue
                         obj = json.loads(line)
-                        if obj.get("type") == "llm_attempts":
+                        t = obj.get("type")
+                        if t == "llm_attempts":
                             steps += 1
                             attempts = obj.get("attempts") or []
                             if attempts and not attempts[0].get("parsed_ok"):
@@ -192,27 +199,31 @@ def main():
                                 # if any later attempt parsed ok -> recovery
                                 if any(a.get("parsed_ok") for a in attempts[1:]):
                                     json_rec += 1
-                        elif obj.get("type") == "tool":
+                        elif t == "tool":
                             tool_calls += 1
                             if obj.get("tool") == "search":
                                 searches += 1
                             elif obj.get("tool") == "open_page":
                                 opens += 1
-                        elif obj.get("type") == "finish":
+                        elif t == "adaptive_unfold":
+                            adaptive_unfolds += 1
+                        elif t == "fold":
+                            folds += 1
+                        elif t == "policy_event":
+                            policy_events += 1
+                        elif t == "prompt":
+                            at = obj.get("active_tokens_est")
+                            if isinstance(at, (int, float)):
+                                active_tokens_samples.append(float(at))
+                        elif t == "finish":
                             finish_seen = True
 
-                    # parse filename tokens: trace_<runTag>_<method>_<taskId>.jsonl
-                    name = tf.stem
-                    parts = name.split("_")
-                    # best-effort: method is second last token(s), task last; but method names have '-' so OK.
-                    # we stored safe string as runTag_method_taskId, so:
-                    # trace_{runTag}_{method}_{taskId}
                     method = None
                     task_id = None
-                    if len(parts) >= 4:
-                        # remove leading "trace"
-                        method = parts[-2]
-                        task_id = parts[-1]
+                    m = name_re.match(tf.stem)
+                    if m:
+                        method = m.group("method")
+                        task_id = m.group("task_id")
 
                     trace_flat.append({
                         "run_id": run_id,
@@ -220,14 +231,18 @@ def main():
                         "runner": runner,
                         "run_tag": run_tag,
                         "trace_file": str(tf),
-                        "method_guess": method,
-                        "task_id_guess": task_id,
+                        "method": method,
+                        "task_id": task_id,
                         "steps_logged": steps,
                         "json_fail_steps": json_fail,
                         "json_recovered_steps": json_rec,
                         "tool_calls_logged": tool_calls,
                         "search_calls_logged": searches,
                         "open_page_calls_logged": opens,
+                        "adaptive_unfolds": adaptive_unfolds,
+                        "folds": folds,
+                        "policy_events": policy_events,
+                        "avg_active_tokens_est": (sum(active_tokens_samples)/len(active_tokens_samples)) if active_tokens_samples else None,
                         "finish_seen": finish_seen,
                         **params,
                     })

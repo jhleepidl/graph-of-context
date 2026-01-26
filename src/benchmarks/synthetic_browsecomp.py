@@ -8,7 +8,7 @@ from .base import Task, Benchmark
 from ..synth_data import make_corpus_and_tasks
 from ..env import CorpusEnv
 from ..tools import ToolBox
-from ..metrics import exact_match, docid_coverage
+from ..metrics import exact_match, robust_match, normalize_project_city_pair, docid_coverage
 
 class SyntheticBrowseComp(Benchmark):
     name = "synthetic_browsecomp"
@@ -90,6 +90,16 @@ class SyntheticBrowseComp(Benchmark):
         return ToolBox(env=env)
 
     def evaluate(self, pred_answer: str, pred_expl: str, task: Task) -> Dict[str, Any]:
-        correct = exact_match(pred_answer, task.answer)
+        # Keep a strict metric for formatting, but use robust matching for the
+        # headline correctness signal (reduces false negatives due to minor
+        # formatting noise).
+        correct_strict = exact_match(pred_answer, task.answer)
+        correct = robust_match(pred_answer, task.answer)
         cov = docid_coverage(pred_expl, task.gold_docids or [])
-        return {"correct": correct, "docid_cov": cov}
+        return {
+            "correct": bool(correct),
+            "correct_strict": bool(correct_strict),
+            "pred_norm": normalize_project_city_pair(pred_answer),
+            "gold_norm": normalize_project_city_pair(task.answer),
+            "docid_cov": cov,
+        }

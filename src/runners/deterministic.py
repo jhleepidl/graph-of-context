@@ -11,6 +11,8 @@ from ..memory import (
     LinearSummaryMemory,
     AgentFoldRangeMemory,
     GoCMemory,
+    SimpleRAGMemory,
+    SimilarityOnlyMemory,
     MemoryManagerBase
 )
 
@@ -25,6 +27,7 @@ def run_deterministic(
     methods: List[str],
     out_results_path: str,
     out_report_path: str,
+    bench_kwargs: Optional[Dict[str, Any]] = None,
     budget_active: int = 2000,
     budget_unfold: int = 800,
     unfold_k: int = 6,
@@ -35,8 +38,9 @@ def run_deterministic(
     retriever_kind: str = "bm25",
     faiss_dim: int = 384,
 ) -> Dict[str, Any]:
-    tools = benchmark.build_tools(data_dir, retriever_kind=retriever_kind, faiss_dim=faiss_dim)
-    tasks = benchmark.load_tasks(data_dir, limit=task_limit)
+    bench_kwargs = bench_kwargs or {}
+    tools = benchmark.build_tools(data_dir, retriever_kind=retriever_kind, faiss_dim=faiss_dim, **bench_kwargs)
+    tasks = benchmark.load_tasks(data_dir, limit=task_limit, **bench_kwargs)
 
     cfg = AgentConfig(topk=5, summary_keep_fields=summary_keep_fields, unfold_k=unfold_k)
 
@@ -44,8 +48,29 @@ def run_deterministic(
         "FullHistory": MethodSpec("FullHistory", lambda: FullHistoryMemory(budget_active=budget_active, budget_unfold=budget_unfold)),
         "ContextFolding-Discard": MethodSpec("ContextFolding-Discard", lambda: ContextFoldingDiscardMemory(budget_active=budget_active, budget_unfold=budget_unfold)),
         "LinearSummary": MethodSpec("LinearSummary", lambda: LinearSummaryMemory(budget_active=budget_active, budget_unfold=budget_unfold, summary_every=linear_summary_every)),
+        "SimpleRAG": MethodSpec(
+            "SimpleRAG",
+            lambda: SimpleRAGMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                window_last_n=10,
+                rag_k=unfold_k,
+                retriever_kind=retriever_kind,
+                faiss_dim=faiss_dim,
+            ),
+        ),
         "AgentFold-Range": MethodSpec("AgentFold-Range", lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk)),
         "GoC": MethodSpec("GoC", lambda: GoCMemory(budget_active=budget_active, budget_unfold=budget_unfold, unfold_k=unfold_k)),
+        "SimilarityOnly": MethodSpec(
+            "SimilarityOnly",
+            lambda: SimilarityOnlyMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+            ),
+        ),
     }
 
     selected: List[MethodSpec] = []
@@ -57,6 +82,11 @@ def run_deterministic(
 
     rows = []
     for t in tasks:
+        if hasattr(tools, "set_task"):
+            try:
+                tools.set_task(t)
+            except Exception:
+                pass
         task_dict = {"id": t.id, "question": t.question, "answer": t.answer}
         if t.entities is not None: task_dict["entities"] = t.entities
         if t.required is not None: task_dict["required"] = t.required

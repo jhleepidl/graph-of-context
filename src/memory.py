@@ -77,6 +77,7 @@ class MemoryManagerBase:
     budget_active: int = 2000
     budget_unfold: int = 800
     ttl_unfold: int = 4
+    enforce_budget: bool = True  # if False, never fold/prune based on budget_active
 
     active: List[str] = field(default_factory=list)         # node ids in active context
     nodes: Dict[str, MemoryNode] = field(default_factory=dict)
@@ -85,6 +86,9 @@ class MemoryManagerBase:
     branch_stack: List[Tuple[str, List[str]]] = field(default_factory=list)  # (branch_id, branch_node_ids)
 
     _global_step: int = 0
+    # Optional event buffer for tracing (e.g., fold/unfold decisions). Subclasses
+    # can push structured events here; the agent can drain and log them.
+    _event_buf: List[Dict[str, Any]] = field(default_factory=list, init=False, repr=False)
 
     def reset(self):
         self.active = []
@@ -92,6 +96,21 @@ class MemoryManagerBase:
         self.current_thread = "main"
         self.branch_stack = []
         self._global_step = 0
+        self._event_buf = []
+
+    def _emit_event(self, ev: Dict[str, Any]):
+        """Add an event to the buffer for later tracing."""
+        try:
+            self._event_buf.append(ev)
+        except Exception:
+            # Never let tracing crash memory
+            pass
+
+    def drain_events(self) -> List[Dict[str, Any]]:
+        """Return and clear buffered events."""
+        evs = self._event_buf
+        self._event_buf = []
+        return evs
 
     # ------------ recording helpers ------------
     def _next_step(self) -> int:
@@ -189,6 +208,8 @@ class MemoryManagerBase:
     # ------------ folding/unfolding ------------
     def maybe_fold(self):
         # default: prune oldest until under budget (no summary)
+        if (not self.enforce_budget) or (not self.budget_active) or (int(self.budget_active) <= 0):
+            return
         while self.active_tokens() > self.budget_active and len(self.active) > 1:
             self.active.pop(0)
 
@@ -203,6 +224,8 @@ class MemoryManagerBase:
 @dataclass
 class FullHistoryMemory(MemoryManagerBase):
     def maybe_fold(self):
+        if (not self.enforce_budget) or (not self.budget_active) or (int(self.budget_active) <= 0):
+            return
         while self.active_tokens() > self.budget_active and len(self.active) > 1:
             self.active.pop(0)
 
@@ -245,6 +268,8 @@ class LinearSummaryMemory(MemoryManagerBase):
         self._step_count = 0
 
     def maybe_fold(self):
+        if (not self.enforce_budget) or (not self.budget_active) or (int(self.budget_active) <= 0):
+            return
         self._step_count += 1
         if self._step_count % self.summary_every == 0 and len(self.active) > 2:
             lines = []
@@ -270,6 +295,8 @@ class AgentFoldRangeMemory(MemoryManagerBase):
     fold_chunk: int = 10
 
     def maybe_fold(self):
+        if (not self.enforce_budget) or (not self.budget_active) or (int(self.budget_active) <= 0):
+            return
         while self.active_tokens() > self.budget_active and len(self.active) > 2:
             # fold the oldest contiguous chunk
             chunk = self.active[: min(self.fold_chunk, len(self.active)-1)]
@@ -295,6 +322,166 @@ class AgentFoldRangeMemory(MemoryManagerBase):
             for nid in chunk:
                 if nid in self.nodes:
                     del self.nodes[nid]
+
+
+@dataclass
+class SimpleRAGMemory(MemoryManagerBase):
+    """Simple RAG-style long-term memory baseline.
+
+    This baseline is intentionally *not* graph-aware:
+      - It stores past nodes losslessly (like a log).
+      - On each step it retrieves top-k past items by similarity to the latest user/tool text.
+      - It injects compact recall snippets into ACTIVE context with a short TTL.
+
+    The goal is to represent a common "simple RAG memory" approach for long-horizon agents.
+    """
+
+    window_last_n: int = 10
+    rag_k: int = 6
+    retriever_kind: str = "bm25"
+    faiss_dim: int = 384
+    snippet_max_chars: int = 700
+    recall_ttl: int = 5
+
+    storage_ids: List[str] = field(default_factory=list)
+    _retriever: Optional[TextRetriever] = None
+    _dirty: bool = True
+
+    def reset(self):
+        super().reset()
+        self.storage_ids = []
+        self._retriever = None
+        self._dirty = True
+
+    def _extract_snippet(self, full: str, query: str, max_chars: int) -> str:
+        """Cheap snippet selector (keyword window)."""
+        if not full:
+            return ""
+        q = (query or "").strip()
+        if not q:
+            return full[:max_chars].strip()
+        terms = re.findall(r"[A-Za-z_]{4,}", q.lower())[:6]
+        hay = full
+        hay_low = hay.lower()
+        idx = -1
+        for t in terms:
+            i = hay_low.find(t)
+            if i >= 0:
+                idx = i
+                break
+        if idx < 0:
+            idx = max(0, len(hay) - max_chars)
+        win = max_chars // 2
+        start = max(0, idx - win)
+        end = min(len(hay), idx + win)
+        snip = hay[start:end]
+        # align to line boundaries
+        s_nl = snip.rfind("\n", 0, min(200, len(snip)))
+        if s_nl > 0:
+            snip = snip[s_nl + 1 :]
+        e_nl = snip.find("\n", max(0, len(snip) - 200))
+        if e_nl > 0:
+            snip = snip[:e_nl]
+        if start > 0:
+            snip = "..." + snip
+        if end < len(hay):
+            snip = snip + "..."
+        return snip[:max_chars].strip()
+
+    def _rebuild_retriever(self):
+        items: List[TextItem] = []
+        for nid in self.storage_ids:
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            text = (n.storage_text or n.text or "").strip()
+            if not text:
+                continue
+            items.append(TextItem(id=nid, text=text, meta={"kind": n.kind, "docids": list(n.docids)}))
+        self._retriever = build_retriever(self.retriever_kind, items, faiss_dim=int(self.faiss_dim)) if items else None
+        self._dirty = False
+
+    def _apply_window(self):
+        """Keep last N non-recall nodes, plus recall snippets with TTL."""
+        # Identify recall snippet nodes by prefix.
+        recall_nodes = [
+            nid for nid in self.active
+            if (nid in self.nodes) and (self.nodes[nid].kind == "summary") and self.nodes[nid].text.startswith("[RAG_RECALL")
+        ]
+        base_nodes = [nid for nid in self.active if nid in self.nodes and nid not in recall_nodes]
+        if self.window_last_n > 0 and len(base_nodes) > self.window_last_n:
+            base_nodes = base_nodes[-int(self.window_last_n):]
+        # Merge and keep chronological ordering.
+        merged = base_nodes + recall_nodes
+        merged = [nid for nid in merged if nid in self.nodes]
+        merged.sort(key=lambda x: self.nodes[x].step_idx)
+        self.active = merged
+
+    def maybe_fold(self):
+        # For this baseline, folding == enforce token budget by dropping oldest.
+        if (not self.enforce_budget) or (not self.budget_active) or (int(self.budget_active) <= 0):
+            return
+        while self.active_tokens() > self.budget_active and len(self.active) > 1:
+            self.active.pop(0)
+
+    def _inject_recalls(self, query: str, k: Optional[int] = None) -> List[str]:
+        if not query:
+            return []
+        if self._dirty:
+            self._rebuild_retriever()
+        if not self._retriever:
+            return []
+
+        k = int(k or self.rag_k)
+        hits = self._retriever.search(query, topk=max(10, k * 4))
+        activated: List[str] = []
+        for nid, score in hits:
+            if nid not in self.nodes:
+                continue
+            if nid in self.active:
+                continue
+            n = self.nodes[nid]
+            src = n.storage_text or n.text
+            snip = self._extract_snippet(src, query=query, max_chars=int(self.snippet_max_chars))
+            if not snip:
+                continue
+            text = f"[RAG_RECALL src={nid} score={score:.3f}]\n{snip}"
+            rid = self.add_node(thread="main", kind="summary", text=text, docids=list(n.docids))
+            self.nodes[rid].ttl = int(self.recall_ttl)
+            self.active.append(rid)
+            activated.append(rid)
+            if len(activated) >= k:
+                break
+        self.active.sort(key=lambda x: self.nodes[x].step_idx)
+        if activated:
+            self._emit_event({"type": "rag_unfold", "query": query, "k": k, "activated": activated[:20]})
+        return activated
+
+    # Expose unfold() so the agent's adaptive_unfold can use it.
+    def unfold(self, query: str, k: int = None):
+        return self._inject_recalls(query, k=k)
+
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None):
+        super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
+        nid = self.active[-1] if self.active else None
+        if nid:
+            self.storage_ids.append(nid)
+            self._dirty = True
+        # Use tool observation as a retrieval cue (cheap but effective for evidence tasks).
+        q = (observation or "")[:600]
+        self._inject_recalls(q)
+        self._apply_window()
+        self.maybe_fold()
+
+    def record_msg(self, text: str):
+        super().record_msg(text)
+        nid = self.active[-1] if self.active else None
+        if nid:
+            self.storage_ids.append(nid)
+            self._dirty = True
+        self._inject_recalls((text or "")[:600])
+        self._apply_window()
+        self.maybe_fold()
 
 
 # ======================
@@ -334,6 +521,29 @@ class GoCMemory(MemoryManagerBase):
     fold_mincut_lambda_max: float = 1e6
     fold_mincut_iters: int = 22
 
+    # Folding policy selector.
+    # - "budget": token-weighted min-cut folding driven by budget_active (default).
+    # - "pef_url": Page-Episode Folding (PEF) for BrowserGym/WebArena: fold primarily on URL changes.
+    fold_policy: str = "budget"
+
+    # PEF(URL) state (internal)
+    _pef_last_url: Optional[str] = field(default=None, init=False, repr=False)
+    _pef_episode_start_pos: int = field(default=0, init=False, repr=False)
+
+    # Safety backstop for PEF: if ACTIVE blows up beyond this multiplier, fall back to budget folding.
+    pef_backstop_mult: float = 2.5
+
+    # PEF rolling compaction (within the same URL):
+    # Rather than folding on every budget hit, we use hysteresis.
+    # - Fold only when ACTIVE tokens exceed budget_active * pef_hi_mult.
+    # - Fold down until <= budget_active * pef_lo_mult.
+    # The fold itself collapses the *older* part of the current URL episode into an EPISODE_PROXY,
+    # keeping the most recent pef_roll_keep_last nodes in full detail.
+    pef_hi_mult: float = 1.25
+    pef_lo_mult: float = 0.85
+    pef_roll_keep_last: int = 10
+    pef_roll_min_chunk: int = 6
+
     # Greedy folding weights (kept as fallback / debugging)
     fold_w_internal: float = 1.0            # reward edges within the chunk
     fold_w_cut: float = 1.4                 # penalize edges from chunk to remaining ACTIVE
@@ -361,6 +571,9 @@ class GoCMemory(MemoryManagerBase):
         self.edges_out = {"depends": {}, "doc_ref": {}, "seq": {}}
         self.edges_in = {"depends": {}, "doc_ref": {}, "seq": {}}
         self._last_in_thread = {}
+        # PEF(URL) state
+        self._pef_last_url = None
+        self._pef_episode_start_pos = 0
 
     # ---- graph helpers ----
     def _add_edge(self, etype: str, u: str, v: str):
@@ -511,11 +724,36 @@ class GoCMemory(MemoryManagerBase):
         return bid
 
     def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None):
-        super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
+        """Record a tool event.
+
+        IMPORTANT: GoCMemory overrides the base implementation so we can support
+        Page-Episode Folding (PEF) for BrowserGym/WebArena without triggering
+        budget-based folding on every tool call.
+        """
+        self._decay_ttl()
+        nid = self.add_node(
+            thread=self.current_thread,
+            kind="tool",
+            text=f"[TOOL:{tool_name}] args={args}\nobs={observation}",
+            docids=docids or [],
+            storage_text=storage_text,
+        )
+        self._on_branch_step(nid)
+
         if self.branch_stack:
             bid, lst = self.branch_stack[-1]
-            lst.append(self.active[-1])
+            lst.append(nid)
             self.branch_stack[-1] = (bid, lst)
+
+        # PEF(URL): fold primarily on URL changes, triggered by observations.
+        if str(self.fold_policy).lower() == "pef_url" and str(tool_name).lower() == "obs":
+            try:
+                self._pef_maybe_fold_on_obs(nid)
+            except Exception:
+                pass
+
+        # Always apply the policy dispatcher (PEF backstop or budget folding).
+        self.maybe_fold()
 
     def record_msg(self, text: str):
         # attach docids found in text as doc_ref anchors
@@ -553,6 +791,231 @@ class GoCMemory(MemoryManagerBase):
         # Incrementally index newly stored nodes.
         self._storage_index_add(list(to_remove), force_flush=False)
         self.maybe_fold()
+
+
+    # ---- PEF (Page-Episode Folding) for BrowserGym/WebArena ----
+    _URL_IN_TEXT_RE = re.compile(r"\burl=([^\s\)]+)")
+
+    def _pef_extract_url(self, nid: str) -> Optional[str]:
+        n = self.nodes.get(nid)
+        if not n:
+            return None
+        # Prefer explicit docids (browsergym_runner uses docids=[url] for obs nodes).
+        for d in (n.docids or []):
+            if isinstance(d, str) and d.startswith("http"):
+                return d
+        # Fallback: parse from text header.
+        m = self._URL_IN_TEXT_RE.search(n.text or "")
+        return m.group(1) if m else None
+
+    def _pef_create_episode_proxy_node(self, chunk: List[str], url: str) -> str:
+        """Create a compact proxy summary for a single page episode.
+
+        This is intentionally lightweight and deterministic (no LLM summarization),
+        tuned for BrowserGym/WebArena traces.
+        """
+        if not chunk:
+            raise ValueError("empty chunk")
+
+        child_steps = [self.nodes[nid].step_idx for nid in chunk if nid in self.nodes]
+        step_min = min(child_steps) if child_steps else 0
+        step_max = max(child_steps) if child_steps else step_min
+
+        # Extract and compress actions.
+        actions: List[str] = []
+        act_re1 = re.compile(r"'action'\s*:\s*'([^']+)'")
+        act_re2 = re.compile(r"\"action\"\s*:\s*\"([^\"]+)\"")
+        last_obs_head: Optional[str] = None
+        for nid in chunk:
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            txt = n.text or ""
+            if txt.startswith("[TOOL:act]"):
+                m = act_re1.search(txt) or act_re2.search(txt)
+                if m:
+                    actions.append(m.group(1).strip())
+            elif txt.startswith("[TOOL:obs]"):
+                # Keep a tiny hint of the latest observation for this episode.
+                head = txt.splitlines()
+                if head:
+                    last_obs_head = head[0][:220]
+
+        # Run-length encode identical consecutive actions (common for noop/scroll).
+        comp: List[str] = []
+        if actions:
+            prev = actions[0]
+            cnt = 1
+            for a in actions[1:]:
+                if a == prev:
+                    cnt += 1
+                    continue
+                comp.append(f"{prev} x{cnt}" if cnt > 1 else prev)
+                prev, cnt = a, 1
+            comp.append(f"{prev} x{cnt}" if cnt > 1 else prev)
+
+        action_line = "; ".join(comp[:12])
+        if len(comp) > 12:
+            action_line += "; ..."
+
+        header = f"[EPISODE_PROXY url={url} steps={step_min}-{step_max} n={len(chunk)}]"
+        body_lines: List[str] = []
+        if action_line:
+            body_lines.append("actions: " + action_line)
+        if last_obs_head:
+            body_lines.append("last_obs: " + last_obs_head)
+
+        proxy_text = header + ("\n" + "\n".join(body_lines) if body_lines else "")
+
+        # Create node WITHOUT sequential linking (use base add_node), then override step_idx.
+        proxy_id = MemoryManagerBase.add_node(self, thread="main", kind="summary", text=proxy_text, docids=[url])
+        if proxy_id in self.nodes:
+            self.nodes[proxy_id].children = list(chunk)
+            self.nodes[proxy_id].step_idx = step_min
+            self.nodes[proxy_id].token_len = approx_token_count(self.nodes[proxy_id].text)
+
+        # Graph hooks: docid index + depends edges so unfolding proxy can bring children.
+        self._index_docids(proxy_id)
+        for child in chunk:
+            if child in self.nodes:
+                self.nodes[child].parent = proxy_id
+                self._add_edge("depends", proxy_id, child)
+        return proxy_id
+
+    def _pef_maybe_fold_on_obs(self, obs_nid: str):
+        """Fold the previous page episode when the URL changes."""
+        url = self._pef_extract_url(obs_nid)
+        if not url:
+            return
+
+        # First observation establishes the current episode boundary.
+        if self._pef_last_url is None:
+            self._pef_last_url = url
+            try:
+                self._pef_episode_start_pos = self.active.index(obs_nid)
+            except ValueError:
+                self._pef_episode_start_pos = max(0, len(self.active) - 1)
+            return
+
+        if url == self._pef_last_url:
+            return
+
+        prev_url = self._pef_last_url
+        try:
+            obs_idx = self.active.index(obs_nid)
+        except ValueError:
+            obs_idx = len(self.active) - 1
+
+        start = int(self._pef_episode_start_pos)
+        start = max(0, min(start, obs_idx))
+
+        # Fold all nodes belonging to the previous episode (between episode start and this obs).
+        chunk = [nid for nid in self.active[start:obs_idx] if (nid in self.nodes and not self._is_anchor_node(nid))]
+        if chunk:
+            before = self.active_tokens()
+            proxy_id = self._pef_create_episode_proxy_node(chunk, prev_url)
+            self._replace_prefix_with_proxy(chunk, proxy_id)
+            newly_stored: List[str] = []
+            for nid in chunk:
+                if nid in self.nodes and nid not in self.storage:
+                    self.storage.append(nid)
+                    newly_stored.append(nid)
+            if newly_stored:
+                self._storage_index_add(newly_stored, force_flush=False)
+            after = self.active_tokens()
+
+            # Trace
+            self._emit_event({
+                "type": "pef_fold",
+                "mem": "GoC",
+                "global_step": int(self._global_step),
+                "prev_url": prev_url,
+                "new_url": url,
+                "episode_nodes": len(chunk),
+                "episode_tokens_before": int(before),
+                "episode_tokens_after": int(after),
+                "proxy_id": proxy_id,
+            })
+
+        # Start the new episode at the current observation.
+        self._pef_last_url = url
+        try:
+            self._pef_episode_start_pos = self.active.index(obs_nid)
+        except ValueError:
+            self._pef_episode_start_pos = max(0, len(self.active) - 1)
+
+
+    def _pef_roll_fold_current_episode(self) -> bool:
+        """Compact the *older* portion of the current URL episode into an EPISODE_PROXY.
+
+        Returns True if a fold occurred.
+
+        Motivation
+        ----------
+        On WebArena tasks, observations are large and can push ACTIVE over budget rapidly,
+        causing frequent budget-driven folds. In PEF mode we prefer to keep the *current*
+        page episode mostly intact, but we can safely compact early steps on the same URL
+        while preserving the latest interaction context.
+        """
+        # Identify the current episode URL.
+        cur_url = self._pef_last_url
+        if not cur_url:
+            # Best-effort fallback: infer from last ACTIVE obs node.
+            for nid in reversed(self.active):
+                u = self._pef_extract_url(nid)
+                if u:
+                    cur_url = u
+                    break
+        if not cur_url:
+            return False
+
+        start = int(self._pef_episode_start_pos)
+        start = max(0, min(start, len(self.active)))
+
+        # Keep the most recent nodes in full detail.
+        keep_last = max(0, int(self.pef_roll_keep_last))
+        end_exclusive = max(start, len(self.active) - keep_last)
+        if end_exclusive <= start:
+            return False
+
+        # Exclude anchors from folding.
+        window = [nid for nid in self.active[start:end_exclusive] if nid in self.nodes]
+        chunk = [nid for nid in window if not self._is_anchor_node(nid)]
+        if len(chunk) < int(self.pef_roll_min_chunk):
+            return False
+
+        before = self.active_tokens()
+        proxy_id = self._pef_create_episode_proxy_node(chunk, cur_url)
+        self._replace_prefix_with_proxy(chunk, proxy_id)
+
+        newly_stored: List[str] = []
+        for nid in chunk:
+            if nid in self.nodes and nid not in self.storage:
+                self.storage.append(nid)
+                newly_stored.append(nid)
+        if newly_stored:
+            self._storage_index_add(newly_stored, force_flush=False)
+        after = self.active_tokens()
+
+        # Trace
+        self._emit_event({
+            "type": "pef_roll_fold",
+            "mem": "GoC",
+            "global_step": int(self._global_step),
+            "url": cur_url,
+            "episode_start_pos": int(self._pef_episode_start_pos),
+            "rolled_nodes": int(len(chunk)),
+            "episode_tokens_before": int(before),
+            "episode_tokens_after": int(after),
+            "proxy_id": proxy_id,
+        })
+
+        # Episode start becomes the proxy position (since we compacted the prefix).
+        try:
+            self._pef_episode_start_pos = self.active.index(proxy_id)
+        except ValueError:
+            self._pef_episode_start_pos = max(0, len(self.active) - 1)
+        return True
 
     
     # ---- proxy summarization helpers (hierarchical folding) ----
@@ -762,7 +1225,9 @@ class GoCMemory(MemoryManagerBase):
         if not n or n.kind != "summary":
             return False
         t = (n.text or "").lstrip()
-        return t.startswith("[FAIL]") or t.startswith("[CONSTRAINT]")
+        # Be permissive: different runners may emit "[FAIL]" or "[FAILURE]".
+        # We anchor any summary beginning with "[FAIL" as well as hard constraints.
+        return t.startswith("[FAIL") or t.startswith("[CONSTRAINT]") or t.startswith("[GUARD]")
 
     def _active_neighbors(self, nid: str, active_set: Set[str], etypes: Tuple[str, ...] = ("depends", "doc_ref")) -> Set[str]:
         """Undirected neighbors within ACTIVE for fold heuristics."""
@@ -990,8 +1455,9 @@ class GoCMemory(MemoryManagerBase):
             self._storage_index_add([nid], force_flush=False)
 
     # ---- folding: keep removed nodes in storage for recovery ----
-    def maybe_fold(self):
-        """
+    def _maybe_fold_budget(self):
+        """Budget-driven folding (token-weighted min-cut by default).
+
         Hierarchical folding policy:
         - When ACTIVE exceeds budget, fold the oldest prefix into a compact proxy summary node that stays ACTIVE.
         - Move original nodes into STORAGE (lossless; recoverable via unfold).
@@ -1115,6 +1581,47 @@ class GoCMemory(MemoryManagerBase):
 
             if chunk:
                 before = self.active_tokens()
+                # ----- trace fold decision (optional) -----
+                try:
+                    chunk_set = set(chunk)
+                    outside_set = set(self.active) - chunk_set
+                    boundary_pairs: Set[frozenset] = set()
+                    internal_pairs: Set[frozenset] = set()
+                    for et in ("depends", "doc_ref", "seq"):
+                        out_map = self.edges_out.get(et, {})
+                        in_map = self.edges_in.get(et, {})
+                        for u in chunk_set:
+                            neigh = set(out_map.get(u, set())) | set(in_map.get(u, set()))
+                            for v in neigh:
+                                if v not in self.nodes:
+                                    continue
+                                if v not in set(self.active):
+                                    continue
+                                if v == u:
+                                    continue
+                                pair = frozenset((u, v))
+                                if len(pair) != 2:
+                                    continue
+                                if v in chunk_set:
+                                    internal_pairs.add(pair)
+                                else:
+                                    boundary_pairs.add(pair)
+
+                    self._emit_event({
+                        "type": "fold",
+                        "mem": "GoC",
+                        "global_step": int(self._global_step),
+                        "budget_active": int(self.budget_active),
+                        "overflow_tokens": int(overflow),
+                        "target_remove_tokens": int(target_remove),
+                        "chunk_size": len(chunk),
+                        "chunk_tokens": int(removed),
+                        "cut_edges": len(boundary_pairs),
+                        "internal_edges": len(internal_pairs),
+                        "chunk_node_ids": chunk[:50],
+                    })
+                except Exception:
+                    pass
                 proxy_id = self._create_proxy_node(chunk)
                 # Remove folded nodes from active and keep proxy active
                 self._replace_prefix_with_proxy(chunk, proxy_id)
@@ -1137,6 +1644,36 @@ class GoCMemory(MemoryManagerBase):
             self._storage_index_add(newly_stored, force_flush=False)
         else:
             self._ensure_storage_index(force_flush=False)
+
+    def maybe_fold(self):
+        """Dispatch folding according to the configured policy."""
+        pol = str(self.fold_policy).lower().strip()
+        if pol == "pef_url":
+            # PEF folds are primarily triggered on obs() when URL changes.
+            # Within a single URL episode, we prefer rolling compaction with hysteresis
+            # to avoid folding on every budget edge.
+            try:
+                hi = float(self.budget_active) * float(self.pef_hi_mult)
+                lo = float(self.budget_active) * float(self.pef_lo_mult)
+                # Roll-fold only when we cross the high watermark, then fold down to low.
+                if self.active_tokens() > hi:
+                    # Fold at most a few times per call to avoid pathological loops.
+                    for _ in range(6):
+                        if self.active_tokens() <= lo:
+                            break
+                        did = self._pef_roll_fold_current_episode()
+                        if not did:
+                            break
+                # Absolute safety backstop: if ACTIVE is truly runaway, fall back to budget folding.
+                if self.active_tokens() > float(self.budget_active) * float(self.pef_backstop_mult):
+                    self._maybe_fold_budget()
+            except Exception:
+                # If anything goes wrong, fall back to budget folding.
+                self._maybe_fold_budget()
+            return
+
+        # Default: budget-driven folding.
+        self._maybe_fold_budget()
 
     # ---- minimal-closure unfold ----
     def _dep_closure(self, seeds: List[str], depth: int) -> Set[str]:
@@ -1291,5 +1828,62 @@ class GoCMemory(MemoryManagerBase):
 
         # Re-order active nodes chronologically by step index so recovered nodes
         # do not end up at the very end of the context.
+        self.active.sort(key=lambda x: self.nodes[x].step_idx)
+        return activated
+
+
+@dataclass
+class SimilarityOnlyMemory(GoCMemory):
+    """RAG-style baseline: unfold purely by retrieval similarity (no dependency closure).
+
+    This isolates the contribution of GoC's *dependency closure* logic.
+    We still keep lossless storage and the same folding mechanism.
+    """
+
+    def unfold(self, query: str, k: int = None):
+        if k is None:
+            k = self.unfold_k
+        if not self._storage_retriever or not self.storage:
+            return []
+
+        hits = self._storage_retriever.search(query, topk=max(k * 5, 10))
+
+        chosen: List[str] = []
+        remaining = int(self.budget_unfold)
+        for nid, _score in hits:
+            if nid not in self.nodes:
+                continue
+            if nid in self.active:
+                continue
+            cost = int(self.nodes[nid].token_len)
+            if remaining - cost < 0:
+                continue
+            chosen.append(nid)
+            remaining -= cost
+            if len(chosen) >= int(k):
+                break
+
+        activated: List[str] = []
+        # Activate in chronological order.
+        for nid in sorted(chosen, key=lambda x: self.nodes[x].step_idx):
+            n = self.nodes[nid]
+            if nid not in self.active:
+                n.ttl = self.ttl_unfold
+                self.active.append(nid)
+                activated.append(nid)
+
+            # Optional snippet materialization (kept consistent with GoC).
+            if n.storage_text:
+                snip = self._extract_storage_snippet(n.storage_text, query=query, max_chars=900)
+                if snip:
+                    sn_text = f"[UNFOLD_SNIPPET from {nid}]\n{snip}"
+                    sn_cost = approx_token_count(sn_text)
+                    if remaining - sn_cost >= 0:
+                        sn_id = self.add_node(thread="main", kind="summary", text=sn_text, docids=list(n.docids))
+                        self.nodes[sn_id].ttl = self.ttl_unfold
+                        self.active.append(sn_id)
+                        activated.append(sn_id)
+                        remaining -= sn_cost
+
         self.active.sort(key=lambda x: self.nodes[x].step_idx)
         return activated

@@ -1,6 +1,66 @@
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import re
+
+# -------------------------
+# Answer matching utilities
+# -------------------------
+# Many tasks in this repo ask for answers exactly as:
+#   "<ProjectName> | <Headquarters>"
+# where the canonical forms are like Project_0047 and City_16.
+#
+# In practice, LLM outputs often contain extra text, different zero-padding,
+# or slightly different separators. For benchmarking, we want a robust
+# *semantic* match while keeping a strict signal for formatting compliance.
+
+PAIR_RE = re.compile(
+    r"(Project[ _]?0*(\d+))\s*\|\s*(City[ _]?0*(\d+))",
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_project_city_pair(text: str) -> Optional[str]:
+    """Extract and normalize 'Project_xxxx | City_y' from a string.
+
+    Returns canonical string like 'Project_0047 | City_16', or None.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = PAIR_RE.search(t)
+    if not m:
+        return None
+    proj_num = int(m.group(2))
+    city_num = int(m.group(4))
+    return f"Project_{proj_num:04d} | City_{city_num}"
+
+
+def parsed_pair_match(pred: str, gold: str) -> Optional[bool]:
+    """Return True/False if both sides can be parsed as a Project|City pair.
+
+    Returns None if parsing fails on either side.
+    """
+    p = normalize_project_city_pair(pred)
+    g = normalize_project_city_pair(gold)
+    if p is None or g is None:
+        return None
+    return p == g
+
+
+def robust_match(pred: str, gold: str) -> bool:
+    """Benchmark-facing match function.
+
+    - If both answers can be parsed as the canonical Project|City pair, compare
+      the normalized forms.
+    - Otherwise fall back to (trimmed) exact match.
+
+    This reduces false negatives from formatting noise while keeping behavior
+    stable for other task types.
+    """
+    pm = parsed_pair_match(pred, gold)
+    if pm is not None:
+        return bool(pm)
+    return exact_match(pred, gold)
 
 def exact_match(pred: str, gold: str) -> bool:
     """Slightly-robust exact match.

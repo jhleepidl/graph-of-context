@@ -1,0 +1,14 @@
+# Optional dependencies for running BrowserGym / WebChoreArena experiments.
+
+# Core BrowserGym packages
+browsergym>=0.13
+
+# Gymnasium is typically installed as a dependency, but pinning helps.
+gymnasium>=0.29
+
+# Playwright is required by BrowserGym
+playwright>=1.40
+
+# (Optional) If you want to run WebArena / VisualWebArena tasks:
+browsergym-webarena>=0.13
+browsergym-visualwebarena>=0.13

@@ -137,10 +137,24 @@ class ToolLoopConfig:
     multi_turn_min_step: int = 8
     multi_turn_min_open_pages: int = 3
 
+    # --- Two-stage commit helpers (HotpotQA/FEVER-style; safe on other tasks) ---
+    # If the agent commits supporting titles in stage-1 via `return`, optionally
+    # enforce that the final `finish` reuses the committed titles to avoid
+    # "supporting_titles drift" confounding memory comparisons.
+    # Values: "none" | "goc_only" | "all"
+    enforce_committed_supporting_titles: str = "none"
+    committed_supporting_titles_n: int = 2
+
+    # Stage-aware unfolding: on FINAL (often CLOSED-BOOK), proactively unfold the
+    # dependency closure around committed anchors / Q1 to counter lost-in-the-middle.
+    stage_aware_unfold_on_final: bool = True
+    stage_final_unfold_k: int = 6
+
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
     log_dir: Optional[str] = None         # if set, write per-task JSONL trace logs
     log_messages: bool = True             # include sent messages (truncated) in logs
+    log_message_chars: int = 6000         # per-message char cap when log_messages=True
 
     # Prompt context bounding:
     # The memory manager already enforces budget_active (approx tokens). This optional
@@ -208,6 +222,11 @@ class ToolLoopLLMAgent:
         self._adaptive_unfold_calls: int = 0
         self._last_finish_block_reason: Optional[str] = None
 
+        # Two-stage commit helpers
+        self._q1_text: str = ""                       # extracted Q1 for multi-turn benches (if present)
+        self._committed_supporting_titles: Optional[List[str]] = None
+        self._stage_final_unfold_done: bool = False
+
         self._trace_fp = None
         self._trace_path: Optional[Path] = None
 
@@ -232,6 +251,29 @@ class ToolLoopLLMAgent:
             return
         self._trace_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
         self._trace_fp.flush()
+
+    def _drain_mem_events(self, *, task_id: str, method: str, run_tag: str, step: int):
+        """Drain structured events from the memory manager and write to the trace.
+
+        Memory managers may emit events (e.g., GoC fold decisions). This keeps
+        trace files self-contained for paper figures and ablations.
+        """
+        try:
+            evs = self.mem.drain_events()
+        except Exception:
+            return
+        if not evs:
+            return
+        for ev in evs:
+            if not isinstance(ev, dict):
+                continue
+            obj = dict(ev)
+            # Attach run metadata for easier post-hoc analysis.
+            obj.setdefault("task_id", task_id)
+            obj.setdefault("method", method)
+            obj.setdefault("run_tag", run_tag)
+            obj.setdefault("step", int(step))
+            self._trace(obj)
 
     def _accum_usage(self, usage: Optional[Dict[str, Any]]):
         if not usage:
@@ -1035,6 +1077,7 @@ class ToolLoopLLMAgent:
         user_question: str,
         *,
         user_turns: Optional[List[str]] = None,
+        task_meta: Optional[Dict[str, Any]] = None,
         task_id: str = "task",
         method: str = "method",
         run_tag: str = "run",
@@ -1059,6 +1102,108 @@ class ToolLoopLLMAgent:
         pending_user_turns: List[str] = turns[1:]
         self.counters["pending_user_turns_init"] = len(pending_user_turns)
 
+        # Reset per-task commit state
+        self._committed_supporting_titles = None
+        self._stage_final_unfold_done = False
+        # Extract Q1 for multi-turn benchmarks that embed it in the initial prompt.
+        # This is intentionally lightweight: it never affects single-turn tasks.
+        self._q1_text = ""
+        try:
+            for ln in str(current_user_prompt).splitlines():
+                if ln.strip().startswith("Q1:"):
+                    self._q1_text = ln.split("Q1:", 1)[1].strip()
+                    break
+        except Exception:
+            self._q1_text = ""
+
+        # Per-task policy overrides (benchmark-encoded levers).
+        task_meta = task_meta or {}
+        # Multi-turn injection thresholds can be overridden per task.
+        mt_min_step = int(task_meta.get("multi_turn_min_step", self.cfg.multi_turn_min_step))
+        mt_min_open_pages = int(task_meta.get("multi_turn_min_open_pages", self.cfg.multi_turn_min_open_pages))
+        # Return gating prevents prematurely requesting follow-ups and collapsing the horizon.
+        rg_min_steps = int(task_meta.get("return_gating_min_steps", mt_min_step))
+        rg_min_open_pages = int(task_meta.get("return_gating_min_open_pages", mt_min_open_pages))
+        # Closed-book final stage (benchmark-controlled). Active only when the user prompt includes a marker.
+        closed_book_final = bool(task_meta.get("closed_book_final", False))
+
+        # Benchmark augmentation: inject internal "noise" nodes after stage-1 commit to increase
+        # context pressure WITHOUT adding extra LLM calls. Applies to all methods equally.
+        noise_nodes_after_stage1 = int(task_meta.get("noise_nodes_after_stage1", 0))
+        noise_node_chars = int(task_meta.get("noise_node_chars", 320))
+        noise_seed = int(task_meta.get("noise_seed", 7))
+        self._noise_injected_after_stage1 = False
+
+        def _inject_noise_nodes(kind: str, count: int):
+            """Inject deterministic, task-scoped noise into memory.
+
+            We record as regular msg nodes (NOT summary), so GoC does not anchor-protect them.
+            This provides fair context pressure across methods while allowing better folding policies
+            to discard noise.
+            """
+            if count <= 0:
+                return
+            try:
+                import hashlib
+                import random
+                # Stable per-task salt
+                sid = int(hashlib.md5(str(task_id).encode("utf-8")).hexdigest()[:8], 16)
+                rng = random.Random(int(noise_seed) + sid)
+            except Exception:
+                rng = None
+
+            words = [
+                "archive", "protocol", "committee", "baseline", "variance", "notation", "dataset",
+                "appendix", "footnote", "chronicle", "specimen", "parliament", "municipal",
+                "cartography", "thermodynamics", "folklore", "astronomy", "linguistics",
+                "taxonomy", "orchestra", "hydrology", "calculus", "jurisdiction",
+                "biography", "metallurgy", "philology", "conjecture", "emphasis",
+            ]
+
+            def make_para(target_chars: int) -> str:
+                if target_chars <= 40:
+                    target_chars = 40
+                out = []
+                cur = 0
+                # Build 3-6 short sentences.
+                n_sent = 4
+                if rng is not None:
+                    n_sent = rng.randint(3, 6)
+                for _ in range(n_sent):
+                    w = []
+                    if rng is not None:
+                        k = rng.randint(10, 18)
+                        for _i in range(k):
+                            w.append(words[rng.randint(0, len(words) - 1)])
+                    else:
+                        w = words[:12]
+                    sent = " ".join(w).capitalize() + "."
+                    out.append(sent)
+                    cur += len(sent) + 1
+                    if cur >= target_chars:
+                        break
+                txt = " ".join(out)
+                # Pad to target length with a repeating tail if needed.
+                if len(txt) < target_chars:
+                    tail = " Note: this paragraph is intentionally irrelevant." 
+                    while len(txt) < target_chars:
+                        txt += tail
+                return txt[:target_chars]
+
+            for i in range(int(count)):
+                txt = make_para(int(noise_node_chars))
+                self.mem.record_msg(f"[NOISE/{kind}/{i+1}/{count}] {txt}")
+            self._trace({
+                "type": "noise_injected",
+                "task_id": task_id,
+                "method": method,
+                "run_tag": run_tag,
+                "step": self._last_progress_step,
+                "kind": kind,
+                "count": int(count),
+                "noise_node_chars": int(noise_node_chars),
+            })
+
         self.given_projects = self._extract_given_projects(current_user_prompt)
         self._given_projects_open_idx = 0
         self._finish_block_counts = Counter()
@@ -1073,6 +1218,7 @@ class ToolLoopLLMAgent:
             self.mem.record_msg(
                 "[SYSTEM] This task lists a specific set of projects. To avoid search loops, you can open each project's OFFICIAL PROFILE (typically docid D_TRUTH_####) and extract the required fields."
             )
+            self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=0)
         self._deadline_nudged = False
         self._last_search_query = None
         self._last_search_results = []
@@ -1102,7 +1248,14 @@ class ToolLoopLLMAgent:
             current_user_prompt = nxt
             self.counters["user_followups_injected"] += 1
             self.mem.record_summary(f"[USER_FOLLOWUP/{reason}] {nxt[:400]}", ttl=8)
+            self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=self._last_progress_step)
             return True
+
+        def _is_closed_book_now() -> bool:
+            if not closed_book_final:
+                return False
+            up = (current_user_prompt or "")
+            return ("[CLOSED-BOOK]" in up) or ("CLOSED BOOK" in up)
 
         start_time = time.time()
 
@@ -1126,8 +1279,44 @@ class ToolLoopLLMAgent:
                 # Multi-turn: optionally auto-inject follow-up user messages after the agent has done some work.
                 if pending_user_turns and self.cfg.multi_turn_auto_inject:
                     oc = int(self.counters.get("open_page_calls", 0))
-                    if (step >= int(self.cfg.multi_turn_min_step)) and (oc >= int(self.cfg.multi_turn_min_open_pages)):
+                    if (step >= int(mt_min_step)) and (oc >= int(mt_min_open_pages)):
                         _inject_next_user_turn("auto")
+
+                # Stage-aware unfold: on FINAL (often CLOSED-BOOK), proactively unfold around
+                # committed anchors and/or Q1. This targets lost-in-the-middle failure modes
+                # where the agent still opens the right pages but answers the wrong question.
+                try:
+                    if (
+                        self.cfg.stage_aware_unfold_on_final
+                        and (not self._stage_final_unfold_done)
+                        and ("[FOLLOW-UP 2" in (current_user_prompt or "") or "/ FINAL" in (current_user_prompt or ""))
+                    ):
+                        q = (self._q1_text or "").strip()
+                        titles = self._committed_supporting_titles or []
+                        # Use a query that is robust across benchmarks: Q1 keywords + committed titles.
+                        q_parts = []
+                        if q:
+                            q_parts.append(q)
+                        if titles:
+                            q_parts.append(" ".join(titles[:8]))
+                        query = " | ".join([p for p in q_parts if p])
+                        if query:
+                            self.mem.unfold(query, k=int(self.cfg.stage_final_unfold_k))
+                            self._stage_final_unfold_done = True
+                            self.counters["stage_final_unfold_calls"] += 1
+                            self._trace({
+                                "type": "stage_final_unfold",
+                                "task_id": task_id,
+                                "method": method,
+                                "run_tag": run_tag,
+                                "step": step,
+                                "query": query,
+                                "k": int(self.cfg.stage_final_unfold_k),
+                                "have_committed_titles": bool(titles),
+                                "have_q1": bool(q),
+                            })
+                except Exception:
+                    self.counters["stage_final_unfold_errors"] += 1
 
                 # GoC: proactively unfold relevant stored nodes when evidence coverage is low.
                 # This happens *before* building the prompt so the recovered nodes can be used by the model.
@@ -1181,7 +1370,7 @@ class ToolLoopLLMAgent:
                         "run_tag": run_tag,
                         "step": step,
                         "messages": [
-                            {"role": m["role"], "content": m["content"][:6000]} for m in messages
+                            {"role": m["role"], "content": m["content"][: int(getattr(self.cfg, "log_message_chars", 6000) or 6000)]} for m in messages
                         ],
                         "active_tokens_est": approx_token_count(ctx),
                     })
@@ -1253,6 +1442,12 @@ class ToolLoopLLMAgent:
                     print(f"[{run_tag}][{method}][{task_id}] step={step+1}/{self.cfg.max_steps} tool={tool}")
 
                 if tool == "search":
+
+                    if _is_closed_book_now():
+                        self.counters["closed_book_tool_blocked"] += 1
+                        self.mem.record_msg("[SYSTEM] CLOSED-BOOK: search is disabled now. Use memory and call finish.")
+                        self._trace({"type":"tool_blocked","task_id":task_id,"method":method,"run_tag":run_tag,"step":step,"tool":"search","reason":"closed_book"})
+                        continue
                     query = args.get("query")
                     if not query:
                         self.counters["malformed_search_args"] += 1
@@ -1312,6 +1507,7 @@ class ToolLoopLLMAgent:
                                     docids=[docid_to_open, self._sig_open_docid(docid_to_open)],
                                     storage_text=cached,
                                 )
+                                self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
                                 # Treat policy-driven evidence surfacing as progress to break stuck-mode heuristics.
                                 self._last_progress_step = step
                                 if docid_to_open not in self.evidence_docids:
@@ -1338,6 +1534,7 @@ class ToolLoopLLMAgent:
                                     docids=[outp["docid"], self._sig_open_docid(outp["docid"])],
                                     storage_text=content,
                                 )
+                                self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
                                 self._last_progress_step = step
 
                             self._trace({
@@ -1374,13 +1571,35 @@ class ToolLoopLLMAgent:
                     self.counters["search_calls"] += 1
 
                     # Record into memory (active context)
+                    # Provide titles/snippets in the observation to make tool output more usable
+                    # and to help downstream matching for structured outputs (e.g., HotpotQA).
                     sig = self._sig_search_docid(query)
+                    try:
+                        lines: List[str] = []
+                        for i, r in enumerate(out[: min(20, len(out))], start=1):
+                            did = r.get("docid")
+                            title = (r.get("title") or "").strip()
+                            score = r.get("score")
+                            snippet = (r.get("snippet") or "").strip().replace("\n", " ")
+                            # Keep it compact; many corpora use long snippets.
+                            if len(snippet) > 220:
+                                snippet = snippet[:220] + "…"
+                            score_s = f"{float(score):.3f}" if isinstance(score, (int, float)) else ""
+                            lines.append(f"{i}. {did} | {title} | score={score_s} | {snippet}".rstrip())
+                        observation = "\n".join(lines) if lines else "[]"
+                    except Exception:
+                        observation = str([x.get("docid") for x in out])
+
+                    # Attach result docids as doc_refs so GoC can follow the evidence chain
+                    # (search -> open_page -> finish) via dependency closure.
+                    search_docids = [sig] + [d for d in (docids or []) if isinstance(d, str)]
                     self.mem.record_tool(
                         "search",
                         args,
-                        observation=str([x["docid"] for x in out]),
-                        docids=[sig],
+                        observation=observation,
+                        docids=search_docids,
                     )
+                    self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
 
                     self._trace({
                         "type": "tool",
@@ -1394,6 +1613,12 @@ class ToolLoopLLMAgent:
                     })
 
                 elif tool == "open_page":
+
+                    if _is_closed_book_now():
+                        self.counters["closed_book_tool_blocked"] += 1
+                        self.mem.record_msg("[SYSTEM] CLOSED-BOOK: open_page is disabled now. Use memory and call finish.")
+                        self._trace({"type":"tool_blocked","task_id":task_id,"method":method,"run_tag":run_tag,"step":step,"tool":"open_page","reason":"closed_book"})
+                        continue
                     docid = args.get("docid")
                     url = args.get("url")
                     if not docid and not url:
@@ -1412,7 +1637,23 @@ class ToolLoopLLMAgent:
                         self.counters["open_page_cache_hits"] += 1
                         full_content = self.opened_cache.get(docid, "") if docid else ""
                         view_content = self.opened_view_cache.get(view_key, "")
-                        prefix = self._authority_prefix(full_content) if full_content else ""
+                        # Include doc meta (docid/title/url) in the surfaced observation.
+                        title = ""
+                        try:
+                            title = (self.tools.env.corpus.get(docid, {}).get("title") or "").strip() if docid else ""
+                        except Exception:
+                            title = ""
+                        auth = self._authority_prefix(full_content) if full_content else ""
+                        prefix_lines = []
+                        if docid:
+                            prefix_lines.append(f"DOCID: {docid}")
+                        if title:
+                            prefix_lines.append(f"TITLE: {title}")
+                        if url:
+                            prefix_lines.append(f"URL: {url}")
+                        if auth:
+                            prefix_lines.append(auth)
+                        prefix = "\n".join(prefix_lines)
                         obs = self._compose_open_page_observation_view(full_content or view_content, view_content, prefix, "[CACHED VIEW]")
 
                         self.mem.record_tool(
@@ -1422,6 +1663,7 @@ class ToolLoopLLMAgent:
                             docids=[docid, self._sig_open_docid(docid)] if docid else [],
                             storage_text=full_content or None,
                         )
+                        self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
 
                         if docid and docid not in self.evidence_docids:
                             self.evidence_docids.append(docid)
@@ -1456,13 +1698,31 @@ class ToolLoopLLMAgent:
                         out = self.tools.open_page(docid=docid, url=url)
                         self.counters["open_page_calls"] += 1
                         full_content = (out.get("content") or "")
+                        title = (out.get("title") or "")
                         # Canonicalize ids
                         docid = out.get("docid") or docid
                         url = out.get("url") or url
                         if docid:
                             self.opened_cache[docid] = full_content
 
-                    prefix = self._authority_prefix(full_content)
+                    # Title for cached docs (if not populated above)
+                    if cached_doc:
+                        try:
+                            title = (self.tools.env.corpus.get(docid, {}).get("title") or "").strip() if docid else ""
+                        except Exception:
+                            title = ""
+
+                    auth = self._authority_prefix(full_content)
+                    prefix_lines = []
+                    if docid:
+                        prefix_lines.append(f"DOCID: {docid}")
+                    if title:
+                        prefix_lines.append(f"TITLE: {title.strip()}")
+                    if url:
+                        prefix_lines.append(f"URL: {url}")
+                    if auth:
+                        prefix_lines.append(auth)
+                    prefix = "\n".join(prefix_lines)
                     view = self._select_open_page_view(full_content, args)
                     view_content = view.get("view") or ""
                     tag = view.get("tag") or ""
@@ -1477,6 +1737,7 @@ class ToolLoopLLMAgent:
                         docids=[docid, self._sig_open_docid(docid)] if docid else [],
                         storage_text=full_content,
                     )
+                    self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
 
                     # Cache per-view so exact repeats are deduped, but different views are allowed.
                     self.opened_view_cache[view_key] = view_content
@@ -1507,6 +1768,12 @@ class ToolLoopLLMAgent:
 
 
                 elif tool == "branch":
+
+                    if _is_closed_book_now():
+                        self.counters["closed_book_tool_blocked"] += 1
+                        self.mem.record_msg("[SYSTEM] CLOSED-BOOK: branch is disabled now. Use memory and call finish.")
+                        self._trace({"type":"tool_blocked","task_id":task_id,"method":method,"run_tag":run_tag,"step":step,"tool":"branch","reason":"closed_book"})
+                        continue
                     # Be robust to missing keys (models sometimes omit required fields).
                     desc = args.get("description")
                     prompt = args.get("prompt")
@@ -1544,10 +1811,73 @@ class ToolLoopLLMAgent:
                     else:
                         # Multi-turn tasks: allow `return` in MAIN to request the next user follow-up.
                         if pending_user_turns:
-                            msg = args.get("message") or ""
-                            if msg:
+                            # Return gating (benchmark-controlled): avoid requesting follow-ups too early.
+                            oc = int(self.counters.get("open_page_calls", 0))
+                            if (step < int(rg_min_steps)) or (oc < int(rg_min_open_pages)):
+                                self.counters["return_gated_blocked"] += 1
+                                self.mem.record_msg(
+                                    f"[SYSTEM] return blocked (gating): collect more evidence first. "
+                                    f"Need steps>={rg_min_steps} and open_page_calls>={rg_min_open_pages}. "
+                                    "Continue with search/open_page."
+                                )
+                                self._trace({
+                                    "type": "return_blocked",
+                                    "task_id": task_id,
+                                    "method": method,
+                                    "run_tag": run_tag,
+                                    "step": step,
+                                    "reason": "return_gating",
+                                    "rg_min_steps": int(rg_min_steps),
+                                    "rg_min_open_pages": int(rg_min_open_pages),
+                                    "open_page_calls": oc,
+                                })
+                                continue
+                            msg = args.get("message")
+                            # "return" can carry structured payloads (dict/list). Ensure we store a safe preview.
+                            if msg is not None and msg != "":
+                                try:
+                                    import json as _json
+                                    if isinstance(msg, (dict, list)):
+                                        msg_s = _json.dumps(msg, ensure_ascii=False)
+                                    else:
+                                        msg_s = str(msg)
+                                except Exception:
+                                    msg_s = str(msg)
+                                msg_s = msg_s[:800]
                                 # Persist the agent's intermediate output (e.g., shortlist) so it can be reused.
-                                self.mem.record_summary(f"[ASSISTANT_RETURN] {msg[:800]}", ttl=12)
+                                self.mem.record_summary(f"[ASSISTANT_RETURN] {msg_s}", ttl=12)
+
+                                # Two-stage COMMIT capture (HotpotQA/FEVER): if return.message contains
+                                # supporting_titles, store them as a durable anchor and keep a copy in agent state.
+                                try:
+                                    up = (current_user_prompt or "")
+                                    is_commit_turn = ("[FOLLOW-UP 1" in up) or ("COMMIT" in up)
+                                    if is_commit_turn and isinstance(msg, dict) and ("supporting_titles" in msg):
+                                        raw_titles = msg.get("supporting_titles")
+                                        if isinstance(raw_titles, list):
+                                            titles = [str(t).strip() for t in raw_titles if str(t).strip()]
+                                            if titles:
+                                                # Keep only the first N to match benchmark expectations.
+                                                n_keep = int(self.cfg.committed_supporting_titles_n or 2)
+                                                self._committed_supporting_titles = titles[:n_keep]
+                                                docids = [f"TITLE:{t}" for t in self._committed_supporting_titles]
+                                                self.mem.record_summary(
+                                                    "[COMMIT_SUPPORTING_TITLES] " + ", ".join(self._committed_supporting_titles),
+                                                    docids=docids,
+                                                    ttl=None,
+                                                )
+                                                self.counters["commit_titles_captured"] += 1
+                                except Exception:
+                                    self.counters["commit_titles_capture_errors"] += 1
+
+                            # Inject benchmark-controlled noise *between* stage-1 commit and final stage.
+                            # This increases context pressure without extra LLM calls.
+                            if (not self._noise_injected_after_stage1) and int(noise_nodes_after_stage1) > 0:
+                                up = (current_user_prompt or "")
+                                if ("[FOLLOW-UP 1" in up) or ("COMMIT" in up):
+                                    self._noise_injected_after_stage1 = True
+                                    _inject_noise_nodes("after_stage1", int(noise_nodes_after_stage1))
+
                             injected = _inject_next_user_turn("return")
                             if not injected:
                                 self.counters["return_in_main_ignored"] += 1
@@ -1615,12 +1945,71 @@ class ToolLoopLLMAgent:
                     if ans_raw is None:
                         # common alternative keys from LLMs
                         ans_raw = args.get("final") or args.get("final_answer") or args.get("result") or args.get("output")
-                    ans = (str(ans_raw).strip() if ans_raw is not None else "")
+                    # IMPORTANT: keep structured answers JSON-parseable.
+                    # Some benchmarks (e.g., HotpotQA) expect finish.args.answer to be a JSON object
+                    # serialized as a string. Using str(dict) produces single-quotes and breaks parsing.
+                    ans = ""
+                    if ans_raw is not None:
+                        try:
+                            import json as _json
+                            import ast as _ast
+
+                            if isinstance(ans_raw, (dict, list)):
+                                ans = _json.dumps(ans_raw, ensure_ascii=False)
+                            elif isinstance(ans_raw, str):
+                                s = ans_raw.strip()
+                                # If the model emitted a python-literal dict, normalize it to JSON.
+                                if s.startswith("{") and "'" in s and '"' not in s:
+                                    try:
+                                        obj = _ast.literal_eval(s)
+                                        if isinstance(obj, (dict, list)):
+                                            s = _json.dumps(obj, ensure_ascii=False)
+                                    except Exception:
+                                        pass
+                                ans = s
+                            else:
+                                ans = str(ans_raw).strip()
+                        except Exception:
+                            ans = str(ans_raw).strip()
                     expl0 = (args.get("explanation") or "")
 
                     # Normalize: ensure the final answer is always stored in args["answer"] for downstream evaluation.
                     if ans:
                         args["answer"] = ans
+
+                    # Optional: enforce committed supporting_titles to avoid drift confounds.
+                    # This is benchmark-agnostic but only activates when:
+                    #   (1) the agent previously captured a commit list, and
+                    #   (2) the final answer is JSON-like and contains (or should contain) supporting_titles.
+                    try:
+                        scope = str(getattr(self.cfg, "enforce_committed_supporting_titles", "none") or "none").lower()
+                        should_enforce = (
+                            scope == "all" or
+                            (scope == "goc_only" and str(method) == "GoC")
+                        )
+                        committed = self._committed_supporting_titles or []
+                        if should_enforce and committed and ans:
+                            import json as _json
+                            obj = None
+                            try:
+                                obj = _json.loads(ans)
+                            except Exception:
+                                obj = None
+                            if isinstance(obj, dict):
+                                obj["supporting_titles"] = list(committed)
+                                args["answer"] = _json.dumps(obj, ensure_ascii=False)
+                                ans = args["answer"]
+                                self.counters["finish_enforced_committed_titles"] += 1
+                                self._trace({
+                                    "type": "enforce_committed_titles",
+                                    "task_id": task_id,
+                                    "method": method,
+                                    "run_tag": run_tag,
+                                    "step": step,
+                                    "committed": committed,
+                                })
+                    except Exception:
+                        self.counters["finish_enforce_committed_titles_errors"] += 1
 
                     # If answer is missing/empty, try to salvage from explanation (models often put the answer there).
                     if not ans:

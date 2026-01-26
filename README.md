@@ -80,7 +80,7 @@ Notes:
 
 The repo includes example sweep configs under `configs/`:
 
-- `configs/sweep_longhorizon_latebinding_stage1_v25.json`: long-horizon + 2-turn late-binding tasks.
+- `configs/sweep_longhorizon_latebinding_stage1_v52.json`: long-horizon + 2-turn late-binding tasks.
 - `configs/sweep_longhorizon_branchmerge_stage1_v26.json`: **long-horizon + 3-turn branch-merge late-binding tasks**.
 
 The v26 branch-merge tasks force two independent intermediate results (A_WINNER / B_WINNER) to be produced in separate turns via `return`,
@@ -145,6 +145,14 @@ This writes one trace file per (method, task) into `logs/traces/` as JSONL:
 
 ## Sweeps: run many configs and aggregate into one master file
 
+There are built-in sweep presets under `sweep_configs/*.json`:
+
+```bash
+python run_sweep.py --list_presets
+python run_sweep.py --preset hotpotqa_tradeoff --out_dir sweeps
+python run_sweep.py --preset hotpotqa_levels --out_dir sweeps
+```
+
 Create a sweep JSON (see `sweep_example.json`) and run:
 
 ```bash
@@ -181,4 +189,35 @@ Outputs:
 - (optional) `sweep_summary/trace_summary.csv`
 - (optional) `sweep_summary/pivot_<...>.csv`
 - (optional) `sweep_summary/heatmap_<...>.pgm` (portable graymap)
+
+
+# Optional: WebChoreArena / BrowserGym integration
+
+This repo includes an **optional** runner to evaluate our memory managers (including GoC)
+on BrowserGym-based web benchmarks such as **WebChoreArena**.
+
+## Install optional deps
+
+```bash
+pip install -r requirements-browsergym.txt
+playwright install chromium
+```
+
+## Run WebChoreArena JSON tasks
+
+Clone WebChoreArena and follow its WebArena environment setup instructions.
+
+Then point this script at the WebChoreArena task JSON and optional small-set ids:
+
+```bash
+python run_webchorearena_browsergym.py \
+  --tasks_json <WebChoreArena>/BrowserGym/config_files/<tasks>.json \
+  --small_set_ids <WebChoreArena>/BrowserGym/config_files/small_set_ids.txt \
+  --method GoC --budget_active 2000 --budget_unfold 800 \
+  --env_id browsergym/webarena --max_steps 50 \
+  --out results_wca_goc.jsonl
+```
+
+If your BrowserGym install uses a different env id or action set, see `src/browsergym_runner.py`
+and override `--env_id` / prompt guidelines accordingly.
 

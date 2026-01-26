@@ -9,3 +9,5 @@ llm_report.md
 sweep*/
 sweep_*.json
 failure_report/
+trace/
+runs/
