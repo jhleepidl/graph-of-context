@@ -3251,7 +3251,6 @@ class ToolLoopLLMAgent:
                                         except Exception:
                                             payload["commit"] = expected
                                         ok = True
-                                        schema_error_type = "autofixed_wrong_commit"
                                         self.counters["schema_autofix_commit_mismatch"] += 1
                                         try:
                                             self._trace({
