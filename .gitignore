@@ -7,7 +7,6 @@ llm_results.jsonl
 llm_report.md
 .env
 sweep*/
-sweep_*.json
 failure_report/
 trace/
 runs/

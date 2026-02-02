@@ -70,15 +70,24 @@ def scan_trace(path: str):
 
         # 4) prompt markers
         # Depending on implementation, the prompt text might appear under different keys.
-        text = ""
+        texts = []
         if isinstance(ev.get("prompt"), str):
-            text = ev["prompt"]
-        elif isinstance(ev.get("user_prompt"), str):
-            text = ev["user_prompt"]
-        elif isinstance(ev.get("content"), str):
-            text = ev["content"]
+            texts.append(ev["prompt"])
+        if isinstance(ev.get("user_prompt"), str):
+            texts.append(ev["user_prompt"])
+        if isinstance(ev.get("content"), str):
+            texts.append(ev["content"])
+        # Some traces store the full prompt as a messages list.
+        if isinstance(ev.get("messages"), list):
+            for msg in ev["messages"]:
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        texts.append(content)
 
-        if text:
+        for text in texts:
+            if not text:
+                continue
             if "[SUBTASK" in text:
                 markers["subtask_marker"] += 1
                 saw_subtask = True
