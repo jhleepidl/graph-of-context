@@ -1,0 +1,67 @@
+{
+  "benchmark": "hotpotqa",
+  "runner": "llm",
+  "data_dir": "data",
+  "methods": [
+    "GoC",
+    "FullHistory",
+    "SimilarityOnly"
+  ],
+  "base": {
+    "model": "gpt-4.1-mini",
+    "dotenv": ".env",
+    "max_steps": 120,
+    "max_json_retries": 3,
+    "task_limit": 30,
+    "parallel_tasks": 10,
+    "retriever_kind": "bm25",
+    "faiss_dim": 384,
+    "trace_messages": true,
+    "trace_message_chars": 8000,
+    "trace_output_chars": 4000,
+    "log_traces": true,
+    "budget_active": 8000,
+    "budget_unfold": 1200,
+    "unfold_k": 10,
+    "stage_aware_unfold_on_final": true,
+    "stage_final_unfold_k": 6,
+    "committed_supporting_titles_n": 2,
+    "enforce_committed_supporting_titles": "goc_only",
+    "goc_annotation_mode": "hybrid_depends",
+    "goc_annotation_gate": "doc_switch,commit_turn,merge_turn,pre_finish",
+    "goc_annotation_force": 1,
+    "bench_kwargs": {
+      "path": "data/hotpotqa/hotpot_dev_distractor_v1.json",
+      "variant": "late_support_titles",
+      "answer_format": "json",
+      "two_stage": true,
+      "closed_book_final": true,
+      "multi_commit_merge_closed_book": true,
+      "anaphoric_mode": "trajectory",
+      "trajectory_chain_closed_book": true,
+      "trajectory_chain_kind": "masked_refs",
+      "trajectory_chain_turns": 3,
+      "anaphoric_level": 2,
+      "supporting_position": "lost_in_middle",
+      "gold_at": 11,
+      "doc_repeat": 2,
+      "branch_trap_k": 2,
+      "noise_nodes_after_stage1": 6,
+      "noise_node_chars": 320,
+      "return_gating_min_open_pages": 2,
+      "return_gating_min_steps": 3,
+      "multi_commit_n": 3,
+      "multi_commit_include_merges": true,
+      "multi_commit_compose_rule": "reduce_lex_min",
+      "multi_commit_doc_shuffle": false,
+      "multi_commit_merge_plan": "binary_tree"
+    }
+  },
+  "runs": [
+    {
+      "name": "mc_dag_stress_tail_n3",
+      "bench_kwargs": {}
+    }
+  ],
+  "grid": {}
+}
