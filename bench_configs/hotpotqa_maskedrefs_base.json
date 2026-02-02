@@ -1,0 +1,18 @@
+{
+  "path": "data/hotpotqa/hotpot_dev_distractor_v1.json",
+  "variant": "late_support_titles",
+  "answer_format": "json",
+  "two_stage": true,
+  "closed_book_final": true,
+  "anaphoric_mode": "trajectory",
+  "trajectory_chain_closed_book": true,
+  "trajectory_chain_kind": "masked_refs",
+  "filler_turns": 0,
+  "delay_after_stage1": 0,
+  "supporting_position": "lost_in_middle",
+  "gold_at": 8,
+  "doc_repeat": 3,
+  "branch_trap_k": 3,
+  "noise_nodes_after_stage1": 0,
+  "noise_node_chars": 320
+}

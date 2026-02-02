@@ -124,6 +124,17 @@ class MemoryManagerBase:
         self.nodes[nid] = n
         return nid
 
+    def add_edge(self, etype: str, u: str, v: str) -> bool:
+        """Optionally add a graph edge between two existing nodes.
+
+        Base memories are not graph-structured, so this is a no-op by default.
+        Graph memories (e.g., GoC) can override to support extra connectivity.
+
+        Returns True if an edge was added, else False.
+        """
+        _ = (etype, u, v)
+        return False
+
     def active_tokens(self) -> int:
         return sum(self.nodes[nid].token_len for nid in self.active if nid in self.nodes)
 
@@ -173,7 +184,7 @@ class MemoryManagerBase:
     def _on_branch_return(self, bid: str, branch_nodes: List[str], ret_id: str):
         pass
 
-    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids: Optional[List[str]] = None, storage_text: Optional[str] = None):
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids: Optional[List[str]] = None, storage_text: Optional[str] = None) -> str:
         self._decay_ttl()
         nid = self.add_node(
             thread=self.current_thread,
@@ -184,14 +195,16 @@ class MemoryManagerBase:
         )
         self._on_branch_step(nid)
         self.maybe_fold()
+        return nid
 
-    def record_msg(self, text: str):
+    def record_msg(self, text: str) -> str:
         self._decay_ttl()
         nid = self.add_node(thread=self.current_thread, kind="msg", text=text)
         self._on_branch_step(nid)
         self.maybe_fold()
+        return nid
 
-    def record_summary(self, text: str, docids: Optional[List[str]] = None, ttl: Optional[int] = None):
+    def record_summary(self, text: str, docids: Optional[List[str]] = None, ttl: Optional[int] = None) -> str:
         """Record a summary-like node into ACTIVE context.
 
         This is useful for durable, compact annotations (e.g., constraints, policy notes)
@@ -204,6 +217,7 @@ class MemoryManagerBase:
             self.nodes[nid].ttl = ttl
         self._on_branch_step(nid)
         self.maybe_fold()
+        return nid
 
     # ------------ folding/unfolding ------------
     def maybe_fold(self):
@@ -236,19 +250,21 @@ class ContextFoldingDiscardMemory(MemoryManagerBase):
         self.branch_stack[-1] = (bid, [n for n in self.active if self.nodes[n].thread == bid])
         return bid
 
-    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None):
-        super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None) -> str:
+        nid = super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
         if self.branch_stack:
             bid, lst = self.branch_stack[-1]
-            lst.append(self.active[-1])
+            lst.append(nid)
             self.branch_stack[-1] = (bid, lst)
+        return nid
 
-    def record_msg(self, text: str):
-        super().record_msg(text)
+    def record_msg(self, text: str) -> str:
+        nid = super().record_msg(text)
         if self.branch_stack:
             bid, lst = self.branch_stack[-1]
-            lst.append(self.active[-1])
+            lst.append(nid)
             self.branch_stack[-1] = (bid, lst)
+        return nid
 
     def _on_branch_return(self, bid: str, branch_nodes: List[str], ret_id: str):
         # remove all branch nodes from active and delete them (hard discard)
@@ -461,9 +477,8 @@ class SimpleRAGMemory(MemoryManagerBase):
     def unfold(self, query: str, k: int = None):
         return self._inject_recalls(query, k=k)
 
-    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None):
-        super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
-        nid = self.active[-1] if self.active else None
+    def record_tool(self, tool_name: str, args: Dict[str, Any], observation: str, docids=None, storage_text: Optional[str] = None) -> str:
+        nid = super().record_tool(tool_name, args, observation, docids=docids, storage_text=storage_text)
         if nid:
             self.storage_ids.append(nid)
             self._dirty = True
@@ -472,16 +487,17 @@ class SimpleRAGMemory(MemoryManagerBase):
         self._inject_recalls(q)
         self._apply_window()
         self.maybe_fold()
+        return nid
 
-    def record_msg(self, text: str):
-        super().record_msg(text)
-        nid = self.active[-1] if self.active else None
+    def record_msg(self, text: str) -> str:
+        nid = super().record_msg(text)
         if nid:
             self.storage_ids.append(nid)
             self._dirty = True
         self._inject_recalls((text or "")[:600])
         self._apply_window()
         self.maybe_fold()
+        return nid
 
 
 # ======================
@@ -493,6 +509,28 @@ class GoCMemory(MemoryManagerBase):
     unfold_k: int = 6
     max_dep_depth: int = 3
     doc_ref_expand: int = 6
+
+    # --- Option-B: richer indexing + controllable closure/unfold ---
+    # Controls which doc_ref keys we create for each node.
+    #   - docid_only: use only corpus docid(s) (default; backwards-compatible)
+    #   - docid_title: also attach TITLE:<title> extracted from open_page observations
+    #   - docid_title_url: also attach TITLE:<title> and URL:<url> when available
+    docid_index_mode: str = "docid_only"
+
+    # Which edge types to follow when building dependency closures during unfolding.
+    # Typical for HotpotQA: ("depends","doc_ref") so committed TITLE anchors can pull the
+    # matching open_page nodes via doc_ref.
+    dep_closure_edge_types: Tuple[str, ...] = ("depends",)
+
+    # Candidate selection mode for unfolding.
+    #   - marginal_ratio: greedy by score / marginal_cost (default)
+    #   - score_only: greedy by score, tie-break by lower cost
+    unfold_select_mode: str = "marginal_ratio"
+
+    # Tracing helpers for controller datasets.
+    trace_unfold_candidates: bool = False
+    unfold_candidate_preview_chars: int = 240
+    unfold_candidate_max_closure_ids: int = 40
 
     # preserved but not active
     storage: List[str] = field(default_factory=list)
@@ -515,6 +553,10 @@ class GoCMemory(MemoryManagerBase):
     # while (b) minimizing cross edges (cut) to the remaining ACTIVE context.
     fold_method: str = "mincut"             # "mincut" or "greedy" (fallback)
     fold_edge_w_depends: float = 1.0
+    # Weight for *LLM-declared* dependency edges (hybrid graph construction).
+    # These edges are typically less reliable than system-derived `depends` edges,
+    # so the default is lower. Tune in sweeps.
+    fold_edge_w_depends_llm: float = 0.6
     fold_edge_w_docref: float = 1.0
     fold_edge_w_seq: float = 0.2
     fold_mincut_lambda_init: float = 1e-3
@@ -524,6 +566,9 @@ class GoCMemory(MemoryManagerBase):
     # Folding policy selector.
     # - "budget": token-weighted min-cut folding driven by budget_active (default).
     # - "pef_url": Page-Episode Folding (PEF) for BrowserGym/WebArena: fold primarily on URL changes.
+    # - "dfs_doc": Doc-Episode Folding (DEF) for doc-scoped benches (HotpotQA/FEVER/LIM-style):
+    #             fold primarily when open_page(docid) switches (DFS-like episode end).
+    # - "phase_end": do not change budget folding, but allow explicit phase_end_fold() triggers from the agent.
     fold_policy: str = "budget"
 
     # PEF(URL) state (internal)
@@ -544,6 +589,30 @@ class GoCMemory(MemoryManagerBase):
     pef_roll_keep_last: int = 10
     pef_roll_min_chunk: int = 6
 
+
+    # DEF(doc) state (internal)
+    _dfs_last_docid: Optional[str] = field(default=None, init=False, repr=False)
+    _dfs_episode_start_pos: int = field(default=0, init=False, repr=False)
+
+    # DEF safety backstop: if ACTIVE blows up beyond this multiplier, fall back to budget folding.
+    dfs_backstop_mult: float = 2.5
+
+    # DEF hysteresis (within a doc episode):
+    # Fold only when ACTIVE tokens exceed budget_active * dfs_hi_mult, and fold down until <= budget_active * dfs_lo_mult.
+    # We first compact *previous episodes* (before the current episode start) to preserve the current page context.
+    dfs_hi_mult: float = 1.20
+    dfs_lo_mult: float = 0.85
+
+    # Within the current doc episode, keep the most recent nodes in full detail when rolling-folding.
+    dfs_roll_keep_last: int = 10
+    dfs_roll_min_chunk: int = 6
+
+    # When switching docids, fold the previous episode; optionally keep a small tail in full detail.
+    dfs_switch_keep_last: int = 0
+
+    # Explicit phase boundary folding (e.g., after stage-1 COMMIT): keep the most recent nodes in full detail.
+    dfs_phase_keep_last: int = 10
+
     # Greedy folding weights (kept as fallback / debugging)
     fold_w_internal: float = 1.0            # reward edges within the chunk
     fold_w_cut: float = 1.4                 # penalize edges from chunk to remaining ACTIVE
@@ -554,8 +623,13 @@ class GoCMemory(MemoryManagerBase):
 
     # lightweight graph
     docid_to_nodes: Dict[str, List[str]] = field(default_factory=dict)  # docid -> node ids
-    edges_out: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "doc_ref": {}, "seq": {}})
-    edges_in: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "doc_ref": {}, "seq": {}})
+    # Edge types:
+    #   - depends: system-derived dependencies (e.g., sequential/thread prerequisites, proxy->children)
+    #   - depends_llm: model-declared dependencies (hybrid; potentially noisy)
+    #   - doc_ref: shared docid/title/url references
+    #   - seq: within-thread sequence edges
+    edges_out: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}})
+    edges_in: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}})
 
     _last_in_thread: Dict[str, str] = field(default_factory=dict)  # thread -> last node id
 
@@ -568,17 +642,36 @@ class GoCMemory(MemoryManagerBase):
         self._storage_buffer_retriever = None
         self._storage_indexed = set()
         self.docid_to_nodes = {}
-        self.edges_out = {"depends": {}, "doc_ref": {}, "seq": {}}
-        self.edges_in = {"depends": {}, "doc_ref": {}, "seq": {}}
+        self.edges_out = {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}}
+        self.edges_in = {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}}
         self._last_in_thread = {}
         # PEF(URL) state
         self._pef_last_url = None
         self._pef_episode_start_pos = 0
 
+        # DEF(doc) state
+        self._dfs_last_docid = None
+        self._dfs_episode_start_pos = 0
+
     # ---- graph helpers ----
     def _add_edge(self, etype: str, u: str, v: str):
         self.edges_out.setdefault(etype, {}).setdefault(u, set()).add(v)
         self.edges_in.setdefault(etype, {}).setdefault(v, set()).add(u)
+
+    def add_edge(self, etype: str, u: str, v: str) -> bool:
+        """Public edge insertion for graph-aware memories.
+
+        This is intentionally minimal: it validates node existence and avoids
+        self-loops. Downstream policies (closure/folding) can leverage the edge.
+        """
+        if not etype or not u or not v:
+            return False
+        if u == v:
+            return False
+        if u not in self.nodes or v not in self.nodes:
+            return False
+        self._add_edge(str(etype), u, v)
+        return True
 
     def _neighbors(self, etype: str, u: str) -> Set[str]:
         return set(self.edges_out.get(etype, {}).get(u, set()))
@@ -609,10 +702,53 @@ class GoCMemory(MemoryManagerBase):
 
     def add_node(self, thread: str, kind: str, text: str, docids: Optional[List[str]] = None, storage_text: Optional[str] = None) -> str:
         nid = super().add_node(thread=thread, kind=kind, text=text, docids=docids, storage_text=storage_text)
+
+        # Option-B: attach extra doc_ref keys (TITLE:/URL:) extracted from observation text.
+        # This is crucial for HotpotQA two-stage setups where committed titles become anchors.
+        try:
+            self._augment_docids_from_text(nid)
+        except Exception:
+            pass
+
         # graph updates
         self._link_sequential(nid)
         self._index_docids(nid)
         return nid
+
+    def _augment_docids_from_text(self, nid: str) -> None:
+        """Augment node.docids with TITLE:/URL: keys for doc_ref linking.
+
+        This does NOT affect tool/docid correctness checks (those still use the corpus docid),
+        but improves doc_ref expansion and dependency closure when titles are used as anchors.
+        """
+        mode = str(getattr(self, "docid_index_mode", "docid_only") or "docid_only").lower().strip()
+        if mode == "docid_only":
+            return
+        n = self.nodes.get(nid)
+        if not n:
+            return
+        text = (n.text or "")
+        docids = list(n.docids or [])
+
+        if mode in {"docid_title", "docid_title_url"}:
+            m = re.search(r"(?m)^TITLE:\s*(.+?)\s*$", text)
+            if m:
+                title = (m.group(1) or "").strip()
+                if title:
+                    key = f"TITLE:{title}"
+                    if key not in docids:
+                        docids.append(key)
+
+        if mode == "docid_title_url":
+            m = re.search(r"(?m)^URL:\s*(.+?)\s*$", text)
+            if m:
+                url = (m.group(1) or "").strip()
+                if url:
+                    key = f"URL:{url}"
+                    if key not in docids:
+                        docids.append(key)
+
+        n.docids = docids
 
     # ---- storage index ----
     def _index_text(self, n: MemoryNode, *, include_full: bool) -> str:
@@ -749,6 +885,14 @@ class GoCMemory(MemoryManagerBase):
         if str(self.fold_policy).lower() == "pef_url" and str(tool_name).lower() == "obs":
             try:
                 self._pef_maybe_fold_on_obs(nid)
+            except Exception:
+                pass
+
+
+        # DEF(doc): fold primarily on open_page(docid) switches (DFS-like episode end).
+        if str(self.fold_policy).lower().strip() in {"dfs_doc", "doc_dfs", "dfs"} and str(tool_name).lower() == "open_page":
+            try:
+                self._dfs_maybe_fold_on_open_page(nid, args)
             except Exception:
                 pass
 
@@ -1018,6 +1162,208 @@ class GoCMemory(MemoryManagerBase):
         return True
 
     
+
+
+    # ---- DEF(doc) folding: doc-scoped episode folding for HotpotQA/FEVER/LIM-style benches ----
+    def _dfs_extract_docid(self, nid: str, args: dict | None = None) -> str:
+        """Extract docid for doc-episode folding.
+
+        Priority:
+          1) args['docid'] when present
+          2) first node.docids that looks like a corpus docid (starts with 'D_')
+        """
+        try:
+            if args and args.get("docid"):
+                return str(args.get("docid") or "").strip()
+        except Exception:
+            pass
+        n = self.nodes.get(nid)
+        if not n:
+            return ""
+        for d in (n.docids or []):
+            ds = str(d or "")
+            if ds.startswith("D_"):
+                return ds
+        return ""
+
+    def _dfs_create_episode_proxy_node(self, chunk: list[str], docid: str) -> str:
+        """Create an EPISODE_PROXY node for a doc episode."""
+        if not chunk:
+            raise ValueError("empty chunk")
+        child_steps = [self.nodes[n].step_idx for n in chunk if n in self.nodes]
+        step_min = min(child_steps) if child_steps else 0
+        step_max = max(child_steps) if child_steps else step_min
+        # Union docids
+        docids: list[str] = []
+        for nid in chunk:
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            for d in (n.docids or []):
+                if d not in docids:
+                    docids.append(d)
+        body = self._summarize_chunk_facts(chunk)
+        header = f"[DOC_EPISODE_PROXY docid={docid} steps={step_min}-{step_max} n={len(chunk)}]"
+        proxy_text = header + "\n" + body
+        proxy_id = MemoryManagerBase.add_node(self, thread="main", kind="summary", text=proxy_text, docids=docids)
+        if proxy_id in self.nodes:
+            self.nodes[proxy_id].children = list(chunk)
+            self.nodes[proxy_id].step_idx = step_min
+            self.nodes[proxy_id].token_len = approx_token_count(self.nodes[proxy_id].text)
+        self._index_docids(proxy_id)
+        for child in chunk:
+            if child in self.nodes:
+                self.nodes[child].parent = proxy_id
+                self._add_edge("depends", proxy_id, child)
+        return proxy_id
+
+    def _dfs_fold_chunk(self, *, chunk: list[str], reason: str, docid: str | None = None):
+        """Fold a non-empty chunk into a proxy and move children to storage."""
+        if not chunk:
+            return
+        before = self.active_tokens()
+        # Filter out anchors
+        chunk = [nid for nid in chunk if nid in self.nodes and (not self._is_anchor_node(nid))]
+        if not chunk:
+            return
+        # Create proxy
+        if docid:
+            proxy_id = self._dfs_create_episode_proxy_node(chunk, docid)
+        else:
+            proxy_id = self._create_proxy_node(chunk)
+        self._replace_prefix_with_proxy(chunk, proxy_id)
+
+        newly_stored: list[str] = []
+        for nid in chunk:
+            if nid in self.nodes and nid not in self.storage:
+                self.storage.append(nid)
+                newly_stored.append(nid)
+        if newly_stored:
+            self._storage_index_add(newly_stored, force_flush=False)
+
+        after = self.active_tokens()
+        self._emit_event({
+            "type": "fold",
+            "mem": "GoC",
+            "policy": str(self.fold_policy),
+            "reason": reason,
+            "docid": docid or "",
+            "global_step": int(self._global_step),
+            "chunk_size": int(len(chunk)),
+            "chunk_tokens": int(sum(int(self.nodes[n].token_len) for n in chunk if n in self.nodes)),
+            "active_tokens_before": int(before),
+            "active_tokens_after": int(after),
+            "proxy_id": proxy_id,
+        })
+        return proxy_id
+
+    def _dfs_maybe_fold_on_open_page(self, nid: str, args: dict | None = None):
+        """Fold the previous doc episode when open_page switches docid."""
+        docid = self._dfs_extract_docid(nid, args)
+        if not docid:
+            return
+        # Locate this node in ACTIVE (should exist)
+        try:
+            cur_idx = self.active.index(nid)
+        except ValueError:
+            cur_idx = len(self.active) - 1
+
+        if not self._dfs_last_docid:
+            self._dfs_last_docid = docid
+            self._dfs_episode_start_pos = max(0, min(cur_idx, len(self.active)))
+            return
+
+        if docid == self._dfs_last_docid:
+            return
+
+        # Fold the previous episode window [start_pos, cur_idx)
+        start = max(0, min(int(self._dfs_episode_start_pos), len(self.active)))
+        end = max(start, min(cur_idx, len(self.active)))
+        if end <= start:
+            self._dfs_last_docid = docid
+            self._dfs_episode_start_pos = max(0, min(cur_idx, len(self.active)))
+            return
+
+        keep_tail = max(0, int(self.dfs_switch_keep_last))
+        fold_end = max(start, end - keep_tail)
+        window = self.active[start:fold_end]
+        # Only fold if it's a meaningful chunk
+        if len([x for x in window if x in self.nodes and (not self._is_anchor_node(x))]) >= int(self.dfs_roll_min_chunk):
+            _pid = self._dfs_fold_chunk(chunk=window, reason="doc_switch", docid=str(self._dfs_last_docid))
+            # Episode tracking reset after folding window
+            # The current open_page node (nid) belongs to the new episode; recompute its index
+            try:
+                cur_idx = self.active.index(nid)
+            except ValueError:
+                cur_idx = len(self.active) - 1
+
+        # Start new episode from current open_page node
+        self._dfs_last_docid = docid
+        self._dfs_episode_start_pos = max(0, min(cur_idx, len(self.active)))
+
+    def _dfs_compact_before_current_episode(self) -> bool:
+        """Try compacting everything BEFORE the current episode start (prefer folding older episodes first)."""
+        boundary = max(0, min(int(self._dfs_episode_start_pos), len(self.active)))
+        if boundary <= 0:
+            return False
+        chunk = [nid for nid in self.active[:boundary] if nid in self.nodes and (not self._is_anchor_node(nid))]
+        if len(chunk) < int(self.dfs_roll_min_chunk):
+            return False
+        _pid = self._dfs_fold_chunk(chunk=chunk, reason="budget_pre_episode", docid=None)
+        # Episode start shifts due to insertions/removals; best-effort clamp
+        self._dfs_episode_start_pos = max(0, min(int(self._dfs_episode_start_pos), len(self.active)))
+        return True
+
+    def _dfs_roll_fold_current_episode(self) -> bool:
+        """Compact the older part of the CURRENT doc episode, keeping a recent tail."""
+        cur_docid = self._dfs_last_docid
+        if not cur_docid:
+            return False
+        start = max(0, min(int(self._dfs_episode_start_pos), len(self.active)))
+        keep_last = max(0, int(self.dfs_roll_keep_last))
+        end_exclusive = max(start, len(self.active) - keep_last)
+        if end_exclusive <= start:
+            return False
+        window = [nid for nid in self.active[start:end_exclusive] if nid in self.nodes and (not self._is_anchor_node(nid))]
+        if len(window) < int(self.dfs_roll_min_chunk):
+            return False
+        proxy_id = self._dfs_fold_chunk(chunk=window, reason="budget_roll_episode", docid=str(cur_docid))
+        # Episode start becomes the proxy position (since we compacted the prefix of the episode).
+        if proxy_id:
+            try:
+                self._dfs_episode_start_pos = self.active.index(proxy_id)
+            except ValueError:
+                self._dfs_episode_start_pos = max(0, len(self.active) - 1)
+        else:
+            self._dfs_episode_start_pos = max(0, len(self.active) - 1)
+        return True
+
+    def phase_end_fold(self, *, reason: str = "phase_end", keep_last: int | None = None):
+        """Explicitly fold at a phase boundary (e.g., after stage-1 COMMIT).
+
+        This is independent of budget_active, but still uses proxies so dependency-closure unfolding remains possible.
+        """
+        k = int(self.dfs_phase_keep_last if keep_last is None else keep_last)
+        k = max(0, k)
+        if not self.active:
+            return
+        # Keep anchors + last-k nodes
+        keep_set = set(nid for nid in self.active[-k:] if nid in self.nodes)
+        for nid in self.active:
+            if self._is_anchor_node(nid):
+                keep_set.add(nid)
+        chunk = [nid for nid in self.active if (nid in self.nodes and nid not in keep_set and (not self._is_anchor_node(nid)))]
+        if len(chunk) < int(self.dfs_roll_min_chunk):
+            # Still reset episode tracking
+            self._dfs_last_docid = None
+            self._dfs_episode_start_pos = max(0, len(self.active))
+            return
+        _pid = self._dfs_fold_chunk(chunk=chunk, reason=str(reason), docid=None)
+        # Reset episode tracking across phases
+        self._dfs_last_docid = None
+        self._dfs_episode_start_pos = max(0, len(self.active))
+
+
     # ---- proxy summarization helpers (hierarchical folding) ----
     _PROXY_DEPTH_RE = re.compile(r"\[GOCPROXY depth=(\d+)\]")
     _PROJECT_RE = re.compile(r"(Project_[0-9]{4})")
@@ -1100,6 +1446,44 @@ class GoCMemory(MemoryManagerBase):
                     if k not in cur and v:
                         cur[k] = v
 
+        # Preserve exact document titles for late-binding tasks.
+        #
+        # Tool observations commonly contain titles in two formats:
+        #   1) open_page header lines:
+        #        TITLE: <exact title>
+        #   2) search result rows:
+        #        1. <docid> | <title> | score=...
+        # Titles may also be prefixed by "obs=" due to how tool nodes are recorded.
+        titles_seen: List[str] = []
+        _re_title_line = re.compile(r"(?:^|\b)TITLE:\s*(.+)$")
+        _re_search_row = re.compile(r"^\s*\d+\.\s*[^|]+\|\s*([^|]+?)\s*\|")
+        for nid in chunk:
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            try:
+                for ln in (n.text or '').splitlines():
+                    s = ln.strip()
+                    if s.startswith('obs='):
+                        s = s[4:].lstrip()
+
+                    m = _re_title_line.search(s)
+                    if m:
+                        t = m.group(1).strip()
+                        if t and t not in titles_seen:
+                            titles_seen.append(t)
+                        continue
+
+                    m = _re_search_row.match(s)
+                    if m:
+                        t = m.group(1).strip()
+                        if t and t not in titles_seen:
+                            titles_seen.append(t)
+                        continue
+            except Exception:
+                pass
+
+
         lines: List[str] = []
         if by_project:
             # Deterministic ordering: by earliest step the project appears in this chunk
@@ -1145,6 +1529,12 @@ class GoCMemory(MemoryManagerBase):
                     s = first[0]
                     s = s[:120] + ("..." if len(s) > 120 else "")
                     lines.append("- " + s)
+
+        if titles_seen:
+            # Keep recent unique titles; do NOT truncate/ellipsis because callers may need exact matches.
+            show = titles_seen[-8:]
+            lines.insert(0, 'Titles: ' + ' | '.join(show))
+
 
         if docids:
             dids = ", ".join(docids[:8])
@@ -1227,9 +1617,9 @@ class GoCMemory(MemoryManagerBase):
         t = (n.text or "").lstrip()
         # Be permissive: different runners may emit "[FAIL]" or "[FAILURE]".
         # We anchor any summary beginning with "[FAIL" as well as hard constraints.
-        return t.startswith("[FAIL") or t.startswith("[CONSTRAINT]") or t.startswith("[GUARD]")
+        return (t.startswith('[FAIL') or t.startswith('[CONSTRAINT]') or t.startswith('[GUARD]') or t.startswith('[COMMIT') or t.startswith('[USER_FOLLOWUP') or t.startswith('[ASSISTANT_RETURN]'))
 
-    def _active_neighbors(self, nid: str, active_set: Set[str], etypes: Tuple[str, ...] = ("depends", "doc_ref")) -> Set[str]:
+    def _active_neighbors(self, nid: str, active_set: Set[str], etypes: Tuple[str, ...] = ("depends", "depends_llm", "doc_ref")) -> Set[str]:
         """Undirected neighbors within ACTIVE for fold heuristics."""
         out: Set[str] = set()
         for et in etypes:
@@ -1248,6 +1638,9 @@ class GoCMemory(MemoryManagerBase):
         # depends
         if (v in self.edges_out.get("depends", {}).get(u, set())) or (u in self.edges_out.get("depends", {}).get(v, set())):
             w += float(self.fold_edge_w_depends)
+        # depends_llm (hybrid, model-declared)
+        if (v in self.edges_out.get("depends_llm", {}).get(u, set())) or (u in self.edges_out.get("depends_llm", {}).get(v, set())):
+            w += float(getattr(self, "fold_edge_w_depends_llm", 0.0) or 0.0)
         # doc_ref
         if (v in self.edges_out.get("doc_ref", {}).get(u, set())) or (u in self.edges_out.get("doc_ref", {}).get(v, set())):
             w += float(self.fold_edge_w_docref)
@@ -1261,6 +1654,7 @@ class GoCMemory(MemoryManagerBase):
         w = 0.0
         for et, ew in (
             ("depends", float(self.fold_edge_w_depends)),
+            ("depends_llm", float(getattr(self, "fold_edge_w_depends_llm", 0.0) or 0.0)),
             ("doc_ref", float(self.fold_edge_w_docref)),
             ("seq", float(self.fold_edge_w_seq)),
         ):
@@ -1305,24 +1699,30 @@ class GoCMemory(MemoryManagerBase):
         # Precompute pair weights among candidates (sparse) and outside-cut weights.
         pair_w: Dict[Tuple[str, str], float] = {}
         # Use edges_out keys to avoid O(n^2).
+        def _fold_edge_weight_for_type(et: str) -> float:
+            et = str(et)
+            if et == "depends":
+                return float(self.fold_edge_w_depends)
+            if et == "depends_llm":
+                return float(getattr(self, "fold_edge_w_depends_llm", 0.0) or 0.0)
+            if et == "doc_ref":
+                return float(self.fold_edge_w_docref)
+            return float(self.fold_edge_w_seq)
+
         for u in candidates:
-            for et in ("depends", "doc_ref", "seq"):
+            for et in ("depends", "depends_llm", "doc_ref", "seq"):
                 for v in self.edges_out.get(et, {}).get(u, set()):
                     if v not in candidates_set or v == u:
                         continue
                     a, b = (u, v) if u < v else (v, u)
-                    pair_w[(a, b)] = pair_w.get((a, b), 0.0) + float(
-                        self.fold_edge_w_depends if et == "depends" else self.fold_edge_w_docref if et == "doc_ref" else self.fold_edge_w_seq
-                    )
+                    pair_w[(a, b)] = pair_w.get((a, b), 0.0) + _fold_edge_weight_for_type(et)
             # Include inbound edges too (treat as undirected).
-            for et in ("depends", "doc_ref", "seq"):
+            for et in ("depends", "depends_llm", "doc_ref", "seq"):
                 for v in self.edges_in.get(et, {}).get(u, set()):
                     if v not in candidates_set or v == u:
                         continue
                     a, b = (u, v) if u < v else (v, u)
-                    pair_w[(a, b)] = pair_w.get((a, b), 0.0) + float(
-                        self.fold_edge_w_depends if et == "depends" else self.fold_edge_w_docref if et == "doc_ref" else self.fold_edge_w_seq
-                    )
+                    pair_w[(a, b)] = pair_w.get((a, b), 0.0) + _fold_edge_weight_for_type(et)
 
         outside_w: Dict[str, float] = {}
         for u in candidates:
@@ -1515,7 +1915,7 @@ class GoCMemory(MemoryManagerBase):
                     # Rank by internal connectivity (within chunk) then token mass.
                     ch_set = set(chunk)
                     def _internal_deg(u: str) -> int:
-                        return len(self._active_neighbors(u, ch_set, ("depends", "doc_ref", "seq")))
+                        return len(self._active_neighbors(u, ch_set, ("depends", "depends_llm", "doc_ref", "seq")))
 
                     keep: List[str] = [seed] if seed in ch_set else [chunk[0]]
                     kept_set = set(keep)
@@ -1587,7 +1987,7 @@ class GoCMemory(MemoryManagerBase):
                     outside_set = set(self.active) - chunk_set
                     boundary_pairs: Set[frozenset] = set()
                     internal_pairs: Set[frozenset] = set()
-                    for et in ("depends", "doc_ref", "seq"):
+                    for et in ("depends", "depends_llm", "doc_ref", "seq"):
                         out_map = self.edges_out.get(et, {})
                         in_map = self.edges_in.get(et, {})
                         for u in chunk_set:
@@ -1672,26 +2072,81 @@ class GoCMemory(MemoryManagerBase):
                 self._maybe_fold_budget()
             return
 
+        if pol in {"dfs_doc", "doc_dfs", "dfs"}:
+            # DEF prefers folding at doc episode boundaries (open_page switches).
+            # We still enforce budget_active via a deterministic strategy:
+            #   1) compact everything before the current episode start (older episodes),
+            #   2) if still over budget, roll-fold within the current episode,
+            #   3) safety backstop: fall back to generic budget folding.
+            try:
+                hi = float(self.budget_active) * float(self.dfs_hi_mult)
+                lo = float(self.budget_active) * float(self.dfs_lo_mult)
+
+                # If we are already above the high watermark, iteratively compact to low.
+                if self.active_tokens() > hi:
+                    for _ in range(10):
+                        if self.active_tokens() <= lo:
+                            break
+                        did = self._dfs_compact_before_current_episode()
+                        if not did:
+                            did = self._dfs_roll_fold_current_episode()
+                        if not did:
+                            break
+
+                # Absolute safety backstop
+                if self.active_tokens() > float(self.budget_active) * float(self.dfs_backstop_mult):
+                    self._maybe_fold_budget()
+            except Exception:
+                self._maybe_fold_budget()
+            return
+
         # Default: budget-driven folding.
         self._maybe_fold_budget()
 
     # ---- minimal-closure unfold ----
-    def _dep_closure(self, seeds: List[str], depth: int) -> Set[str]:
+    def _dep_closure(self, seeds: List[str], depth: int, edge_types: Optional[Tuple[str, ...]] = None) -> Set[str]:
+        """Return a dependency closure from seed node ids.
+
+        edge_types controls which graph relations are traversed. By default we use
+        self.dep_closure_edge_types.
+
+        Notes on traversal:
+          - depends: traverse outgoing depends edges (newer -> prerequisite)
+          - doc_ref: traverse doc_ref edges (bidirectional already)
+          - seq: traverse *backward* along seq (to preserve chronology)
+        """
+        etypes = edge_types
+        if not etypes:
+            etypes = tuple(getattr(self, "dep_closure_edge_types", None) or ("depends",))
+        etypes = tuple(str(e).strip() for e in etypes if str(e).strip())
+
         visited: Set[str] = set()
         frontier: Set[str] = set(seeds)
-        for _ in range(depth):
+        for _ in range(max(0, int(depth))):
             new_frontier: Set[str] = set()
             for u in frontier:
                 if u in visited:
                     continue
                 visited.add(u)
-                # parents along depends (bring prerequisites)
-                for p in self._neighbors("depends", u):
-                    if p not in visited:
-                        new_frontier.add(p)
+                for et in etypes:
+                    nbrs: Set[str] = set()
+                    if et == "seq":
+                        nbrs |= set(self._parents("seq", u))
+                    elif et == "doc_ref":
+                        nbrs |= set(self._neighbors("doc_ref", u))
+                        nbrs |= set(self._parents("doc_ref", u))
+                    else:
+                        nbrs |= set(self._neighbors(et, u))
+                    for v in nbrs:
+                        if v not in visited:
+                            new_frontier.add(v)
             frontier = new_frontier
             if not frontier:
                 break
+        # Ensure seeds are included even when depth==0.
+        for s in seeds:
+            if s in self.nodes:
+                visited.add(s)
         return visited
 
     def _doc_ref_expand(self, nodes: Set[str], limit_per_node: int) -> Set[str]:
@@ -1761,78 +2216,262 @@ class GoCMemory(MemoryManagerBase):
             snip = snip + "..."
         return snip[:max_chars].strip()
 
+    
+    def compute_unfold_candidates(self, query: str, *, k: Optional[int] = None, topk: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return ranked unfold candidates for controller-style selection.
+
+        Each candidate corresponds to a *seed* storage node and includes:
+          - seed_id, score
+          - closure_ids (seed + dependency closure + doc_ref expansion)
+          - cost_tokens (sum of token_len for closure nodes not already ACTIVE)
+          - preview (short snippet for inspection/LLM-controller)
+        """
+        kk = int(k or self.unfold_k or 6)
+        if not self._storage_retriever or not self.storage:
+            return []
+        top = int(topk or max(kk * 3, 10))
+        hits = self._storage_retriever.search(query, topk=top)
+
+        candidates: List[Dict[str, Any]] = []
+        active_set = set(self.active)
+
+        for nid, score in hits:
+            if nid not in self.nodes:
+                continue
+            if nid in active_set:
+                continue
+
+            # closure: seed + dependency closure (configurable edges) + doc_ref neighbors
+            closure = self._dep_closure([nid], int(self.max_dep_depth), None)
+            closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+            closure_list = [x for x in closure if x in self.nodes]
+
+            # cost: only count nodes that would be newly activated
+            cost = 0
+            for x in closure_list:
+                if x in active_set:
+                    continue
+                cost += int(self.nodes[x].token_len)
+
+            n = self.nodes.get(nid)
+            docids = list(n.docids or []) if n else []
+            preview_src = ""
+            if n and n.storage_text:
+                preview_src = self._extract_storage_snippet(n.storage_text, query)
+            if (not preview_src) and n:
+                preview_src = (n.text or "")
+            preview = (preview_src or "").strip().replace("\n", " ")
+            max_chars = int(getattr(self, "unfold_candidate_preview_chars", 240) or 240)
+            if len(preview) > max_chars:
+                preview = preview[:max_chars] + "..."
+
+            # stable chronological order for closure ids (helps debugging/training)
+            closure_list.sort(key=lambda x: int(self.nodes[x].step_idx) if x in self.nodes else 10**9)
+            max_cl = int(getattr(self, "unfold_candidate_max_closure_ids", 40) or 40)
+            closure_trunc = closure_list[:max_cl]
+
+            candidates.append({
+                "seed_id": nid,
+                "seed_kind": str(n.kind) if n else "",
+                "seed_step": int(n.step_idx) if n else -1,
+                "seed_docids": docids[:8],
+                "score": float(score),
+                "cost_tokens": int(cost),
+                "closure_size": int(len(closure_list)),
+                "closure_ids": closure_trunc,
+                "preview": preview,
+            })
+
+        # Sort by score desc
+        candidates.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
+        return candidates
+
+    def _select_unfold_seeds(self, candidates: List[Dict[str, Any]], *, k: int) -> Tuple[List[str], Set[str], int]:
+        """Greedy seed selection under budget_unfold."""
+        kk = max(1, int(k or self.unfold_k or 6))
+        mode = str(getattr(self, "unfold_select_mode", "marginal_ratio") or "marginal_ratio").lower().strip()
+
+        def _key(c: Dict[str, Any]):
+            s = float(c.get("score", 0.0))
+            cost = float(max(1, int(c.get("cost_tokens", 1))))
+            if mode == "score_only":
+                return (s, -cost)
+            return (s / cost, s)
+
+        ordered = sorted(candidates, key=_key, reverse=True)
+
+        chosen_nodes: Set[str] = set()
+        chosen_seed_ids: List[str] = []
+        used = 0
+        active_set = set(self.active)
+
+        for cand in ordered:
+            sid = str(cand.get("seed_id") or "")
+            if not sid or sid not in self.nodes:
+                continue
+
+            # Recompute full closure (candidate closure_ids might be truncated for logging).
+            closure = self._dep_closure([sid], int(self.max_dep_depth), None)
+            closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+
+            add_cost = 0
+            for x in closure:
+                if x in active_set or x in chosen_nodes:
+                    continue
+                n = self.nodes.get(x)
+                if n:
+                    add_cost += int(n.token_len)
+
+            if used + add_cost > int(self.budget_unfold):
+                continue
+
+            chosen_seed_ids.append(sid)
+            for x in closure:
+                if x in self.nodes:
+                    chosen_nodes.add(x)
+            used += int(add_cost)
+            if len(chosen_seed_ids) >= kk:
+                break
+
+        return chosen_seed_ids, chosen_nodes, int(used)
+
+    def unfold_with_seed_ids(self, query: str, seed_ids: List[str], *, k: Optional[int] = None) -> List[str]:
+        """Unfold by explicit seed ids (used by agentic memory controllers)."""
+        kk = int(k or self.unfold_k or 6)
+        active_set = set(self.active)
+        chosen_nodes: Set[str] = set()
+        chosen_seed_ids: List[str] = []
+        used = 0
+
+        for sid in (seed_ids or []):
+            sid = str(sid or "").strip()
+            if (not sid) or (sid not in self.nodes):
+                continue
+
+            closure = self._dep_closure([sid], int(self.max_dep_depth), None)
+            closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+
+            add_cost = 0
+            for x in closure:
+                if x in active_set or x in chosen_nodes:
+                    continue
+                n = self.nodes.get(x)
+                if n:
+                    add_cost += int(n.token_len)
+
+            if used + add_cost > int(self.budget_unfold):
+                continue
+
+            chosen_seed_ids.append(sid)
+            for x in closure:
+                if x in self.nodes:
+                    chosen_nodes.add(x)
+            used += int(add_cost)
+            if len(chosen_seed_ids) >= kk:
+                break
+
+        activated: List[str] = []
+        if chosen_nodes:
+            activated = self._activate_unfold_nodes(query, chosen_nodes)
+
+        # Trace
+        try:
+            if chosen_seed_ids:
+                self._emit_event({
+                    "type": "unfold_seeded",
+                    "mem": "GoC",
+                    "global_step": int(self._global_step),
+                    "query": query,
+                    "k": int(kk),
+                    "budget_unfold": int(self.budget_unfold),
+                    "chosen_seed_ids": chosen_seed_ids[:30],
+                    "activated": activated[:30],
+                })
+        except Exception:
+            pass
+
+        return activated
+
+    def _activate_unfold_nodes(self, query: str, chosen_nodes: Set[str]) -> List[str]:
+        """Activate chosen nodes under budget_unfold and optionally add a snippet node."""
+        activated: List[str] = []
+
+        ordered = [x for x in sorted(chosen_nodes, key=lambda x: int(self.nodes[x].step_idx) if x in self.nodes else 10**9) if x in self.nodes]
+        used = 0
+        for nid in ordered:
+            if nid in self.active:
+                continue
+            n = self.nodes[nid]
+            if used + int(n.token_len) > int(self.budget_unfold):
+                continue
+            self.active.append(nid)
+            activated.append(nid)
+            used += int(n.token_len)
+
+        # Add a compact snippet node for one activated storage node that has full text.
+        try:
+            best = None
+            best_len = -1
+            for nid in activated:
+                n = self.nodes.get(nid)
+                if not n or not n.storage_text:
+                    continue
+                if int(len(n.storage_text or "")) > best_len:
+                    best_len = int(len(n.storage_text or ""))
+                    best = nid
+            if best:
+                n = self.nodes.get(best)
+                snip = ""
+                if n and n.storage_text:
+                    snip = self._extract_storage_snippet(n.storage_text, query)
+                if snip:
+                    self.add_node(
+                        thread="main",
+                        kind="summary",
+                        text=f"[UNFOLD_SNIPPET] {snip}",
+                        docids=list(n.docids or []),
+                        storage_text=None,
+                    )
+        except Exception:
+            pass
+
+        return activated
+
     def unfold(self, query: str, k: int = None):
+        """Default GoC unfolding: retrieve storage seeds, take closure, activate under budget."""
         if k is None:
             k = self.unfold_k
         if not self._storage_retriever or not self.storage:
             return []
 
-        hits = self._storage_retriever.search(query, topk=max(k*3, 10))
+        candidates = self.compute_unfold_candidates(query, k=int(k), topk=max(int(k) * 3, 10))
+        chosen_seed_ids, chosen_nodes, used_tokens = self._select_unfold_seeds(candidates, k=int(k))
 
-        # Build candidate closures
-        candidates = []
-        for nid, score in hits:
-            if nid not in self.nodes:
-                continue
-            if nid in self.active:
-                continue
-            # closure: node + depends closure + doc_ref neighbors
-            closure = self._dep_closure([nid], depth=self.max_dep_depth)
-            closure = self._doc_ref_expand(closure, limit_per_node=self.doc_ref_expand)
-            # ensure closure is within known nodes
-            closure = {x for x in closure if x in self.nodes}
-            cost = sum(self.nodes[x].token_len for x in closure if x not in self.active)
-            candidates.append((score, cost, closure))
+        activated: List[str] = []
+        if chosen_nodes:
+            activated = self._activate_unfold_nodes(query, chosen_nodes)
 
-        # Greedy selection under unfold budget
-        candidates.sort(key=lambda x: x[0] / max(1, x[1]), reverse=True)
-        chosen: Set[str] = set()
-        used = 0
-        for score, cost, closure in candidates:
-            add_cost = sum(self.nodes[x].token_len for x in closure if x not in self.active and x not in chosen)
-            if used + add_cost > self.budget_unfold:
-                continue
-            chosen |= closure
-            used += add_cost
-            if len(chosen) >= k:
-                break
+        # Trace (include candidates for controller dataset when requested)
+        try:
+            ev: Dict[str, Any] = {
+                "type": "unfold",
+                "mem": "GoC",
+                "global_step": int(self._global_step),
+                "query": query,
+                "k": int(k),
+                "budget_unfold": int(self.budget_unfold),
+                "chosen_seed_ids": chosen_seed_ids[:30],
+                "used_tokens_est": int(used_tokens),
+                "activated": activated[:30],
+            }
+            if bool(getattr(self, "trace_unfold_candidates", False)):
+                ev["candidates"] = candidates[: min(40, len(candidates))]
+            self._emit_event(ev)
+        except Exception:
+            pass
 
-        activated = []
-        # Activate nodes and, for lossless nodes, also materialize a small relevant snippet.
-        remaining = int(self.budget_unfold)
-        for nid in sorted(chosen, key=lambda x: self.nodes[x].step_idx):
-            if nid not in self.nodes:
-                continue
-            n = self.nodes[nid]
-            if nid not in self.active:
-                cost = n.token_len
-                if remaining - cost < 0:
-                    continue
-                remaining -= cost
-                n.ttl = self.ttl_unfold
-                self.active.append(nid)
-                activated.append(nid)
-
-            # If we have full stored content, recover an excerpt likely to contain the late-bound fact.
-            if n.storage_text:
-                snip = self._extract_storage_snippet(n.storage_text, query=query, max_chars=900)
-                if snip:
-                    sn_text = f"[UNFOLD_SNIPPET from {nid}]\n{snip}"
-                    sn_cost = approx_token_count(sn_text)
-                    if remaining - sn_cost >= 0:
-                        sn_id = self.add_node(thread="main", kind="summary", text=sn_text, docids=list(n.docids))
-                        self.nodes[sn_id].ttl = self.ttl_unfold
-                        self.active.append(sn_id)
-                        activated.append(sn_id)
-                        remaining -= sn_cost
-
-        # Re-order active nodes chronologically by step index so recovered nodes
-        # do not end up at the very end of the context.
-        self.active.sort(key=lambda x: self.nodes[x].step_idx)
         return activated
 
-
-@dataclass
 class SimilarityOnlyMemory(GoCMemory):
     """RAG-style baseline: unfold purely by retrieval similarity (no dependency closure).
 

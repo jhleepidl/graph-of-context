@@ -13,7 +13,7 @@
     "max_steps": 120,
     "max_json_retries": 3,
     "task_limit": 30,
-    "parallel_tasks": 6,
+    "parallel_tasks": 10,
     "retriever_kind": "bm25",
     "faiss_dim": 384,
     "trace_messages": true,

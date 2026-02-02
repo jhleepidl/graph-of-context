@@ -21,6 +21,7 @@ Goal: keep decisions, experiment provenance, and results *traceable* and *reprod
 2) Every experiment gets a registry row (git SHA, preset path, artifact path).
 3) Results notes include: completion, accuracy, token p50/p90, and 2–3 failure modes.
 4) Main branch stays “paper-clean”; experiments live on feature branches.
+5) Every run-group produces a Debug Packet under `runs/<exp_id>/` and appends `research_ops/_auto/run_manifest.json`.
 
 ## Roles (RACI)
 - GPT: designs + prompts + analyses + paper writing (Responsible)

@@ -126,3 +126,44 @@ You can tune *when* the follow-up turn is injected:
 
 These act like a coarse difficulty dial: higher thresholds force the agent to gather more evidence
 before the late-binding turn arrives.
+
+## 4) FEVER raw -> prepared (with local wiki-pages)
+
+If you have the official FEVER jsonl (claims) and the FEVER "wiki-pages" dump
+already downloaded (as in `data/fever/wiki/wiki-pages/wiki-*.jsonl`), you can
+create a prepared dataset compatible with this repo.
+
+### Step A: build a local docstore (SQLite + optional FTS5)
+
+**Full (recommended for real runs)**
+```bash
+python scripts/build_fever_wiki_sqlite.py \
+  --wiki_dir data/fever/wiki/wiki-pages \
+  --out_db  data/fever/wiki/wiki.sqlite \
+  --max_chars 6000
+```
+
+**Mini (fast debug; stores evidence pages + random reservoir)**
+```bash
+python scripts/build_fever_wiki_sqlite.py \
+  --wiki_dir data/fever/wiki/wiki-pages \
+  --out_db  data/fever/wiki/wiki_mini.sqlite \
+  --keep_titles_from_fever data/fever/fever-data/dev.jsonl \
+  --limit_examples 300 \
+  --random_reservoir 50000
+```
+
+### Step B: prepare FEVER into task-local docs
+
+```bash
+python scripts/prepare_fever_from_wiki.py \
+  --fever   data/fever/fever-data/dev.jsonl \
+  --wiki_db data/fever/wiki/wiki.sqlite \
+  --out     data/fever/fever_prepared/dev_prepared.jsonl.gz \
+  --docs_per_task 20 \
+  --gold_titles_n 2 \
+  --seed 7
+```
+
+Then run the benchmark or sweep using `fever_prepared` with `prepared_path` set
+to that output file.
