@@ -22,6 +22,7 @@ Goal: keep decisions, experiment provenance, and results *traceable* and *reprod
 3) Results notes include: completion, accuracy, token p50/p90, and 2–3 failure modes.
 4) Main branch stays “paper-clean”; experiments live on feature branches.
 5) Every run-group produces a Debug Packet under `runs/<exp_id>/` and appends `research_ops/_auto/run_manifest.json`.
+6) Cost guardrail: Codex only runs 1–2 task sanity checks. Any run with 5+ tasks must be executed by the owner.
 
 ## Roles (RACI)
 - GPT: designs + prompts + analyses + paper writing (Responsible)
