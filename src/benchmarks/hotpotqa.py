@@ -12,6 +12,7 @@ from .session_utils import (
     parse_structured_answer,
     extract_list_field,
     set_f1,
+    normalize_text,
 )
 from ..metrics import docid_coverage
 from ..task_tools import TaskScopedToolBox
@@ -137,6 +138,118 @@ def _apply_branch_trap(docs: List[Dict[str, Any]], gold_titles: List[str], k: in
     return out
 
 
+# --- Multi-Commit DAG synthesis helpers ---
+# These create a *benchmark-level* long-horizon episode by chaining multiple
+# independent HotpotQA subtasks in one trajectory. This is designed to create
+# natural dependency edges (commit -> merge -> final) without adding extra tools.
+
+_MULTI_COMMIT_RULES = {
+    "reduce_lex_min",
+    "reduce_shortest",
+    "reduce_longest",
+    "reduce_len_then_lex",
+}
+
+
+def _mc_rule_desc(rule: str) -> str:
+    r = (rule or "").lower().strip()
+    if r == "reduce_lex_min":
+        return "pick the winner whose normalized answer is lexicographically smallest"
+    if r == "reduce_shortest":
+        return "pick the winner whose normalized answer is shortest"
+    if r == "reduce_longest":
+        return "pick the winner whose normalized answer is longest"
+    if r == "reduce_len_then_lex":
+        return "pick the winner with shortest normalized answer; break ties by lexicographic order"
+    return "pick the winner by reduce_lex_min"
+
+
+def _mc_key(ans: str) -> str:
+    # Reuse the benchmark's normalization (punct/article stripping).
+    return normalize_text(str(ans or ""))
+
+
+def _mc_better(rule: str, a: str, b: str) -> bool:
+    """Return True if a beats b under rule."""
+    r = (rule or "reduce_lex_min").lower().strip()
+    ka = _mc_key(a)
+    kb = _mc_key(b)
+    if r == "reduce_lex_min":
+        return ka < kb
+    if r == "reduce_shortest":
+        return (len(ka), ka) < (len(kb), kb)
+    if r == "reduce_longest":
+        return (len(ka), ka) > (len(kb), kb)
+    if r == "reduce_len_then_lex":
+        return (len(ka), ka) < (len(kb), kb)
+    return ka < kb
+
+
+def _mc_reduce_winner(rule: str, answers_by_commit: Dict[int, str]) -> int:
+    """Deterministically reduce answers into a single winning commit index."""
+    items = [(int(k), str(v)) for k, v in (answers_by_commit or {}).items()]
+    items.sort(key=lambda x: x[0])
+    if not items:
+        return 1
+    win_k, win_a = items[0]
+    for k, a in items[1:]:
+        if _mc_better(rule, a, win_a):
+            win_k, win_a = k, a
+    return int(win_k)
+
+
+def _mc_build_merge_plan(n_commits: int, plan: str) -> List[Tuple[str, str, str]]:
+    """Return a list of merge ops as (merge_id, left_id, right_id).
+
+    Node ids are strings:
+      - "C1".."Cn" are leaf commits
+      - "M1".. are merge nodes
+
+    The acting model is asked to output a *leaf* winner_commit (1..n) for each merge,
+    even when left/right are merge nodes.
+    """
+    n = int(n_commits or 0)
+    if n <= 1:
+        return []
+    p = (plan or "binary_tree").lower().strip()
+
+    leaves = [f"C{i}" for i in range(1, n + 1)]
+    merges: List[Tuple[str, str, str]] = []
+    m_idx = 1
+
+    if p in {"none", "no", "off"}:
+        return []
+
+    if p in {"chain", "linear"}:
+        cur = leaves[0]
+        for nxt in leaves[1:]:
+            mid = f"M{m_idx}"
+            merges.append((mid, cur, nxt))
+            cur = mid
+            m_idx += 1
+        return merges
+
+    # Default: balanced-ish binary tree tournament
+    level = leaves
+    while len(level) > 1:
+        next_level: List[str] = []
+        i = 0
+        while i < len(level):
+            if i == len(level) - 1:
+                next_level.append(level[i])
+                i += 1
+                continue
+            left = level[i]
+            right = level[i + 1]
+            mid = f"M{m_idx}"
+            merges.append((mid, left, right))
+            next_level.append(mid)
+            m_idx += 1
+            i += 2
+        level = next_level
+    return merges
+
+
 class HotpotQA(Benchmark):
     """HotpotQA (distractor) with task-local context.
 
@@ -203,8 +316,12 @@ class HotpotQA(Benchmark):
                 rows = list(rows)
                 rng.shuffle(rows)
 
+        # Multi-commit synthesis: if multi_commit_n>1, `limit` applies to the number of
+        # *composite* tasks, so we need mc_n*limit raw examples.
+        multi_commit_n_pre = int(kwargs.get("multi_commit_n", 1) or 1)
         if limit is not None:
-            rows = rows[:limit]
+            lim = int(limit)
+            rows = rows[: (lim * multi_commit_n_pre if multi_commit_n_pre > 1 else lim)]
 
         seed = int(kwargs.get("seed", 7))
         variant = str(kwargs.get("variant", "late_support_titles")).lower()
@@ -257,6 +374,29 @@ class HotpotQA(Benchmark):
         # Similarity trap
         branch_trap_k = int(kwargs.get("branch_trap_k", 0))
 
+        # Multi-commit synthesis (benchmark-level). When enabled, we stitch N independent
+        # HotpotQA subtasks into one episode with COMMIT -> MERGE -> FINAL turns.
+        multi_commit_n = int(kwargs.get("multi_commit_n", multi_commit_n_pre) or 1)
+
+        # Accept a few legacy/sweep key names:
+        #  - multi_commit_merge_rule: older name for compose_rule (winner selection)
+        #  - multi_commit_shuffle: older name for doc shuffle
+        _mc_rule = (
+            kwargs.get("multi_commit_compose_rule")
+            or kwargs.get("multi_commit_merge_rule")
+            or "reduce_lex_min"
+        )
+        multi_commit_rule = str(_mc_rule or "reduce_lex_min").lower().strip()
+        if multi_commit_rule in {"alpha_min", "alphabetical_min", "alpha"}:
+            multi_commit_rule = "reduce_lex_min"
+
+        multi_commit_merge_plan = str(kwargs.get("multi_commit_merge_plan", "binary_tree") or "binary_tree").lower().strip()
+        multi_commit_include_merges = bool(kwargs.get("multi_commit_include_merges", True))
+        multi_commit_merge_closed_book = bool(kwargs.get("multi_commit_merge_closed_book", True))
+        multi_commit_doc_shuffle = bool(kwargs.get("multi_commit_doc_shuffle", kwargs.get("multi_commit_shuffle", True)))
+        # Optional: inject noise after EVERY commit (not just stage-1). Implemented in the agent.
+        noise_nodes_after_commit = int(kwargs.get("noise_nodes_after_commit", 0))
+
         # Lost-in-the-middle positioning
         gold_at = kwargs.get("gold_at")
         gold_at = int(gold_at) if gold_at is not None else None
@@ -269,6 +409,224 @@ class HotpotQA(Benchmark):
 
         rng = random.Random(seed)
         out: List[Task] = []
+
+        # ---- Multi-Commit DAG (benchmark-level synthesis) ----
+        # If enabled, stitch mc_n independent examples into a single long-horizon task.
+        # Each subtask requires a COMMIT (return), optional MERGE commits, and one FINAL finish.
+        if int(multi_commit_n) > 1:
+            mc_n = int(multi_commit_n)
+            if multi_commit_rule not in _MULTI_COMMIT_RULES:
+                multi_commit_rule = "reduce_lex_min"
+
+            merge_ops = _mc_build_merge_plan(mc_n, multi_commit_merge_plan) if bool(multi_commit_include_merges) else []
+
+            n_groups = len(rows) // mc_n
+            for g in range(n_groups):
+                chunk = rows[g * mc_n : (g + 1) * mc_n]
+
+                docs_all: List[Dict[str, Any]] = []
+                answers_by_commit: Dict[int, str] = {}
+                gold_titles_by_commit: Dict[int, List[str]] = {}
+                gold_docids_by_commit: Dict[int, List[str]] = {}
+
+                for si, ex in enumerate(chunk, start=1):
+                    q = str(ex.get("question", "")).strip()
+                    a = str(ex.get("answer", "")).strip()
+                    if not q or not a:
+                        continue
+
+                    context = _normalize_context(ex)
+                    if not context:
+                        continue
+
+                    # Build docs for this subtask (one doc per title)
+                    docs_i: List[Dict[str, Any]] = []
+                    for j, pair in enumerate(context):
+                        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                            continue
+                        title = str(pair[0]).strip() or "Untitled"
+                        sents = pair[1]
+                        if isinstance(sents, list):
+                            text = " ".join([str(s) for s in sents])
+                        else:
+                            text = str(sents)
+                        if doc_max_chars > 0:
+                            text = text[:doc_max_chars]
+                        if doc_repeat > 1 and text:
+                            text = ("\n\n".join([text] * doc_repeat))
+                        docid = f"D_HP_MC_{g:06d}_{si:02d}_{j:02d}"
+                        url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
+                        docs_i.append({"docid": docid, "title": title, "content": text, "url": url})
+
+                    sf = _normalize_supporting_facts(ex)
+                    gold_titles: List[str] = []
+                    if isinstance(sf, list):
+                        for it in sf:
+                            if isinstance(it, (list, tuple)) and it:
+                                gold_titles.append(str(it[0]))
+                    seen = set()
+                    gold_titles = [t for t in gold_titles if not (t in seen or seen.add(t))]
+
+                    # Position gold evidence per-subtask (lost-in-middle stress)
+                    if supporting_position != "original" and gold_titles:
+                        gold_set = set(gold_titles)
+                        gold_docs = [d for d in docs_i if d.get("title") in gold_set]
+                        rest_docs = [d for d in docs_i if d.get("title") not in gold_set]
+                        rng.shuffle(rest_docs)
+                        if supporting_position == "front":
+                            docs_i = gold_docs + rest_docs
+                        elif supporting_position == "back":
+                            docs_i = rest_docs + gold_docs
+                        elif supporting_position == "middle":
+                            mid = len(rest_docs) // 2
+                            docs_i = rest_docs[:mid] + gold_docs + rest_docs[mid:]
+                        elif supporting_position == "lost_in_middle":
+                            rest = rest_docs
+                            pos = gold_at if (gold_at is not None) else (len(rest) // 2)
+                            pos = max(0, min(len(rest), int(pos)))
+                            docs_i = rest[:pos] + gold_docs + rest[pos:]
+                        else:
+                            rng.shuffle(gold_docs)
+                            pos = rng.randint(0, len(rest_docs))
+                            docs_i = rest_docs[:pos] + gold_docs + rest_docs[pos:]
+
+                    # Similarity trap within subtask
+                    docs_i = _apply_branch_trap(docs_i, gold_titles, branch_trap_k, rng)
+
+                    answers_by_commit[si] = a
+                    gold_titles_by_commit[si] = gold_titles
+                    gold_docids_by_commit[si] = [d["docid"] for d in docs_i if d.get("title") in set(gold_titles)]
+                    docs_all.extend(docs_i)
+
+                if len(answers_by_commit) != mc_n:
+                    continue
+
+                # Optionally shuffle all docs to mix subtasks
+                if bool(multi_commit_doc_shuffle):
+                    rng.shuffle(docs_all)
+
+                winner = _mc_reduce_winner(multi_commit_rule, answers_by_commit)
+                winner = max(1, min(mc_n, int(winner)))
+
+                gold_struct = {
+                    "a1": str(answers_by_commit.get(winner, "") or "").strip(),
+                    "supporting_titles": list(gold_titles_by_commit.get(winner, []) or []),
+                    "selected_commit": int(winner),
+                }
+
+                intro = (
+                    "You have access to a task-local document set via tools search/open_page.\n"
+                    f"This is a MULTI-COMMIT DAG episode with N={mc_n} subtasks.\n"
+                    "For EACH subtask i, you must use tools search/open_page to gather evidence, then COMMIT by calling the `return` tool.\n"
+                    "When you call `return`, it MUST be a single JSON tool call with args.message set to a JSON object.\n"
+                    "Commit schema (return.args.message): {\"commit\":<i>,\"a1\":\"...\",\"supporting_titles\":[\"Title A\",\"Title B\"]}\n"
+                    "Do NOT call finish until the FINAL.\n"
+                    f"The overall winner is selected deterministically by: {_mc_rule_desc(multi_commit_rule)}.\n"
+                    "You will later MERGE commits (memory-only) and then FINISH with the winner.\n"
+                )
+
+                commit_turns: List[str] = []
+                for i in range(1, mc_n + 1):
+                    # Keep COMMIT prompts self-contained (they contain the question), but do not repeat titles later.
+                    q_i = str(chunk[i-1].get("question", ""))
+                    commit_turns.append(
+                        f"[SUBTASK {i} / COMMIT] Q{i}: {q_i}\n"
+                        "Use tools. DO NOT call finish. When ready, CALL the `return` tool with args.message containing the commit JSON.\n"
+                        f"Example tool call: {{\"tool\":\"return\",\"args\":{{\"message\":{{\"commit\":{i},\"a1\":\"...\",\"supporting_titles\":[\"Title A\",\"Title B\"]}}}}}}"
+                    )
+
+                # IMPORTANT: keep SUBTASK turns as follow-ups so the current user message
+                # always contains only the active subtask (matches later injection behavior).
+                turns: List[str] = [intro]
+                if commit_turns:
+                    turns.extend(commit_turns)
+
+                for mi, (mid, left, right) in enumerate(merge_ops, start=1):
+                    msg = (
+                        f"[MERGE {mi} / COMMIT] You must MERGE {left} vs {right} under the SAME deterministic rule.\n"
+                        "Do NOT restate earlier answers/titles. Use ONLY your previously committed information.\n"
+                        f"CALL the `return` tool with args.message: {{\"merge\":{mi},\"left\":\"{left}\",\"right\":\"{right}\",\"winner_commit\":<1..{mc_n}>}}\n"
+                        f"Example tool call: {{\"tool\":\"return\",\"args\":{{\"message\":{{\"merge\":{mi},\"left\":\"{left}\",\"right\":\"{right}\",\"winner_commit\":1}}}}}}"
+                    )
+                    if bool(multi_commit_merge_closed_book):
+                        msg += "\n[CLOSED-BOOK] Do NOT use tools now (no search/open_page)."
+                    turns.append(msg)
+
+                final = (
+                    "[FINAL / FINISH] CALL finish NOW.\n"
+                    "Use ONLY your committed information.\n"
+                    "Call the `finish` tool with args.answer as a JSON object with keys: a1, supporting_titles, selected_commit.\n"
+                    "a1 MUST be the winner's answer. supporting_titles MUST be the winner's supporting_titles.\n"
+                    "selected_commit MUST be the winner leaf commit number.\n"
+                    "Example tool call: {\"tool\":\"finish\",\"args\":{\"answer\":{\"a1\":\"...\",\"supporting_titles\":[\"Title A\",\"Title B\"],\"selected_commit\":1},\"explanation\":\"Evidence docids: D_HP_...\",\"confidence\":\"\"}}\n"
+                )
+
+                if bool(closed_book_final):
+                    final += "[CLOSED-BOOK] Do NOT use tools now (no search/open_page).\n"
+
+                turns.append(final)
+                out.append(Task(
+                    id=f"hp_mc_{g:06d}",
+                    question=turns[0],
+                    turns=turns,
+                    answer=json.dumps(gold_struct, ensure_ascii=False),
+                    gold_docids=gold_docids_by_commit.get(winner, None),
+                    meta={
+                        "benchmark": "hotpotqa",
+                        "docs": docs_all,
+                        "variant": variant,
+                        "gold": gold_struct,
+                        "f1_threshold": f1_threshold,
+                        "titles_f1_threshold": titles_f1_threshold,
+                        "require_joint_output": True,
+                        "finish_answer_format": "hotpotqa_json",
+                        "finish_supporting_titles_n": 2,
+                        "two_stage": False,
+                        "multi_commit": True,
+                        "multi_commit_n": int(mc_n),
+                        "multi_commit_merge_plan": str(multi_commit_merge_plan),
+                        "return_gating_per_turn": True,
+                        "closed_book_final": bool(closed_book_final),
+                        "anaphoric_level": int(anaphoric_level),
+                        "anaphoric_mode": str(anaphoric_mode),
+                        "trajectory_chain_turns": int(trajectory_chain_turns),
+                        "trajectory_chain_kind": str(trajectory_chain_kind),
+                        "trajectory_chain_closed_book": bool(trajectory_chain_closed_book),
+                        "noise_nodes_after_stage1": int(noise_nodes_after_stage1),
+                        "noise_nodes_after_commit": int(noise_nodes_after_commit),
+                        "noise_node_chars": int(noise_node_chars),
+                        "noise_seed": int(noise_seed),
+                        "return_gating_min_steps": int(return_gating_min_steps),
+                        "return_gating_min_open_pages": int(return_gating_min_open_pages),
+                        "branch_trap_k": int(branch_trap_k),
+                        "supporting_position": supporting_position,
+                        "multi_commit_n": int(mc_n),
+                        "multi_commit_compose_rule": str(multi_commit_rule),
+                        "multi_commit_merge_plan": str(multi_commit_merge_plan),
+                        "multi_commit_include_merges": bool(multi_commit_include_merges),
+                        "multi_commit_doc_shuffle": bool(multi_commit_doc_shuffle),
+                        "multi_commit_merge_closed_book": bool(multi_commit_merge_closed_book),
+                        "schema_autofix_commit_mismatch": bool(kwargs.get("schema_autofix_commit_mismatch", False)),
+                        # GoC folding policy overrides
+                        "goc_fold_policy": kwargs.get("goc_fold_policy", kwargs.get("fold_policy", None)),
+                        "goc_phase_end_fold": kwargs.get("goc_phase_end_fold", None),
+                        "goc_dfs_hi_mult": kwargs.get("goc_dfs_hi_mult", None),
+                        "goc_dfs_lo_mult": kwargs.get("goc_dfs_lo_mult", None),
+                        "goc_dfs_roll_keep_last": kwargs.get("goc_dfs_roll_keep_last", None),
+                        "goc_dfs_roll_min_chunk": kwargs.get("goc_dfs_roll_min_chunk", None),
+                        "goc_dfs_switch_keep_last": kwargs.get("goc_dfs_switch_keep_last", None),
+                        "goc_dfs_phase_keep_last": kwargs.get("goc_dfs_phase_keep_last", None),
+                        "goc_pef_hi_mult": kwargs.get("goc_pef_hi_mult", None),
+                        "goc_pef_lo_mult": kwargs.get("goc_pef_lo_mult", None),
+                        "goc_pef_roll_keep_last": kwargs.get("goc_pef_roll_keep_last", None),
+                        "goc_pef_roll_min_chunk": kwargs.get("goc_pef_roll_min_chunk", None),
+                    },
+                ))
+
+            # Respect original limit (composite tasks).
+            if limit is not None:
+                out = out[: int(limit)]
+            return out
 
         for idx, ex in enumerate(rows):
             q = str(ex.get("question", "")).strip()
@@ -384,6 +742,24 @@ class HotpotQA(Benchmark):
                                 "{\"primary_title\":\"<the FIRST committed title>\",\"secondary_title\":\"<the SECOND committed title>\"}. "
                                 "The titles MUST EXACTLY match what you returned in FOLLOW-UP 1 (same spelling and order)."
                             )
+                        elif trajectory_chain_kind in {"masked_refs", "masked_ref", "masked"}:
+                            # Masked checkpoint: add horizon/pressure without re-emitting titles.
+                            # This is designed to weaken similarity-only methods that benefit from
+                            # fresh lexical overlap near the end of a long trajectory.
+                            base += (
+                                "CALL `return` with args.message as JSON only: "
+                                "{\"page_a\":\"FIRST_FROM_FOLLOWUP1\",\"page_b\":\"SECOND_FROM_FOLLOWUP1\",\"order_rule\":\"A_then_B\"}. "
+                                "Do NOT include the actual titles; use these placeholders exactly."
+                            )
+                        elif trajectory_chain_kind in {"opened_first_ab", "open_order_ab", "open_order"}:
+                            # Order-dependent but still masked: forces reliance on trajectory
+                            # (which page was opened first) without restating titles.
+                            base += (
+                                "CALL `return` with args.message as JSON only: "
+                                "{\"opened_first\":\"A_or_B\",\"A\":\"FIRST_FROM_FOLLOWUP1\",\"B\":\"SECOND_FROM_FOLLOWUP1\"}. "
+                                "Set opened_first to 'A' if you opened the first (A) committed page earlier than the second (B), otherwise 'B'. "
+                                "Do NOT include the actual titles."
+                            )
                         elif trajectory_chain_kind == "bridge_entity":
                             base += (
                                 "CALL `return` with args.message as JSON only: "
@@ -419,9 +795,9 @@ class HotpotQA(Benchmark):
                                 "[FOLLOW-UP 2 / FINAL / TRAJECTORY] CALL finish NOW. "
                                 "The original question (Q1) was asked earlier in this session and is NOT repeated here. "
                                 "Answer that SAME Q1. "
-                                "You MUST use ONLY the two Wikipedia titles you committed in FOLLOW-UP 1. "
+                                "You MUST use ONLY the two Wikipedia pages you provided in FOLLOW-UP 1. "
                                 "In finish.args.answer output JSON only with keys: a1, supporting_titles. "
-                                "supporting_titles MUST EXACTLY match the committed list in the SAME order (no extra titles). "
+                                "supporting_titles MUST EXACTLY match the two page titles you provided in FOLLOW-UP 1, in the SAME order (no extra titles). "
                                 "Example: {\"a1\":\"...\",\"supporting_titles\":[\"Title A\",\"Title B\"]}."
                             )
                         else:
@@ -507,12 +883,16 @@ class HotpotQA(Benchmark):
                 answer=gold_answer_str,
                 gold_docids=gold_docids or None,
                 meta={
+                    "benchmark": "hotpotqa",
                     "docs": docs,
                     "variant": variant,
                     "gold": gold_struct,
                     "f1_threshold": f1_threshold,
                     "titles_f1_threshold": titles_f1_threshold,
                     "require_joint_output": require_joint_output,
+                    # Finish-output contract (used by the agent to validate/salvage finish.args.answer)
+                    "finish_answer_format": "hotpotqa_json" if (answer_format == "json" and require_joint_output) else "text",
+                    "finish_supporting_titles_n": 2,
                     # Augmentation config (passed to runner/agent as task_meta)
                     "two_stage": bool(two_stage),
                     "delay_after_stage1": int(delay_after_stage1),
@@ -525,6 +905,19 @@ class HotpotQA(Benchmark):
                     "noise_nodes_after_stage1": int(noise_nodes_after_stage1),
                     "noise_node_chars": int(noise_node_chars),
                     "noise_seed": int(noise_seed),
+                    # GoC folding policy overrides (optional; used by GoC only)
+                    "goc_fold_policy": kwargs.get("goc_fold_policy", kwargs.get("fold_policy", None)),
+                    "goc_phase_end_fold": kwargs.get("goc_phase_end_fold", None),
+                    "goc_dfs_hi_mult": kwargs.get("goc_dfs_hi_mult", None),
+                    "goc_dfs_lo_mult": kwargs.get("goc_dfs_lo_mult", None),
+                    "goc_dfs_roll_keep_last": kwargs.get("goc_dfs_roll_keep_last", None),
+                    "goc_dfs_roll_min_chunk": kwargs.get("goc_dfs_roll_min_chunk", None),
+                    "goc_dfs_switch_keep_last": kwargs.get("goc_dfs_switch_keep_last", None),
+                    "goc_dfs_phase_keep_last": kwargs.get("goc_dfs_phase_keep_last", None),
+                    "goc_pef_hi_mult": kwargs.get("goc_pef_hi_mult", None),
+                    "goc_pef_lo_mult": kwargs.get("goc_pef_lo_mult", None),
+                    "goc_pef_roll_keep_last": kwargs.get("goc_pef_roll_keep_last", None),
+                    "goc_pef_roll_min_chunk": kwargs.get("goc_pef_roll_min_chunk", None),
                     "return_gating_min_steps": int(return_gating_min_steps),
                     "return_gating_min_open_pages": int(return_gating_min_open_pages),
                     "branch_trap_k": int(branch_trap_k),

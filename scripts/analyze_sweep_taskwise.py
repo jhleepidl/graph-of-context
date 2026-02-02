@@ -16,8 +16,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+# Ensure repo root is on sys.path so `import src.*` works when running as a script.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from src.analysis.taskwise import build_taskwise, load_jsonl, write_taskwise_artifacts
 

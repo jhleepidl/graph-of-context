@@ -145,7 +145,7 @@ This writes one trace file per (method, task) into `logs/traces/` as JSONL:
 
 ## Sweeps: run many configs and aggregate into one master file
 
-There are built-in sweep presets under `sweep_configs/*.json`:
+There are built-in sweep presets under `configs/*.json`:
 
 ```bash
 python run_sweep.py --list_presets
@@ -221,3 +221,22 @@ python run_webchorearena_browsergym.py \
 If your BrowserGym install uses a different env id or action set, see `src/browsergym_runner.py`
 and override `--env_id` / prompt guidelines accordingly.
 
+
+
+## Sweeps (presets)
+
+New trajectory-focused presets (HotpotQA, two-stage + closed-book final):
+
+- `hotpotqa_levels_traj_flipgrid`: 3 levels × (budget {4000,8000}) × (trajectory_chain_turns {1,2}) = **12 runs**
+- `hotpotqa_levels_traj_stressgrid`: 3 levels × (branch_trap_k/noise_nodes_after_stage1 4 combos) @ budget=8000 = **12 runs**
+- `hotpotqa_levels_traj_commitgrid`: 3 levels × enforce_committed_supporting_titles {none,goc_only,all} @ budget=8000 = **9 runs**
+
+Run with:
+
+```bash
+python run_sweep.py --preset hotpotqa_levels_traj_flipgrid --out_dir sweeps_traj_flip --fresh
+python run_sweep.py --preset hotpotqa_levels_traj_stressgrid --out_dir sweeps_traj_stress --fresh
+python run_sweep.py --preset hotpotqa_levels_traj_commitgrid --out_dir sweeps_traj_commit --fresh
+```
+
+Tip: to fix the task set, add `"task_ids_path": "..."` under `base.bench_kwargs` in the preset JSON.

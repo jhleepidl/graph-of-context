@@ -243,6 +243,28 @@ class LostInMiddle(Benchmark):
         doc_max_chars = int(kwargs.get("doc_max_chars", 0))
         doc_repeat = int(kwargs.get("doc_repeat", 1))
 
+        # --- HotpotQA-aligned multi-turn augmentations ---
+        two_stage = bool(kwargs.get("two_stage", False))
+        closed_book_final = bool(kwargs.get("closed_book_final", False))
+        delay_after_stage1 = int(kwargs.get("delay_after_stage1", 0))
+
+        anaphoric_mode = str(kwargs.get("anaphoric_mode", "trajectory")).lower()  # level|trajectory
+        anaphoric_level = int(kwargs.get("anaphoric_level", 0))
+        trajectory_chain_turns = int(kwargs.get("trajectory_chain_turns", 0))
+        trajectory_chain_kind = str(kwargs.get("trajectory_chain_kind", "masked_refs")).lower()
+        trajectory_chain_closed_book = bool(kwargs.get("trajectory_chain_closed_book", False))
+
+        # Agent/controller knobs (forwarded via task.meta)
+        noise_nodes_after_stage1 = int(kwargs.get("noise_nodes_after_stage1", 0))
+        noise_node_chars = int(kwargs.get("noise_node_chars", 320))
+        noise_seed = int(kwargs.get("noise_seed", 7))
+        return_gating_min_open_pages = int(kwargs.get("return_gating_min_open_pages", 0))
+        return_gating_min_steps = int(kwargs.get("return_gating_min_steps", 0))
+
+        # Optional GoC fold knobs (bench-level control)
+        goc_fold_policy = kwargs.get("goc_fold_policy", None)
+        goc_dfs_switch_keep_last = kwargs.get("goc_dfs_switch_keep_last", None)
+
         out: List[Task] = []
 
         for i, ex in enumerate(rows):
@@ -298,30 +320,96 @@ class LostInMiddle(Benchmark):
                 intro = (
                     f"You have access to a task-local document set via tools search/open_page.\n"
                     f"Q1: {q}\n"
-                    "Use tools to find evidence. Do NOT call finish until a follow-up arrives."
+                    "Use tools to find evidence. Do NOT call finish until instructed by a follow-up.\n"
+                    "If you need the next follow-up, CALL `return`."
                 )
                 follow = ""
-                if "a2" in gold_struct:
-                    if variant.lower().startswith("late_title") or "title" in variant.lower():
-                        a2_desc = "the Wikipedia title of ONE document that contains the answer"
-                    else:
-                        a2_desc = "one evidence sentence (verbatim-ish) from a document that supports the answer"
-                    if answer_format == "json":
-                        follow = (
-                            "FOLLOW-UP (late-binding): Now CALL finish. "
-                            "In finish.args.answer, output a JSON object with keys a1 and a2. "
-                            f"a1 = answer to Q1. a2 = {a2_desc}. "
-                            "JSON only (no extra text)."
-                        )
-                    else:
-                        follow = (
-                            "FOLLOW-UP (late-binding): Now CALL finish. "
-                            "In finish.args.answer, output two lines: 'a1: ...' and 'a2: ...'."
-                        )
-                else:
-                    follow = "FOLLOW-UP: Now CALL finish and provide the answer to Q1."
 
-                turns = [intro] + _make_filler_turns(filler_turns, filler_kind) + [follow]
+                def _make_trajectory_checkpoint(j: int) -> str:
+                    base = (
+                        f"[FOLLOW-UP 1.{j} / TRAJECTORY-CHECKPOINT] "
+                        "Do NOT call finish. This checkpoint does NOT repeat Q1. "
+                    )
+                    if trajectory_chain_kind == "echo_titles":
+                        base += (
+                            "CALL `return` with args.message as JSON only: "
+                            "{\"primary_title\":\"<the committed title>\"}. "
+                            "The title MUST EXACTLY match what you returned in FOLLOW-UP 1."
+                        )
+                    else:
+                        base += (
+                            "CALL `return` with args.message as JSON only: "
+                            "{\"page_a\":\"ONLY_FROM_FOLLOWUP1\",\"order_rule\":\"A\"}. "
+                            "Do NOT include the actual title; use this placeholder exactly."
+                        )
+                    if trajectory_chain_closed_book:
+                        base += " [CLOSED-BOOK]"
+                    return base
+
+                if two_stage and ("a2" in gold_struct) and ("title" in variant.lower()):
+                    # Stage 1: commit the evidence title (used later under closed-book + anaphora).
+                    follow1 = (
+                        "[FOLLOW-UP 1 / COMMIT] Identify the ONE Wikipedia title of the document you will cite as evidence. "
+                        "DO NOT call finish. Instead CALL `return` with args.message as JSON only: "
+                        "{\"supporting_titles\":[\"<Title>\"]}. "
+                        "Use the exact TITLE string you saw in open_page."
+                    )
+
+                    # Stage 2: final (optionally do not re-state Q1)
+                    if answer_format == "json":
+                        if anaphoric_mode == "trajectory" or anaphoric_level >= 2:
+                            follow2 = (
+                                "[FOLLOW-UP 2 / FINAL] Now CALL finish. "
+                                "This follow-up does NOT repeat Q1. Use only the committed title from FOLLOW-UP 1. "
+                                "In finish.args.answer output JSON only with keys a1 and a2. "
+                                "a1 = answer to Q1. a2 = the evidence title. "
+                                "a2 MUST EXACTLY match what you returned in FOLLOW-UP 1 (same spelling)."
+                            )
+                        else:
+                            follow2 = (
+                                "[FOLLOW-UP 2 / FINAL] Now CALL finish. "
+                                f"Q1 (repeated): {q}\n"
+                                "In finish.args.answer output JSON only with keys a1 and a2. "
+                                "a1 = answer to Q1. a2 = the evidence title. "
+                                "a2 MUST EXACTLY match what you returned in FOLLOW-UP 1."
+                            )
+                    else:
+                        follow2 = (
+                            "[FOLLOW-UP 2 / FINAL] Now CALL finish. "
+                            "Output two lines: 'a1: ...' and 'a2: ...'. a2 must match your committed title."
+                        )
+
+                    if closed_book_final:
+                        follow2 += " [CLOSED-BOOK]"
+
+                    stage2_fillers = _make_filler_turns(delay_after_stage1, filler_kind) if delay_after_stage1 > 0 else []
+                    checkpoints = [_make_trajectory_checkpoint(j + 1) for j in range(max(0, trajectory_chain_turns))]
+                    turns = [intro] + _make_filler_turns(filler_turns, filler_kind) + [follow1] + checkpoints + stage2_fillers + [follow2]
+                else:
+                    # One-stage late-binding (baseline)
+                    if "a2" in gold_struct:
+                        if variant.lower().startswith("late_title") or "title" in variant.lower():
+                            a2_desc = "the Wikipedia title of ONE document that contains the answer"
+                        else:
+                            a2_desc = "one evidence sentence (verbatim-ish) from a document that supports the answer"
+                        if answer_format == "json":
+                            follow = (
+                                "FOLLOW-UP (late-binding): Now CALL finish. "
+                                "In finish.args.answer, output a JSON object with keys a1 and a2. "
+                                f"a1 = answer to Q1. a2 = {a2_desc}. "
+                                "JSON only (no extra text)."
+                            )
+                        else:
+                            follow = (
+                                "FOLLOW-UP (late-binding): Now CALL finish. "
+                                "In finish.args.answer, output two lines: 'a1: ...' and 'a2: ...'."
+                            )
+                    else:
+                        follow = "FOLLOW-UP: Now CALL finish and provide the answer to Q1."
+
+                    if closed_book_final:
+                        follow += " [CLOSED-BOOK]"
+                    turns = [intro] + _make_filler_turns(filler_turns, filler_kind) + [follow]
 
             # Gold answer string for logging
             gold_answer_str = json.dumps(gold_struct, ensure_ascii=False)
@@ -342,6 +430,24 @@ class LostInMiddle(Benchmark):
                     "f1_threshold": f1_threshold,
                     "evidence_f1_threshold": evidence_f1_threshold,
                     "require_joint_output": require_joint_output,
+
+                    # Agent/controller knobs
+                    "closed_book_final": closed_book_final,
+                    "noise_nodes_after_stage1": noise_nodes_after_stage1,
+                    "noise_node_chars": noise_node_chars,
+                    "noise_seed": noise_seed,
+                    "return_gating_min_open_pages": return_gating_min_open_pages,
+                    "return_gating_min_steps": return_gating_min_steps,
+
+                    # Finish schema hints (ToolLoopLLMAgent can salvage/normalize)
+                    "finish_answer_format": (
+                        "litm_json_title" if (answer_format == "json" and "title" in variant.lower() and variant.lower() != "single") else
+                        "litm_json_sentence" if (answer_format == "json" and "sentence" in variant.lower() and variant.lower() != "single") else
+                        ""
+                    ),
+
+                    **({"goc_fold_policy": goc_fold_policy} if goc_fold_policy is not None else {}),
+                    **({"goc_dfs_switch_keep_last": goc_dfs_switch_keep_last} if goc_dfs_switch_keep_last is not None else {}),
                 },
             ))
 

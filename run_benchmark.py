@@ -2,12 +2,18 @@ import argparse
 import json
 from pathlib import Path
 
+from src.version import CODE_VERSION
 from src.benchmarks.registry import get_benchmark, BENCHMARKS
 from src.runners.deterministic import run_deterministic
 from src.runners.llm import run_llm
 
 def main():
     ap = argparse.ArgumentParser(description="Unified benchmark runner (deterministic or LLM).")
+    ap.add_argument(
+        "--print_version",
+        action="store_true",
+        help="Print the code version (for debugging patch/override issues) and exit.",
+    )
     ap.add_argument("--benchmark", type=str, default="synthetic_browsecomp", choices=list(BENCHMARKS.keys()))
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--prepare", action="store_true", help="Generate/download benchmark data into data_dir.")
@@ -25,6 +31,13 @@ def main():
         type=str,
         default=None,
         help="Path to a JSON file with benchmark-specific config knobs (overrides --bench_cfg).",
+    )
+
+    ap.add_argument(
+        "--sweep",
+        type=str,
+        default=None,
+        help="Alias for --bench_cfg_path (accepts sweep config JSON too).",
     )
 
     ap.add_argument("--runner", type=str, default="deterministic", choices=["deterministic", "llm"])
@@ -55,9 +68,78 @@ def main():
 
     # llm knobs
     ap.add_argument("--model", type=str, default="gpt-4o-mini")
+    ap.add_argument("--controller_model", type=str, default=None, help="Optional smaller controller LLM model for GoC-Agentic unfold selection.")
+
+    # Optional: LLM-assisted GoC annotations (hybrid/trace-first)
+    # These flags override per-method defaults when provided.
+    ap.add_argument(
+        "--goc_annotation_mode",
+        type=str,
+        default=None,
+        choices=["none", "hybrid_depends", "tracefirst"],
+        help="Override goc_annotation_mode in ToolLoopConfig (default: per-method).",
+    )
+    ap.add_argument(
+        "--goc_annotation_gate",
+        type=str,
+        default=None,
+        help="Override goc_annotation_gate (comma-separated triggers, e.g. 'doc_switch,pre_finish').",
+    )
+    ap.add_argument(
+        "--goc_annotation_gate_pre_finish_steps",
+        type=int,
+        default=None,
+        help="Override goc_annotation_gate_pre_finish_steps (default: 2).",
+    )
+    ap.add_argument(
+        "--goc_annotation_gate_every_k_steps",
+        type=int,
+        default=None,
+        help="Override goc_annotation_gate_every_k_steps (default: 0).",
+    )
+    ap.add_argument(
+        "--goc_annotation_schema",
+        type=str,
+        default=None,
+        choices=["compact", "legacy"],
+        help="Override goc_annotation_schema (default: compact).",
+    )
+    ap.add_argument(
+        "--goc_declared_dep_max_back",
+        type=int,
+        default=None,
+        help="Override goc_declared_dep_max_back (default: 12).",
+    )
+    ap.add_argument(
+        "--goc_declared_dep_max_per_step",
+        type=int,
+        default=None,
+        help="Override goc_declared_dep_max_per_step (default: 6).",
+    )
+
+    ap.add_argument(
+        "--goc_annotation_force",
+        type=int,
+        default=None,
+        choices=[0, 1, 2],
+        help="Force GoC annotation emission on gated steps (0=off, 1=force goc key, 2=force minimal dep).",
+    )
+
+    # Bandit controller (GoC-Bandit)
+    ap.add_argument(
+        "--bandit_model_path",
+        type=str,
+        default=None,
+        help="Path to a saved bandit model JSON (for GoC-Bandit). If omitted, uses an untrained prior.",
+    )
+    ap.add_argument("--bandit_alpha", type=float, default=1.0, help="LinUCB exploration alpha (GoC-Bandit).")
+    ap.add_argument("--bandit_epsilon", type=float, default=0.05, help="Epsilon-greedy exploration prob (GoC-Bandit).")
     ap.add_argument("--dotenv", type=str, default=".env")
     ap.add_argument("--max_steps", type=int, default=35)
     ap.add_argument("--max_json_retries", type=int, default=2)
+
+    # Parallelization
+    ap.add_argument("--parallel_tasks", type=int, default=1, help="Run tasks concurrently (thread pool) to speed up eval.")
 
     # Multi-turn gating / difficulty levers (LLM runner).
     ap.add_argument("--multi_turn_auto_inject", action="store_true", default=None, help="Enable auto-injection of pending user turns (default: enabled).")
@@ -73,7 +155,7 @@ def main():
     ap.add_argument(
         "--enforce_committed_supporting_titles",
         type=str,
-        default="none",
+        default="goc_only",
         choices=["none", "goc_only", "all"],
         help="If stage-1 committed supporting titles are available, enforce them in final finish JSON (avoids supporting_titles drift).",
     )
@@ -107,6 +189,17 @@ def main():
 
     args = ap.parse_args()
 
+    if args.print_version:
+        print(CODE_VERSION)
+        return
+
+    # Convenience alias: --sweep behaves like --bench_cfg_path.
+    if getattr(args, 'sweep', None):
+        if args.bench_cfg_path:
+            raise SystemExit('Provide only one of --bench_cfg_path or --sweep')
+        args.bench_cfg_path = args.sweep
+
+
     bench_kwargs = {}
     if args.bench_cfg_path:
         bench_kwargs = json.loads(Path(args.bench_cfg_path).read_text(encoding="utf-8"))
@@ -117,6 +210,51 @@ def main():
             raise SystemExit(f"Invalid --bench_cfg JSON: {e}")
 
     bench = get_benchmark(args.benchmark)
+    # Helper: shallow dict merge (b overrides a).
+    def _merge_dict(a: dict, b: dict) -> dict:
+        out = dict(a or {})
+        if isinstance(b, dict):
+            out.update(b)
+        return out
+
+    # If the user passed a sweep config, flatten it into benchmark kwargs so `run_benchmark.py`
+    # works as a convenient entrypoint for quick sanity checks.
+    if isinstance(bench_kwargs, dict):
+        # Sweep format A (legacy): top-level has `bench_kwargs` + `grid`/`runs`.
+        if isinstance(bench_kwargs.get("bench_kwargs"), dict) and (
+            "grid" in bench_kwargs or "sweep_name" in bench_kwargs or "runs" in bench_kwargs
+        ):
+            sweep_cfg = bench_kwargs
+            bench_kwargs = dict(sweep_cfg.get("bench_kwargs") or {})
+            # If sweep config specifies data_dir and CLI stayed at default, prefer the sweep value.
+            if str(args.data_dir) == "data" and isinstance(sweep_cfg.get("data_dir"), str):
+                args.data_dir = sweep_cfg["data_dir"]
+
+        # Sweep format B (run_sweep preset): top-level has `base` + `runs` (+ optional `grid`).
+        # Benchmark kwargs live under base.bench_kwargs, and each run may override them.
+        elif isinstance(bench_kwargs.get("base"), dict) and ("runs" in bench_kwargs or "grid" in bench_kwargs):
+            sweep_cfg = bench_kwargs
+            base = sweep_cfg.get("base") or {}
+            base_bk = base.get("bench_kwargs") if isinstance(base.get("bench_kwargs"), dict) else {}
+
+            rv_over: dict = {}
+            runs = sweep_cfg.get("runs")
+            if isinstance(runs, list) and runs and isinstance(runs[0], dict):
+                rv = runs[0]
+                rv_over = rv.get("bench_kwargs") if isinstance(rv.get("bench_kwargs"), dict) else {}
+
+            bench_kwargs = _merge_dict(base_bk, rv_over)
+
+            if str(args.data_dir) == "data" and isinstance(sweep_cfg.get("data_dir"), str):
+                args.data_dir = sweep_cfg["data_dir"]
+
+    # Defensive: if a bench config accidentally includes data_dir inside bench_kwargs,
+    # remove it to avoid passing data_dir twice to load_tasks().
+    if isinstance(bench_kwargs, dict):
+        _cfg_dd = bench_kwargs.pop("data_dir", None)
+        if str(args.data_dir) == "data" and isinstance(_cfg_dd, str) and _cfg_dd:
+            args.data_dir = _cfg_dd
+
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -178,6 +316,7 @@ def main():
             out_results_path=str(out_dir / "llm_results.jsonl"),
             out_report_path=str(out_dir / "llm_report.md"),
             model=args.model,
+            controller_model=args.controller_model,
             dotenv_path=args.dotenv,
             max_steps=args.max_steps,
             max_json_retries=args.max_json_retries,
@@ -206,6 +345,21 @@ def main():
             trace_output_chars=args.trace_output_chars,
             prompt_context_chars=args.prompt_context_chars,
             log_context_chars=args.log_context_chars,
+
+            parallel_tasks=args.parallel_tasks,
+
+            bandit_model_path=args.bandit_model_path,
+            bandit_alpha=args.bandit_alpha,
+            bandit_epsilon=args.bandit_epsilon,
+
+            goc_annotation_mode=args.goc_annotation_mode,
+            goc_annotation_gate=args.goc_annotation_gate,
+            goc_annotation_gate_pre_finish_steps=args.goc_annotation_gate_pre_finish_steps,
+            goc_annotation_gate_every_k_steps=args.goc_annotation_gate_every_k_steps,
+            goc_annotation_schema=args.goc_annotation_schema,
+            goc_declared_dep_max_back=args.goc_declared_dep_max_back,
+            goc_declared_dep_max_per_step=args.goc_declared_dep_max_per_step,
+            goc_annotation_force=args.goc_annotation_force,
         )
 
     # Be explicit about outputs so users don't look at the wrong working directory.

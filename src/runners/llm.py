@@ -1,13 +1,16 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Callable, Optional
 import json
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from ..benchmarks.base import Benchmark
 from ..llm_openai import make_openai_client
 from ..llm_agent import ToolLoopLLMAgent, ToolLoopConfig
+from ..bandit_controller import BanditUnfoldController
 from ..memory import (
     FullHistoryMemory,
     ContextFoldingDiscardMemory,
@@ -33,6 +36,12 @@ def run_llm(
     bench_kwargs: Optional[Dict[str, Any]] = None,
     model: str = "gpt-4o-mini",
     dotenv_path: str = ".env",
+    controller_model: Optional[str] = None,
+
+    # Bandit controller (GoC-Bandit)
+    bandit_model_path: Optional[str] = None,
+    bandit_alpha: float = 1.0,
+    bandit_epsilon: float = 0.05,
     max_steps: int = 35,
     max_json_retries: int = 2,
     # Difficulty / gating levers
@@ -63,6 +72,10 @@ def run_llm(
     verbose_steps: bool = False,
     log_dir: Optional[str] = None,
 
+    # Parallelization
+    # - parallel_tasks: run tasks concurrently (thread pool).
+    parallel_tasks: int = 1,
+
     # Trace controls
     trace_messages: bool = True,
     trace_message_chars: int = 6000,
@@ -73,10 +86,27 @@ def run_llm(
     log_context_chars: int = 2500,
 
     # Two-stage commit helpers (HotpotQA/FEVER-style)
-    enforce_committed_supporting_titles: str = "none",
+    # Default to "goc_only" so GoC can leverage traceable commitments to
+    # eliminate supporting_titles drift without affecting other baselines.
+    enforce_committed_supporting_titles: str = "goc_only",
     committed_supporting_titles_n: int = 2,
     stage_aware_unfold_on_final: bool = True,
     stage_final_unfold_k: int = 6,
+    stage_aware_unfold_on_commit: bool = True,
+    stage_commit_unfold_k: int = 6,
+
+    # Optional: override LLM-assisted GoC annotation settings (prompt gating + schema)
+    # If None, defaults are used (and per-method overrides like GoC-HybridDep apply).
+    goc_annotation_mode: Optional[str] = None,
+    goc_annotation_gate: Optional[str] = None,
+    goc_annotation_gate_pre_finish_steps: Optional[int] = None,
+    goc_annotation_gate_every_k_steps: Optional[int] = None,
+    goc_annotation_schema: Optional[str] = None,
+    goc_annotation_force: Optional[int] = None,
+
+    goc_declared_dep_max_back: Optional[int] = None,
+    goc_declared_dep_max_per_step: Optional[int] = None,
+
 
     # Resume / robustness
     resume: bool = False,
@@ -85,8 +115,13 @@ def run_llm(
     # When set, writes one JSONL row per task: {task_id, question, gold, meta}.
     out_task_index_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    bench_kwargs = bench_kwargs or {}
-    tools = benchmark.build_tools(data_dir, retriever_kind=retriever_kind, faiss_dim=faiss_dim, **bench_kwargs)
+    # Defensive: allow bench config (or sweep wrapper) to specify data_dir without
+    # causing Python to receive data_dir twice (positional + kwarg).
+    # If present in bench_kwargs, prefer it and remove from kwargs.
+    bench_kwargs = dict(bench_kwargs or {})
+    cfg_data_dir = bench_kwargs.pop("data_dir", None)
+    if isinstance(cfg_data_dir, str) and cfg_data_dir:
+        data_dir = cfg_data_dir
     tasks = benchmark.load_tasks(data_dir, limit=task_limit, **bench_kwargs)
 
     # Write a lightweight task index (best effort). Useful for later analysis of
@@ -124,6 +159,7 @@ def run_llm(
             "Double-check --bench_cfg (e.g., {'path': '.../hotpot_dev_distractor_v1.json'}) and that the file is readable."
         )
 
+    # Build an LLM client.
     llm = make_openai_client(
         model=model,
         api_mode="auto",
@@ -131,6 +167,17 @@ def run_llm(
         force_json=True,
         dotenv_path=dotenv_path,
     )
+
+    # Optional controller model for agentic unfold/fold (Option-B).
+    controller_llm = llm
+    if controller_model:
+        controller_llm = make_openai_client(
+            model=controller_model,
+            api_mode="auto",
+            temperature=0.0,
+            force_json=True,
+            dotenv_path=dotenv_path,
+        )
 
     all_method_specs: Dict[str, MethodSpec] = {
         "FullHistory": MethodSpec("FullHistory", lambda: FullHistoryMemory(budget_active=budget_active, budget_unfold=budget_unfold)),
@@ -148,7 +195,63 @@ def run_llm(
             ),
         ),
         "AgentFold-Range": MethodSpec("AgentFold-Range", lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk)),
-        "GoC": MethodSpec("GoC", lambda: GoCMemory(budget_active=budget_active, budget_unfold=budget_unfold, unfold_k=unfold_k)),
+        "GoC": MethodSpec(
+            "GoC",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        # Research variants: allow the acting model to emit optional "goc" annotations
+        # (e.g., depends_on_steps) to help connect steps. These are intended for
+        # controlled comparisons and should be treated as experimental.
+        "GoC-HybridDep": MethodSpec(
+            "GoC-HybridDep",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                dep_closure_edge_types=("depends", "depends_llm", "doc_ref"),
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-TraceFirst": MethodSpec(
+            "GoC-TraceFirst",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                dep_closure_edge_types=("depends", "depends_llm", "doc_ref"),
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Agentic": MethodSpec(
+            "GoC-Agentic",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                dep_closure_edge_types=("depends", "doc_ref"),
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Bandit": MethodSpec(
+            "GoC-Bandit",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                dep_closure_edge_types=("depends", "doc_ref"),
+                trace_unfold_candidates=True,
+            ),
+        ),
         "SimilarityOnly": MethodSpec(
             "SimilarityOnly",
             lambda: SimilarityOnlyMemory(
@@ -190,19 +293,10 @@ def run_llm(
     f_out = open(out_path, f_mode, encoding="utf-8")
     written = 0
 
-    for ms in selected:
-        if verbose_steps:
-            print(f"\n=== METHOD: {ms.name} ===", flush=True)
-        mem = ms.mem_factory()
-        # Only override optional bool knobs when explicitly provided.
-        require_docids = require_docids_in_finish if (require_docids_in_finish is not None) else True
-        mt_auto = multi_turn_auto_inject if (multi_turn_auto_inject is not None) else True
-
-        agent = ToolLoopLLMAgent(
-            llm=llm,
-            tools=tools,
-            mem=mem,
-            cfg=ToolLoopConfig(
+    # Shared config used for per-task agents.
+    require_docids = require_docids_in_finish if (require_docids_in_finish is not None) else True
+    mt_auto = multi_turn_auto_inject if (multi_turn_auto_inject is not None) else True
+    base_cfg = ToolLoopConfig(
                 max_steps=max_steps,
                 min_steps_before_finish=min_steps_before_finish,
                 min_open_pages_before_finish=min_open_pages_before_finish,
@@ -231,81 +325,167 @@ def run_llm(
                 committed_supporting_titles_n=int(committed_supporting_titles_n),
                 stage_aware_unfold_on_final=bool(stage_aware_unfold_on_final),
                 stage_final_unfold_k=int(stage_final_unfold_k),
-            ),
-        )
+                stage_aware_unfold_on_commit=bool(stage_aware_unfold_on_commit),
+                stage_commit_unfold_k=int(stage_commit_unfold_k),
+            )
 
-        for t in tasks:
-            # Some benchmarks require per-task tool scoping (e.g., each task has its own context set).
-            if hasattr(tools, "set_task"):
-                try:
-                    tools.set_task(t)
-                except Exception:
-                    # Never crash a full run due to scoping.
-                    pass
-            if (ms.name, t.id) in done_keys:
-                continue
+    # Shared bandit controller instance (read-only during evaluation).
+    # Training is typically done offline from traces via scripts/build_bandit_dataset.py
+    # and scripts/train_bandit_linucb.py.
+    shared_bandit: Optional[BanditUnfoldController] = None
+    try:
+        # Create on-demand only if any selected method is GoC-Bandit.
+        if any(str(ms.name) == "GoC-Bandit" for ms in selected):
+            shared_bandit = BanditUnfoldController(alpha=float(bandit_alpha), epsilon=float(bandit_epsilon))
+            if bandit_model_path:
+                shared_bandit.load_json(bandit_model_path)
+    except Exception:
+        shared_bandit = None
 
+    # Thread-safe writer for parallel runs.
+    write_lock = threading.Lock()
+
+    def _run_one_task(ms_name: str, mem_factory: Callable[[], MemoryManagerBase], t) -> Dict[str, Any]:
+        """Run one task with fresh tools+agent (thread-safe)."""
+        local_tools = benchmark.build_tools(data_dir, retriever_kind=retriever_kind, faiss_dim=faiss_dim, **bench_kwargs)
+        if hasattr(local_tools, "set_task"):
             try:
-                out = agent.run(
-                    t.question,
-                    user_turns=t.turns,
-                    task_meta=t.meta,
-                    task_id=t.id,
-                    method=ms.name,
-                    run_tag=run_tag,
-                )
-                pred = (out.get("answer") or "").strip()
-                expl = out.get("explanation") or ""
-                ev = benchmark.evaluate(pred, expl, t)
+                local_tools.set_task(t)
+            except Exception:
+                pass
+        mem = mem_factory()
+        cfg = base_cfg
+        if str(ms_name).lower().startswith('goc-agentic') or str(ms_name).lower().endswith('agentic'):
+            cfg = replace(base_cfg, enable_agentic_unfold=True)
+        # Experimental: let the acting model declare lightweight graph annotations
+        # (depends_on_steps + optional notes) to help GoC connect steps.
+        if str(ms_name) == "GoC-HybridDep":
+            cfg = replace(cfg, goc_annotation_mode="hybrid_depends")
+        elif str(ms_name) == "GoC-TraceFirst":
+            cfg = replace(cfg, goc_annotation_mode="tracefirst")
 
-                row = {
-                    "benchmark": benchmark.name,
-                    "method": ms.name,
-                    "task_id": t.id,
-                    "pred": pred,
-                    "gold": t.answer,
-                    "correct": bool(ev.get("correct")),
-                    "correct_strict": bool(ev.get("correct_strict")) if ("correct_strict" in ev) else None,
-                    "pred_norm": ev.get("pred_norm"),
-                    "gold_norm": ev.get("gold_norm"),
-                    "docid_cov": float(ev.get("docid_cov", 0.0)),
-                    "usage": out.get("usage") or {},
-                    "tool_stats": out.get("tool_stats") or {},
-                    "steps": out.get("steps"),
-                    "elapsed_sec": out.get("elapsed_sec"),
-                    "confidence": out.get("confidence", ""),
-                    "explanation": expl,
-                    "run_tag": run_tag,
-                    "retriever_kind": retriever_kind,
-                }
-            except Exception as e:
-                # Don't kill the whole run; record the failure and continue.
-                row = {
-                    "benchmark": benchmark.name,
-                    "method": ms.name,
-                    "task_id": t.id,
-                    "pred": "",
-                    "gold": t.answer,
-                    "correct": False,
-                    "correct_strict": None,
-                    "pred_norm": None,
-                    "gold_norm": None,
-                    "docid_cov": 0.0,
-                    "usage": {},
-                    "tool_stats": {"runner_error": True, "runner_error_msg": str(e)},
-                    "steps": None,
-                    "elapsed_sec": None,
-                    "confidence": "",
-                    "explanation": "",
-                    "run_tag": run_tag,
-                    "retriever_kind": retriever_kind,
-                    "error": str(e),
-                }
+        # CLI overrides (if provided) take precedence over per-method defaults.
+        if goc_annotation_mode is not None:
+            cfg = replace(cfg, goc_annotation_mode=str(goc_annotation_mode))
+        if goc_annotation_gate is not None:
+            cfg = replace(cfg, goc_annotation_gate=str(goc_annotation_gate))
+        if goc_annotation_gate_pre_finish_steps is not None:
+            cfg = replace(cfg, goc_annotation_gate_pre_finish_steps=int(goc_annotation_gate_pre_finish_steps))
+        if goc_annotation_gate_every_k_steps is not None:
+            cfg = replace(cfg, goc_annotation_gate_every_k_steps=int(goc_annotation_gate_every_k_steps))
+        if goc_annotation_schema is not None:
+            cfg = replace(cfg, goc_annotation_schema=str(goc_annotation_schema))
+        if goc_declared_dep_max_back is not None:
+            cfg = replace(cfg, goc_declared_dep_max_back=int(goc_declared_dep_max_back))
+        if goc_declared_dep_max_per_step is not None:
+            cfg = replace(cfg, goc_declared_dep_max_per_step=int(goc_declared_dep_max_per_step))
+        if goc_annotation_force is not None:
+            cfg = replace(cfg, goc_annotation_force=bool(int(goc_annotation_force)))
+        # Bandit controller mode (GoC-Bandit)
+        bandit_ctl = None
+        if str(ms_name) == "GoC-Bandit":
+            cfg = replace(
+                cfg,
+                enable_bandit_unfold=True,
+                bandit_alpha=float(bandit_alpha),
+                bandit_epsilon=float(bandit_epsilon),
+                bandit_model_path=str(bandit_model_path) if bandit_model_path else None,
+            )
+            bandit_ctl = shared_bandit
 
-            f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
-            f_out.flush()
-            done_keys.add((ms.name, t.id))
-            written += 1
+        agent = ToolLoopLLMAgent(
+            llm=llm,
+            tools=local_tools,
+            mem=mem,
+            cfg=cfg,
+            controller_llm=controller_llm,
+            bandit_controller=bandit_ctl,
+        )
+        try:
+            out = agent.run(
+                t.question,
+                user_turns=t.turns,
+                task_meta=t.meta,
+                task_id=t.id,
+                method=ms_name,
+                run_tag=run_tag,
+            )
+            pred = (out.get("answer") or "").strip()
+            expl = out.get("explanation") or ""
+            ev = benchmark.evaluate(pred, expl, t)
+            return {
+                "benchmark": benchmark.name,
+                "method": ms_name,
+                "task_id": t.id,
+                "pred": pred,
+                "gold": t.answer,
+                "correct": bool(ev.get("correct")),
+                "correct_strict": bool(ev.get("correct_strict")) if ("correct_strict" in ev) else None,
+                "pred_norm": ev.get("pred_norm"),
+                "gold_norm": ev.get("gold_norm"),
+                "docid_cov": float(ev.get("docid_cov", 0.0)),
+                "usage": out.get("usage") or {},
+                "tool_stats": out.get("tool_stats") or {},
+                "steps": out.get("steps"),
+                "elapsed_sec": out.get("elapsed_sec"),
+                "confidence": out.get("confidence", ""),
+                "explanation": expl,
+                "run_tag": run_tag,
+                "retriever_kind": retriever_kind,
+            }
+        except Exception as e:
+            return {
+                "benchmark": benchmark.name,
+                "method": ms_name,
+                "task_id": t.id,
+                "pred": "",
+                "gold": t.answer,
+                "correct": False,
+                "correct_strict": None,
+                "pred_norm": None,
+                "gold_norm": None,
+                "docid_cov": 0.0,
+                "usage": {},
+                "tool_stats": {"runner_error": True, "runner_error_msg": str(e)},
+                "steps": None,
+                "elapsed_sec": None,
+                "confidence": "",
+                "explanation": "",
+                "run_tag": run_tag,
+                "retriever_kind": retriever_kind,
+                "error": str(e),
+            }
+
+
+    for ms in selected:
+        if verbose_steps:
+            print(f"\n=== METHOD: {ms.name} ===", flush=True)
+
+        # Filter tasks for resume.
+        todo = [t for t in tasks if (ms.name, t.id) not in done_keys]
+        if not todo:
+            continue
+
+        n_workers = max(1, int(parallel_tasks or 1))
+        if n_workers == 1:
+            # Preserve the previous sequential behavior.
+            for t in todo:
+                row = _run_one_task(ms.name, ms.mem_factory, t)
+                with write_lock:
+                    f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f_out.flush()
+                done_keys.add((ms.name, t.id))
+                written += 1
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(_run_one_task, ms.name, ms.mem_factory, t) for t in todo]
+                for fut in as_completed(futs):
+                    row = fut.result()
+                    with write_lock:
+                        f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        f_out.flush()
+                    done_keys.add((row.get("method"), row.get("task_id")))
+                    written += 1
 
     f_out.close()
 
