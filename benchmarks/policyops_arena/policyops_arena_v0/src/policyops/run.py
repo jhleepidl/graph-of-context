@@ -14,8 +14,9 @@ from .baselines import (
     run_goc_heuristic,
     run_topk_rag,
 )
+from .controller import Controller
 from .env import PolicyOpsEnv
-from .eval import aggregate_metrics, evaluate_prediction, save_report
+from .eval import aggregate_metrics, evaluate_prediction, gold_decision_distribution, save_report
 from .generator import generate_world_and_tasks
 from .world import load_tasks, load_world
 
@@ -23,6 +24,22 @@ from .world import load_tasks, load_world
 def _default_base_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
+
+def _avg_p90(values: List[int]) -> Dict[str, float]:
+    if not values:
+        return {"avg": 0.0, "p90": 0.0}
+    avg = sum(values) / len(values)
+    ordered = sorted(values)
+    idx = int(0.9 * (len(ordered) - 1))
+    p90 = ordered[idx]
+    return {"avg": avg, "p90": float(p90)}
+
+
+def _resolve_controller_state_path(base_dir: Path, path_str: str) -> Path:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return base_dir / path
 
 def apply_evidence_padding(
     pred: Dict[str, Any],
@@ -65,6 +82,121 @@ def apply_evidence_padding(
     raise ValueError(f"Unknown evidence padding mode: {mode}")
 
 
+def _evaluate_method(
+    method: str,
+    world: Any,
+    tasks: List[Any],
+    args: argparse.Namespace,
+    client: LLMClient,
+    run_dir: Path,
+    controller: Controller | None = None,
+    controller_mode: str = "off",
+) -> Dict[str, Any]:
+    metrics: List[Dict[str, float]] = []
+    tool_calls: List[int] = []
+    open_calls: List[int] = []
+    prompt_tokens_list: List[int] = []
+    records: List[Dict[str, Any]] = []
+    controller_actions: Dict[str, int] = {}
+
+    for task in tasks:
+        env = PolicyOpsEnv(
+            world,
+            tool_call_budget=task.budgets.get("tool_call_budget", 50),
+            open_budget=task.budgets.get("open_budget", 5),
+        )
+        error: str | None = None
+        raw_output: str | None = None
+        controller_action: str | None = None
+        if method == "topk":
+            pred, opened_ids, prompt, raw_output = run_topk_rag(task, env, client)
+        elif method == "full":
+            pred, opened_ids, prompt, raw_output = run_full_history(task, env, client)
+        elif method == "goc":
+            pred, opened_ids, prompt, raw_output, error, controller_action = run_goc_heuristic(
+                task,
+                env,
+                client,
+                controller=controller,
+                controller_mode=controller_mode,
+            )
+            if controller_action:
+                controller_actions[controller_action] = controller_actions.get(controller_action, 0) + 1
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        pred_for_eval, pred_for_record, evidence_before, evidence_after = apply_evidence_padding(
+            pred,
+            opened_ids,
+            mode=args.evidence_padding_mode,
+            min_count=args.min_evidence_count,
+        )
+        task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
+        metrics.append(task_metrics)
+        tool_calls.append(env.tool_call_count)
+        open_calls.append(env.open_count)
+        prompt_tokens = len(prompt.split()) if prompt else 0
+        prompt_tokens_list.append(prompt_tokens)
+        pred_decision = pred_for_record.get("decision")
+        record: Dict[str, Any] = {
+            "task_id": task.task_id,
+            "method": method,
+            "opened_clause_ids": opened_ids,
+            "tool_calls": env.tool_call_count,
+            "open_calls": env.open_count,
+            "prompt_tokens": prompt_tokens,
+            "pred_decision": pred_decision,
+            "gold_decision": task.gold.decision,
+            "decision_correct": pred_decision == task.gold.decision,
+            "evidence_precision": task_metrics.get("evidence_precision"),
+            "evidence_recall": task_metrics.get("evidence_recall"),
+            "critical_evidence_hit": task_metrics.get("critical_evidence_hit"),
+            "pred_evidence_count": len(pred_for_record.get("evidence", []) or []),
+            "gold_evidence_count": len(task.gold.gold_evidence or []),
+            "error": error,
+            "evidence_padding_mode": args.evidence_padding_mode,
+            "min_evidence_count": args.min_evidence_count,
+            "controller_action": controller_action,
+        }
+        if args.evidence_padding_mode in {"schema_only", "global"}:
+            record["evidence_before_pad"] = evidence_before
+            record["evidence_after_pad"] = evidence_after
+        if args.save_prompts:
+            prompt_dir = run_dir / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+            prompt_path = prompt_dir / f"{task.task_id}.txt"
+            prompt_path.write_text(prompt, encoding="utf-8")
+            record["prompt_path"] = str(prompt_path)
+        if args.save_raw:
+            raw_dir = run_dir / "raw_outputs"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_path = raw_dir / f"{task.task_id}.txt"
+            raw_path.write_text(raw_output or "", encoding="utf-8")
+            record["raw_path"] = str(raw_path)
+        records.append(record)
+
+    aggregate = aggregate_metrics(metrics)
+    aggregate["gold_decision_distribution"] = gold_decision_distribution(tasks)
+    report = {
+        "method": method,
+        "model": args.model,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "metrics": aggregate,
+        "counts": {"tasks": len(tasks)},
+        "usage": {
+            "tool_calls_avg": sum(tool_calls) / len(tool_calls) if tool_calls else 0.0,
+            "open_calls_avg": sum(open_calls) / len(open_calls) if open_calls else 0.0,
+            "prompt_tokens_avg": sum(prompt_tokens_list) / len(prompt_tokens_list) if prompt_tokens_list else 0.0,
+        },
+        "tool_calls": sum(tool_calls),
+        "open_calls": sum(open_calls),
+        "records": records,
+        "controller_enabled": bool(controller),
+        "controller_mode": controller_mode,
+        "controller_actions_distribution": controller_actions,
+    }
+    return report
+
 def cmd_generate(args: argparse.Namespace) -> None:
     generate_world_and_tasks(
         out_dir=args.out_dir,
@@ -92,103 +224,118 @@ def cmd_eval(args: argparse.Namespace) -> None:
         client = OpenAIClient(model=args.model, dotenv_path=args.dotenv)
     else:
         client = DummyClient()
-    metrics: List[Dict[str, float]] = []
-    tool_calls: List[int] = []
-    open_calls: List[int] = []
-    prompt_tokens: List[int] = []
-    records: List[Dict[str, Any]] = []
+
+    controller = None
+    controller_mode = "off"
+    state_path = None
+    if args.use_controller and args.method == "goc":
+        controller_mode = args.controller_mode
+        state_path = _resolve_controller_state_path(base_dir, args.controller_state_path)
+        controller = Controller.load(state_path)
 
     run_dir = Path(base_dir) / "runs" / args.method
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    for task in tasks:
-        env = PolicyOpsEnv(
-            world,
-            tool_call_budget=task.budgets.get("tool_call_budget", 50),
-            open_budget=task.budgets.get("open_budget", 5),
-        )
-        error: str | None = None
-        raw_output: str | None = None
-        if args.method == "topk":
-            pred, opened_ids, prompt, raw_output = run_topk_rag(task, env, client)
-        elif args.method == "full":
-            pred, opened_ids, prompt, raw_output = run_full_history(task, env, client)
-        elif args.method == "goc":
-            pred, opened_ids, prompt, raw_output, error = run_goc_heuristic(task, env, client)
-        else:
-            raise ValueError(f"Unknown method: {args.method}")
+    report = _evaluate_method(
+        args.method,
+        world,
+        tasks,
+        args,
+        client,
+        run_dir,
+        controller=controller,
+        controller_mode=controller_mode,
+    )
 
-        pred_for_eval, pred_for_record, evidence_before, evidence_after = apply_evidence_padding(
-            pred,
-            opened_ids,
-            mode=args.evidence_padding_mode,
-            min_count=args.min_evidence_count,
-        )
-        task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
-        metrics.append(task_metrics)
-        tool_calls.append(env.tool_call_count)
-        open_calls.append(env.open_count)
-        prompt_tokens.append(len(prompt.split()) if prompt else 0)
-        pred_decision = pred_for_record.get("decision")
-        record: Dict[str, Any] = {
-            "task_id": task.task_id,
-            "method": args.method,
-            "opened_clause_ids": opened_ids,
-            "tool_calls": env.tool_call_count,
-            "open_calls": env.open_count,
-            "pred_decision": pred_decision,
-            "gold_decision": task.gold.decision,
-            "decision_correct": pred_decision == task.gold.decision,
-            "evidence_precision": task_metrics.get("evidence_precision"),
-            "evidence_recall": task_metrics.get("evidence_recall"),
-            "critical_evidence_hit": task_metrics.get("critical_evidence_hit"),
-            "pred_evidence_count": len(pred_for_record.get("evidence", []) or []),
-            "gold_evidence_count": len(task.gold.gold_evidence or []),
-            "error": error,
-            "evidence_padding_mode": args.evidence_padding_mode,
-            "min_evidence_count": args.min_evidence_count,
-        }
-        if args.evidence_padding_mode in {"schema_only", "global"}:
-            record["evidence_before_pad"] = evidence_before
-            record["evidence_after_pad"] = evidence_after
-        if args.save_prompts:
-            prompt_dir = run_dir / "prompts"
-            prompt_dir.mkdir(parents=True, exist_ok=True)
-            prompt_path = prompt_dir / f"{task.task_id}.txt"
-            prompt_path.write_text(prompt, encoding="utf-8")
-            record["prompt_path"] = str(prompt_path)
-        if args.save_raw:
-            raw_dir = run_dir / "raw_outputs"
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            raw_path = raw_dir / f"{task.task_id}.txt"
-            raw_path.write_text(raw_output or "", encoding="utf-8")
-            record["raw_path"] = str(raw_path)
-        records.append(record)
-
-    aggregate = aggregate_metrics(metrics)
-    report = {
-        "method": args.method,
-        "model": args.model,
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "metrics": aggregate,
-        "counts": {"tasks": len(tasks)},
-        "usage": {
-            "tool_calls_avg": sum(tool_calls) / len(tool_calls) if tool_calls else 0.0,
-            "open_calls_avg": sum(open_calls) / len(open_calls) if open_calls else 0.0,
-            "prompt_tokens_avg": sum(prompt_tokens) / len(prompt_tokens) if prompt_tokens else 0.0,
-        },
-        "tool_calls": sum(tool_calls),
-        "open_calls": sum(open_calls),
-        "records": records,
-    }
+    if controller and controller_mode == "train" and state_path:
+        controller.save(state_path)
 
     out_path = run_dir / f"{timestamp}.json"
     save_report(out_path, report)
 
     print("Evaluation complete.")
-    for key, value in aggregate.items():
-        print(f"{key}: {value:.3f}")
+    for key, value in report["metrics"].items():
+        if isinstance(value, (int, float)):
+            print(f"{key}: {value:.3f}")
+    print(f"Report saved to {out_path}")
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    base_dir = args.out_dir or _default_base_dir()
+    world_dir = Path(base_dir) / "data" / "worlds"
+    tasks_path = Path(base_dir) / "data" / "tasks" / "tasks.jsonl"
+
+    world = load_world(world_dir)
+    tasks = load_tasks(tasks_path)
+
+    if args.llm == "openai":
+        client = OpenAIClient(model=args.model, dotenv_path=args.dotenv)
+    else:
+        client = DummyClient()
+
+    methods = args.methods or ["topk", "full", "goc"]
+    controller = None
+    controller_mode = "off"
+    state_path = None
+    if args.use_controller:
+        controller_mode = args.controller_mode
+        state_path = _resolve_controller_state_path(base_dir, args.controller_state_path)
+        controller = Controller.load(state_path)
+
+    compare_dir = Path(base_dir) / "runs" / "compare"
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    compare_run_dir = compare_dir / timestamp
+    compare_run_dir.mkdir(parents=True, exist_ok=True)
+
+    method_reports: Dict[str, Any] = {}
+    summary: Dict[str, Any] = {}
+    for method in methods:
+        method_dir = compare_run_dir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
+        method_report = _evaluate_method(
+            method,
+            world,
+            tasks,
+            args,
+            client,
+            method_dir,
+            controller=controller if method == "goc" else None,
+            controller_mode=controller_mode if method == "goc" else "off",
+        )
+        method_reports[method] = method_report
+
+        records = method_report.get("records", [])
+        prompt_tokens_vals = [int(r.get("prompt_tokens", 0)) for r in records]
+        open_calls_vals = [int(r.get("open_calls", 0)) for r in records]
+        tool_calls_vals = [int(r.get("tool_calls", 0)) for r in records]
+        summary[method] = {
+            "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
+            "condition_f1": method_report["metrics"].get("condition_f1"),
+            "evidence_recall": method_report["metrics"].get("evidence_recall"),
+            "critical_evidence_hit": method_report["metrics"].get("critical_evidence_hit"),
+            "prompt_tokens": _avg_p90(prompt_tokens_vals),
+            "open_calls": _avg_p90(open_calls_vals),
+            "tool_calls": _avg_p90(tool_calls_vals),
+        }
+
+    if controller and controller_mode == "train" and state_path:
+        controller.save(state_path)
+
+    compare_report = {
+        "methods": methods,
+        "model": args.model,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "gold_decision_distribution": gold_decision_distribution(tasks),
+        "summary": summary,
+        "method_reports": method_reports,
+        "controller_enabled": bool(controller),
+        "controller_mode": controller_mode,
+    }
+
+    out_path = compare_dir / f"{timestamp}.json"
+    save_report(out_path, compare_report)
+    print("Compare complete.")
     print(f"Report saved to {out_path}")
 
 
@@ -212,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--method", choices=["topk", "full", "goc"], required=True)
     ev.add_argument("--model", type=str, default="gpt-4.1-mini")
     ev.add_argument("--llm", choices=["dummy", "openai"], default="dummy")
-    ev.add_argument("--dotenv", type=str, default="../../../.env")
+    ev.add_argument("--dotenv", type=str, default=".env")
     ev.add_argument("--out_dir", type=Path, default=None)
     ev.add_argument(
         "--evidence_padding_mode",
@@ -223,7 +370,30 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--min_evidence_count", type=int, default=2)
     ev.add_argument("--save_prompts", action="store_true", help="Save per-task prompts to files")
     ev.add_argument("--save_raw", action="store_true", help="Save per-task raw outputs to files")
+    ev.add_argument("--use_controller", action="store_true")
+    ev.add_argument("--controller_mode", choices=["off", "eval", "train"], default="off")
+    ev.add_argument("--controller_state_path", type=str, default="runs/controller_state.json")
     ev.set_defaults(func=cmd_eval)
+
+    cmp = sub.add_parser("compare", help="Compare methods in one run")
+    cmp.add_argument("--methods", nargs="+", default=["topk", "full", "goc"])
+    cmp.add_argument("--model", type=str, default="gpt-4.1-mini")
+    cmp.add_argument("--llm", choices=["dummy", "openai"], default="dummy")
+    cmp.add_argument("--dotenv", type=str, default=".env")
+    cmp.add_argument("--out_dir", type=Path, default=None)
+    cmp.add_argument(
+        "--evidence_padding_mode",
+        choices=["none", "schema_only", "global"],
+        default="schema_only",
+        help="Evidence padding mode for evaluation and reporting",
+    )
+    cmp.add_argument("--min_evidence_count", type=int, default=2)
+    cmp.add_argument("--save_prompts", action="store_true", help="Save per-task prompts to files")
+    cmp.add_argument("--save_raw", action="store_true", help="Save per-task raw outputs to files")
+    cmp.add_argument("--use_controller", action="store_true")
+    cmp.add_argument("--controller_mode", choices=["off", "eval", "train"], default="off")
+    cmp.add_argument("--controller_state_path", type=str, default="runs/controller_state.json")
+    cmp.set_defaults(func=cmd_compare)
 
     return parser
 

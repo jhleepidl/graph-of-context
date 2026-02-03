@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .env import PolicyOpsEnv
+from .controller import Controller
+
+ALLOWED_DECISIONS = {"allow", "deny", "require_condition", "needs_more_info"}
 
 
 class LLMClient:
@@ -20,6 +23,7 @@ class DummyClient(LLMClient):
                 "decision": "needs_more_info",
                 "conditions": [],
                 "evidence": [],
+                "customer_message": "",
             }
         )
 
@@ -102,9 +106,12 @@ class OpenAIClient(LLMClient):
 
 def _build_prompt(ticket: str, clauses: List[Dict[str, Any]]) -> str:
     header = (
-        "You are a policy assistant. Respond with JSON containing: "
-        "decision (allow|deny|require_condition|needs_more_info), "
-        "conditions (list of keys), evidence (list of clause_id).\n"
+        "You are a policy assistant. Respond with JSON only using this schema:\n"
+        '{ "decision": "allow|deny|require_condition|needs_more_info", '
+        '"conditions": ["KEY1", "KEY2"], '
+        '"evidence": ["C-..."], '
+        '"customer_message": "..." }\n'
+        "Use only the provided clauses as evidence.\n"
     )
     body = ["Ticket:", ticket, "", "Clauses:"]
     for clause in clauses:
@@ -112,6 +119,49 @@ def _build_prompt(ticket: str, clauses: List[Dict[str, Any]]) -> str:
     body.append("")
     body.append("Return JSON only.")
     return header + "\n".join(body)
+
+
+def _extract_conditions(*candidates: Any) -> List[str]:
+    conditions: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, list):
+            continue
+        for item in candidate:
+            key: Optional[str] = None
+            if isinstance(item, str):
+                key = item
+            elif isinstance(item, dict):
+                if "key" in item:
+                    key = str(item.get("key"))
+                elif "name" in item:
+                    key = str(item.get("name"))
+            if key and key not in seen:
+                conditions.append(key)
+                seen.add(key)
+    return conditions
+
+
+def _normalize_prediction(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        data = {}
+    decision = data.get("decision", "needs_more_info")
+    if decision not in ALLOWED_DECISIONS:
+        decision = "needs_more_info"
+    conditions = _extract_conditions(data.get("conditions"), data.get("required_conditions"))
+    evidence = data.get("evidence", []) or []
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence = [str(item) for item in evidence if isinstance(item, (str, int))]
+    customer_message = data.get("customer_message", "")
+    if not isinstance(customer_message, str):
+        customer_message = ""
+    return {
+        "decision": decision,
+        "conditions": conditions,
+        "evidence": evidence,
+        "customer_message": customer_message,
+    }
 
 
 def _parse_prediction(raw: str) -> Dict[str, Any]:
@@ -128,25 +178,18 @@ def _parse_prediction(raw: str) -> Dict[str, Any]:
                 data = json.loads(raw[start : end + 1])
             except json.JSONDecodeError:
                 data = {}
-    decision = data.get("decision", "needs_more_info")
-    conditions = data.get("conditions", []) or []
-    evidence = data.get("evidence", []) or []
-    if not isinstance(conditions, list):
-        conditions = []
-    if not isinstance(evidence, list):
-        evidence = []
-    return {"decision": decision, "conditions": conditions, "evidence": evidence}
+    return _normalize_prediction(data)
 
 
 def _build_goc_prompt(ticket: str, clauses: List[Dict[str, Any]], clause_ids: List[str]) -> str:
     header = (
-        "너는 정책 담당 에이전트. 아래 티켓을 처리해라.\n"
-        "아래 제공된 clauses 중에서만 근거를 선택할 것.\n"
-        "다음 JSON 스키마를 엄격히 준수해라:\n"
-        "decision: allow|deny|needs_more_info\n"
-        "required_conditions: list of {key, details}\n"
-        "evidence: list of clause_id (최소 2개, 제공된 clause_id 중에서만 선택)\n"
-        "customer_message: 1~3문장\n"
+        "You are a policy agent. Resolve the ticket below.\n"
+        "Use only the provided clauses as evidence.\n"
+        "Return JSON only using this schema:\n"
+        '{ "decision": "allow|deny|require_condition|needs_more_info", '
+        '"conditions": ["KEY1", "KEY2"], '
+        '"evidence": ["C-..."], '
+        '"customer_message": "..." }\n'
     )
     body = ["", "Ticket:", ticket, "", "Available clause_ids:", ", ".join(clause_ids), "", "Clauses:"]
     for clause in clauses:
@@ -181,37 +224,7 @@ def _parse_goc_prediction(raw: str, opened_ids: List[str]) -> Tuple[Dict[str, An
         except json.JSONDecodeError:
             return {}, "parse_error: invalid_json"
 
-    decision = data.get("decision", "needs_more_info") if isinstance(data, dict) else "needs_more_info"
-    if decision not in {"allow", "deny", "needs_more_info"}:
-        decision = "needs_more_info"
-
-    conditions: List[str] = []
-    if isinstance(data, dict) and isinstance(data.get("required_conditions"), list):
-        for item in data.get("required_conditions", []):
-            if isinstance(item, dict) and item.get("key"):
-                conditions.append(str(item["key"]))
-            elif isinstance(item, str):
-                conditions.append(item)
-    elif isinstance(data, dict) and isinstance(data.get("conditions"), list):
-        for item in data.get("conditions", []):
-            if isinstance(item, str):
-                conditions.append(item)
-
-    evidence = data.get("evidence", []) or [] if isinstance(data, dict) else []
-    if not isinstance(evidence, list):
-        evidence = []
-    customer_message = None
-    if isinstance(data, dict) and isinstance(data.get("customer_message"), str):
-        customer_message = data.get("customer_message")
-
-    prediction: Dict[str, Any] = {
-        "decision": decision,
-        "conditions": conditions,
-        "evidence": evidence,
-    }
-    if customer_message:
-        prediction["customer_message"] = customer_message
-
+    prediction = _normalize_prediction(data)
     return prediction, parse_error
 
 
@@ -261,15 +274,18 @@ def run_full_history(
 
 
 def run_goc_heuristic(
-    task: Any, env: PolicyOpsEnv, client: LLMClient
-) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None]:
+    task: Any,
+    env: PolicyOpsEnv,
+    client: LLMClient,
+    controller: Optional[Controller] = None,
+    controller_mode: str = "off",
+) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None]:
     errors: List[str] = []
     fallback_prediction = {
         "decision": "needs_more_info",
         "conditions": [],
-        "required_conditions": [],
         "evidence": [],
-        "customer_message": "I need a bit more information to proceed.",
+        "customer_message": "",
     }
     try:
         seed_results = env.search(task.user_ticket, top_k=20)
@@ -287,6 +303,17 @@ def run_goc_heuristic(
     for item in expanded_results:
         merged.setdefault(item["clause_id"], item)
 
+    controller_action: str | None = None
+    ordered_clause_ids: List[str] = []
+    if controller and controller_mode != "off":
+        context_features = controller.build_context_features(task.context, env.open_budget)
+        controller_action = controller.select_action(
+            context_features, explore=controller_mode == "train"
+        )
+        ordered_clause_ids = controller.rank_clause_ids(
+            controller_action, seed_results, expanded_results
+        )
+
     def score_item(item: Dict[str, Any]) -> Tuple[int, float]:
         snippet = item.get("snippet", "").lower()
         if any(word in snippet for word in ["effective", "supersede", "revoke", "update", "amend"]):
@@ -303,10 +330,13 @@ def run_goc_heuristic(
     opened: List[Dict[str, Any]] = []
     opened_ids: List[str] = []
     opened_set: set[str] = set()
-    for item in ranked:
+    if ordered_clause_ids:
+        ranked_ids = ordered_clause_ids
+    else:
+        ranked_ids = [item["clause_id"] for item in ranked]
+    for clause_id in ranked_ids:
         if len(opened_set) >= env.open_budget:
             break
-        clause_id = item["clause_id"]
         if clause_id in opened_set:
             continue
         try:
@@ -334,10 +364,32 @@ def run_goc_heuristic(
         prediction.setdefault("decision", "needs_more_info")
         prediction.setdefault("conditions", [])
         prediction.setdefault("evidence", [])
-        prediction.setdefault("customer_message", fallback_prediction["customer_message"])
+        prediction.setdefault("customer_message", "")
     except Exception as exc:  # noqa: BLE001 - defensive
         errors.append(f"generate_error: {exc}")
         prediction = dict(fallback_prediction)
 
+    if controller and controller_mode == "train" and controller_action:
+        gold_ids = set(task.gold.gold_evidence or [])
+        opened_id_set = set(opened_ids)
+        coverage = len(opened_id_set & gold_ids) / max(1, len(gold_ids))
+        bonus = 0.0
+        critical_kinds = {"update", "definition", "exception"}
+        gold_kinds = {
+            env.world.clauses[cid].kind
+            for cid in gold_ids
+            if cid in env.world.clauses and env.world.clauses[cid].kind in critical_kinds
+        }
+        for kind in gold_kinds:
+            if any(
+                env.world.clauses.get(cid) and env.world.clauses[cid].kind == kind
+                for cid in opened_id_set
+            ):
+                bonus += 0.1
+        penalty = -0.01 * len(opened_ids)
+        reward = coverage + bonus + penalty
+        context_features = controller.build_context_features(task.context, env.open_budget)
+        controller.update(controller_action, context_features, reward)
+
     error = "; ".join(errors) if errors else None
-    return prediction, opened_ids, prompt, raw_output, error
+    return prediction, opened_ids, prompt, raw_output, error, controller_action

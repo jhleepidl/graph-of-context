@@ -72,6 +72,22 @@ def aggregate_metrics(metrics: List[Dict[str, float]]) -> Dict[str, float]:
     return {key: mean([m[key] for m in metrics]) for key in keys}
 
 
+def gold_decision_distribution(tasks: List[Task]) -> Dict[str, int]:
+    dist: Dict[str, int] = {
+        "allow": 0,
+        "deny": 0,
+        "require_condition": 0,
+        "needs_more_info": 0,
+    }
+    for task in tasks:
+        decision = task.gold.decision
+        if decision in dist:
+            dist[decision] += 1
+        else:
+            dist[decision] = dist.get(decision, 0) + 1
+    return dist
+
+
 def save_report(path: Path, report: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2), encoding="utf-8")
