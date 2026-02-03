@@ -1835,6 +1835,59 @@ class ToolLoopLLMAgent:
             base += ' ; optional goc:{"step_notes":["..."]}.'
         return base
 
+    def _parse_commit_idx(self, raw, *, max_n: int = 0):
+        """Parse a commit index from int/str like 3, "3", "C3", "commit3"."""
+        if raw is None:
+            return None
+        try:
+            if isinstance(raw, bool):
+                return None
+            if isinstance(raw, int):
+                val = raw
+            elif isinstance(raw, float):
+                val = int(raw)
+            else:
+                s = str(raw).strip()
+                if not s:
+                    return None
+                m = re.search(r"(\d+)", s)
+                if not m:
+                    return None
+                val = int(m.group(1))
+        except Exception:
+            return None
+        if val <= 0:
+            return None
+        if int(max_n or 0) > 0 and val > int(max_n):
+            return None
+        return val
+
+    def _resolve_to_leaf_commit(self, node, *, max_n: int = 0, max_hops: int = 8):
+        """Resolve Ck/Mk/idx to a leaf commit index; loop-safe."""
+        seen = set()
+        cur = node
+        for _ in range(int(max_hops or 8)):
+            if cur is None:
+                return None
+            # Direct int or str -> parse
+            if isinstance(cur, (int, float, str)):
+                # For string nodes, distinguish merge ids (M*)
+                try:
+                    s = str(cur).strip().upper()
+                except Exception:
+                    s = ""
+                if s.startswith("M"):
+                    if s in seen:
+                        return None
+                    seen.add(s)
+                    nxt = self._committed_merge_winner_by_merge_id.get(s)
+                    cur = nxt
+                    continue
+                idx = self._parse_commit_idx(cur, max_n=max_n)
+                return idx
+            return None
+        return None
+
     def _build_system_prompt(self) -> str:
         base = (
             "You are an assistant that MUST use the provided tools.\n"
@@ -2512,20 +2565,28 @@ class ToolLoopLLMAgent:
                             stage_kind = "final"
                     except Exception:
                         stage_kind = None
+                    if stage_kind is None:
+                        try:
+                            st = self._goc_stage_tag(current_user_prompt or "")
+                            if st == "merge":
+                                stage_kind = "merge"
+                            elif st == "stage2":
+                                stage_kind = "final"
+                        except Exception:
+                            stage_kind = None
 
                     if stage_kind in {"merge", "final"}:
                         merge_ops = task_meta.get("multi_commit_merge_ops") if isinstance(task_meta.get("multi_commit_merge_ops"), list) else []
                         candidates = []
+                        try:
+                            mc_n = int(task_meta.get("multi_commit_n", 0) or 0)
+                        except Exception:
+                            mc_n = 0
                         if stage_kind == "merge" and merge_idx and merge_ops and (merge_idx - 1) < len(merge_ops):
                             _, left, right = merge_ops[merge_idx - 1]
                             for node in (left, right):
-                                cid = None
                                 try:
-                                    nid = str(node).strip().upper()
-                                    if nid.startswith("C"):
-                                        cid = int(nid[1:])
-                                    elif nid.startswith("M"):
-                                        cid = self._committed_merge_winner_by_merge_id.get(nid)
+                                    cid = self._resolve_to_leaf_commit(node, max_n=mc_n)
                                 except Exception:
                                     cid = None
                                 if cid:
@@ -2535,27 +2596,47 @@ class ToolLoopLLMAgent:
                             if merge_ops:
                                 _, left, right = merge_ops[-1]
                                 for node in (left, right):
-                                    cid = None
                                     try:
-                                        nid = str(node).strip().upper()
-                                        if nid.startswith("C"):
-                                            cid = int(nid[1:])
-                                        elif nid.startswith("M"):
-                                            cid = self._committed_merge_winner_by_merge_id.get(nid)
+                                        cid = self._resolve_to_leaf_commit(node, max_n=mc_n)
                                     except Exception:
                                         cid = None
                                     if cid:
                                         candidates.append(int(cid))
                             else:
-                                try:
-                                    mc_n = int(task_meta.get("multi_commit_n", 0) or 0)
-                                except Exception:
-                                    mc_n = 0
                                 candidates = [i for i in range(1, mc_n + 1)]
 
                         # Deduplicate while preserving order
                         seen = set()
                         candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+                        fallback_used = False
+                        fallback_reason = None
+                        candidates_before_fallback = len(candidates)
+
+                        # FINAL fallback: try resolving root merge id or leaf commits if missing
+                        if stage_kind == "final" and len(candidates) < 2:
+                            try:
+                                if merge_ops:
+                                    root_mid = merge_ops[-1][0]
+                                    cid = self._resolve_to_leaf_commit(root_mid, max_n=mc_n)
+                                    if cid and cid not in candidates:
+                                        candidates.append(int(cid))
+                                        fallback_used = True
+                                        fallback_reason = "root_merge_resolved"
+                            except Exception:
+                                pass
+                        if stage_kind == "final" and len(candidates) < 2:
+                            try:
+                                leafs = sorted([int(k) for k in self._committed_supporting_titles_by_commit.keys() if isinstance(k, int)])
+                            except Exception:
+                                leafs = []
+                            for cid in leafs:
+                                if len(candidates) >= 2:
+                                    break
+                                if cid not in candidates:
+                                    candidates.append(int(cid))
+                                    fallback_used = True
+                                    if not fallback_reason:
+                                        fallback_reason = "leaf_commit_fallback"
 
                         max_chars = int(task_meta.get("candidate_commit_max_chars", 900) or 900)
                         a1_max = int(task_meta.get("candidate_commit_a1_max_chars", 240) or 240)
@@ -2612,6 +2693,33 @@ class ToolLoopLLMAgent:
                                 })
                             except Exception:
                                 pass
+                            if fallback_used:
+                                try:
+                                    self._trace({
+                                        "type": "candidate_commits_injection_fallback",
+                                        "task_id": task_id,
+                                        "method": method,
+                                        "run_tag": run_tag,
+                                        "step": step,
+                                        "stage_kind": stage_kind,
+                                        "reason": fallback_reason or "unknown",
+                                        "candidates_before": int(candidates_before_fallback),
+                                        "candidates_after": int(len(candidates)),
+                                    })
+                                except Exception:
+                                    pass
+                    else:
+                        try:
+                            self._trace({
+                                "type": "candidate_commits_injection_skipped",
+                                "task_id": task_id,
+                                "method": method,
+                                "run_tag": run_tag,
+                                "step": step,
+                                "reason": "stage_not_detected",
+                            })
+                        except Exception:
+                            pass
 
                 # What we actually send to the model.
                 # By default (prompt_context_chars==0), include the full ACTIVE_CONTEXT as produced by the
@@ -3475,9 +3583,15 @@ class ToolLoopLLMAgent:
                                         merge_ops = _get_merge_ops()
                                         if merge_ops and (expected - 1) < len(merge_ops):
                                             merge_id = str(merge_ops[expected - 1][0]).upper()
-                                            winner_commit = int(payload.get("winner_commit", -1) or -1)
-                                            if merge_id.startswith("M") and winner_commit > 0:
-                                                self._committed_merge_winner_by_merge_id[merge_id] = winner_commit
+                                            raw_winner = (
+                                                payload.get("winner_commit")
+                                                or payload.get("selected_commit")
+                                                or payload.get("winner")
+                                                or payload.get("chosen_commit")
+                                            )
+                                            winner_commit = self._parse_commit_idx(raw_winner, max_n=mc_n)
+                                            if merge_id.startswith("M") and winner_commit:
+                                                self._committed_merge_winner_by_merge_id[merge_id] = int(winner_commit)
                                     except Exception:
                                         pass
                             # "return" can carry structured payloads (dict/list). Ensure we store a safe preview.
