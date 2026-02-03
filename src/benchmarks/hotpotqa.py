@@ -393,6 +393,10 @@ class HotpotQA(Benchmark):
         multi_commit_merge_plan = str(kwargs.get("multi_commit_merge_plan", "binary_tree") or "binary_tree").lower().strip()
         multi_commit_include_merges = bool(kwargs.get("multi_commit_include_merges", True))
         multi_commit_merge_closed_book = bool(kwargs.get("multi_commit_merge_closed_book", True))
+        inject_candidate_commits = bool(kwargs.get("inject_candidate_commits", True))
+        candidate_commit_max_chars = int(kwargs.get("candidate_commit_max_chars", 900))
+        candidate_commit_a1_max_chars = int(kwargs.get("candidate_commit_a1_max_chars", 240))
+        candidate_commit_title_max_chars = int(kwargs.get("candidate_commit_title_max_chars", 80))
         multi_commit_doc_shuffle = bool(kwargs.get("multi_commit_doc_shuffle", kwargs.get("multi_commit_shuffle", True)))
         # Optional: inject noise after EVERY commit (not just stage-1). Implemented in the agent.
         noise_nodes_after_commit = int(kwargs.get("noise_nodes_after_commit", 0))
@@ -603,9 +607,14 @@ class HotpotQA(Benchmark):
                         "multi_commit_n": int(mc_n),
                         "multi_commit_compose_rule": str(multi_commit_rule),
                         "multi_commit_merge_plan": str(multi_commit_merge_plan),
+                        "multi_commit_merge_ops": list(merge_ops),
                         "multi_commit_include_merges": bool(multi_commit_include_merges),
                         "multi_commit_doc_shuffle": bool(multi_commit_doc_shuffle),
                         "multi_commit_merge_closed_book": bool(multi_commit_merge_closed_book),
+                        "inject_candidate_commits": bool(inject_candidate_commits),
+                        "candidate_commit_max_chars": int(candidate_commit_max_chars),
+                        "candidate_commit_a1_max_chars": int(candidate_commit_a1_max_chars),
+                        "candidate_commit_title_max_chars": int(candidate_commit_title_max_chars),
                         "schema_autofix_commit_mismatch": bool(kwargs.get("schema_autofix_commit_mismatch", False)),
                         # GoC folding policy overrides
                         "goc_fold_policy": kwargs.get("goc_fold_policy", kwargs.get("fold_policy", None)),

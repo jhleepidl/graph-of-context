@@ -2094,6 +2094,7 @@ class ToolLoopLLMAgent:
         self._goc_commit_title_nids_by_commit = {}
         self._goc_commit_anchor_nid = None
         self._goc_commit_title_nids = {}
+        self._committed_merge_winner_by_merge_id = {}
         self._stage_final_unfold_done = False
         self._stage_commit_unfold_done = False
         self._stage_commit_unfold_done_for = set()
@@ -2491,6 +2492,126 @@ class ToolLoopLLMAgent:
                     self.counters["forced_unfold_errors"] += 1
                 # Stateless prompting: we DO NOT accumulate prior ACTIVE_CONTEXT in messages.
                 ctx = self.mem.get_active_text()
+
+                # Candidate commit injection for MERGE/FINAL (fair across methods).
+                try:
+                    inject_candidates = bool(task_meta.get("inject_candidate_commits", False))
+                except Exception:
+                    inject_candidates = False
+
+                if inject_candidates:
+                    stage_kind = None
+                    merge_idx = None
+                    try:
+                        up = (current_user_prompt or "")
+                        m_merge = re.search(r"\[MERGE\s+(\d+)\s*/\s*COMMIT\]", up)
+                        if m_merge:
+                            stage_kind = "merge"
+                            merge_idx = int(m_merge.group(1))
+                        elif "[FINAL" in up:
+                            stage_kind = "final"
+                    except Exception:
+                        stage_kind = None
+
+                    if stage_kind in {"merge", "final"}:
+                        merge_ops = task_meta.get("multi_commit_merge_ops") if isinstance(task_meta.get("multi_commit_merge_ops"), list) else []
+                        candidates = []
+                        if stage_kind == "merge" and merge_idx and merge_ops and (merge_idx - 1) < len(merge_ops):
+                            _, left, right = merge_ops[merge_idx - 1]
+                            for node in (left, right):
+                                cid = None
+                                try:
+                                    nid = str(node).strip().upper()
+                                    if nid.startswith("C"):
+                                        cid = int(nid[1:])
+                                    elif nid.startswith("M"):
+                                        cid = self._committed_merge_winner_by_merge_id.get(nid)
+                                except Exception:
+                                    cid = None
+                                if cid:
+                                    candidates.append(int(cid))
+                        elif stage_kind == "final":
+                            # Prefer last merge pair if available; otherwise fall back to leaf commits.
+                            if merge_ops:
+                                _, left, right = merge_ops[-1]
+                                for node in (left, right):
+                                    cid = None
+                                    try:
+                                        nid = str(node).strip().upper()
+                                        if nid.startswith("C"):
+                                            cid = int(nid[1:])
+                                        elif nid.startswith("M"):
+                                            cid = self._committed_merge_winner_by_merge_id.get(nid)
+                                    except Exception:
+                                        cid = None
+                                    if cid:
+                                        candidates.append(int(cid))
+                            else:
+                                try:
+                                    mc_n = int(task_meta.get("multi_commit_n", 0) or 0)
+                                except Exception:
+                                    mc_n = 0
+                                candidates = [i for i in range(1, mc_n + 1)]
+
+                        # Deduplicate while preserving order
+                        seen = set()
+                        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+                        max_chars = int(task_meta.get("candidate_commit_max_chars", 900) or 900)
+                        a1_max = int(task_meta.get("candidate_commit_a1_max_chars", 240) or 240)
+                        title_max = int(task_meta.get("candidate_commit_title_max_chars", 80) or 80)
+
+                        # Local formatter to avoid cross-function dependency
+                        def _format_candidate_block_local(cands):
+                            lines = ["[CANDIDATE_COMMITS]"]
+                            trunc = {"a1": False, "title": False}
+                            used = []
+                            for c in cands:
+                                titles = self._committed_supporting_titles_by_commit.get(c)
+                                a1 = self._committed_answers_by_commit.get(c)
+                                if not titles or not a1:
+                                    continue
+                                t_out = []
+                                for t in list(titles)[:2]:
+                                    ts = str(t).replace("\n", " ").strip()
+                                    if len(ts) > title_max:
+                                        ts = ts[:title_max]
+                                        trunc["title"] = True
+                                    t_out.append(ts)
+                                a1s = str(a1).replace("\n", " ").strip()
+                                if len(a1s) > a1_max:
+                                    a1s = a1s[:a1_max]
+                                    trunc["a1"] = True
+                                line = f"C{c}: titles={json.dumps(t_out)} ; a1={json.dumps(a1s)}"
+                                test = "\n".join(lines + [line, "[/CANDIDATE_COMMITS]"])
+                                if len(test) > max_chars:
+                                    break
+                                lines.append(line)
+                                used.append(int(c))
+                            if not used:
+                                return "", trunc, []
+                            lines.append("[/CANDIDATE_COMMITS]")
+                            return "\n".join(lines), trunc, used
+
+                        block, truncs, used = _format_candidate_block_local(candidates)
+                        if block:
+                            # Prepend inside ACTIVE_CONTEXT
+                            ctx = block + "\n" + ctx
+                            try:
+                                self._trace({
+                                    "type": "candidate_commits_injected",
+                                    "task_id": task_id,
+                                    "method": method,
+                                    "run_tag": run_tag,
+                                    "step": step,
+                                    "stage_kind": stage_kind,
+                                    "merge_step_idx": int(merge_idx) if merge_idx else None,
+                                    "candidate_indices": used,
+                                    "chars": len(block),
+                                    "truncations": truncs,
+                                })
+                            except Exception:
+                                pass
 
                 # What we actually send to the model.
                 # By default (prompt_context_chars==0), include the full ACTIVE_CONTEXT as produced by the
@@ -3220,6 +3341,12 @@ class ToolLoopLLMAgent:
                                 up_mc = (current_user_prompt or "")
                                 msub = _re.search(r"\[SUBTASK\s+(\d+)\s*/\s*COMMIT\]", up_mc)
                                 mmerge = _re.search(r"\[MERGE\s+(\d+)\s*/\s*COMMIT\]", up_mc)
+                                def _get_merge_ops():
+                                    ops = task_meta.get("multi_commit_merge_ops")
+                                    if isinstance(ops, list):
+                                        return ops
+                                    return []
+
                                 if msub:
                                     expected = int(msub.group(1))
                                     payload = _parse_payload(msg)
@@ -3343,6 +3470,16 @@ class ToolLoopLLMAgent:
                                             "payload_preview": (str(msg)[:200] if msg is not None else ""),
                                         })
                                         continue
+                                    # Store merge winner for downstream candidate resolution (M<idx> -> leaf commit)
+                                    try:
+                                        merge_ops = _get_merge_ops()
+                                        if merge_ops and (expected - 1) < len(merge_ops):
+                                            merge_id = str(merge_ops[expected - 1][0]).upper()
+                                            winner_commit = int(payload.get("winner_commit", -1) or -1)
+                                            if merge_id.startswith("M") and winner_commit > 0:
+                                                self._committed_merge_winner_by_merge_id[merge_id] = winner_commit
+                                    except Exception:
+                                        pass
                             # "return" can carry structured payloads (dict/list). Ensure we store a safe preview.
                             if msg is not None and msg != "":
                                 try:

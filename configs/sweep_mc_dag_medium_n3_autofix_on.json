@@ -55,7 +55,11 @@
       "multi_commit_compose_rule": "reduce_lex_min",
       "multi_commit_doc_shuffle": false,
       "multi_commit_merge_plan": "binary_tree",
-      "schema_autofix_commit_mismatch": true
+      "schema_autofix_commit_mismatch": true,
+      "inject_candidate_commits": true,
+      "candidate_commit_max_chars": 900,
+      "candidate_commit_a1_max_chars": 240,
+      "candidate_commit_title_max_chars": 80
     }
   },
   "runs": [
