@@ -12,6 +12,10 @@ Inject deterministic candidate commit summaries into MERGE/FINAL prompts to avoi
   - Resolve merge nodes recursively to leaf commits (loop-safe).
   - FINAL fallback: root merge winner, then leaf commits if candidates < 2.
   - Emit `candidate_commits_injection_fallback` and `candidate_commits_injection_skipped` when applicable.
+- Add deterministic sort keys for MERGE:
+  - Compute `key` from normalized a1 (deterministic, no LLM).
+  - Inject `key` in [CANDIDATE_COMMITS] and instruct MERGE to compare only keys.
+  - Track `merge_key_injection_count` and `merge_key_truncation_count` in summary_min.
 - Add benchmark knobs (defaults ON for multi-commit):
   - inject_candidate_commits
   - candidate_commit_max_chars

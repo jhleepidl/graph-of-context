@@ -55,6 +55,8 @@
       "multi_commit_doc_shuffle": false,
       "multi_commit_merge_plan": "binary_tree",
       "inject_candidate_commits": true,
+      "inject_candidate_commit_keys": true,
+      "candidate_commit_key_max_chars": 160,
       "candidate_commit_max_chars": 900,
       "candidate_commit_a1_max_chars": 240,
       "candidate_commit_title_max_chars": 80

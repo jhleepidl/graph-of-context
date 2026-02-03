@@ -394,9 +394,11 @@ class HotpotQA(Benchmark):
         multi_commit_include_merges = bool(kwargs.get("multi_commit_include_merges", True))
         multi_commit_merge_closed_book = bool(kwargs.get("multi_commit_merge_closed_book", True))
         inject_candidate_commits = bool(kwargs.get("inject_candidate_commits", True))
+        inject_candidate_commit_keys = bool(kwargs.get("inject_candidate_commit_keys", True))
         candidate_commit_max_chars = int(kwargs.get("candidate_commit_max_chars", 900))
         candidate_commit_a1_max_chars = int(kwargs.get("candidate_commit_a1_max_chars", 240))
         candidate_commit_title_max_chars = int(kwargs.get("candidate_commit_title_max_chars", 80))
+        candidate_commit_key_max_chars = int(kwargs.get("candidate_commit_key_max_chars", 160))
         multi_commit_doc_shuffle = bool(kwargs.get("multi_commit_doc_shuffle", kwargs.get("multi_commit_shuffle", True)))
         # Optional: inject noise after EVERY commit (not just stage-1). Implemented in the agent.
         noise_nodes_after_commit = int(kwargs.get("noise_nodes_after_commit", 0))
@@ -549,6 +551,9 @@ class HotpotQA(Benchmark):
                     msg = (
                         f"[MERGE {mi} / COMMIT] You must MERGE {left} vs {right} under the SAME deterministic rule.\n"
                         "Do NOT restate earlier answers/titles. Use ONLY your previously committed information.\n"
+                        "Compare ONLY the candidate key values in [CANDIDATE_COMMITS].\n"
+                        "Choose the lexicographically smallest key (ASCII order).\n"
+                        "Do NOT compare the a1 field; compare only key.\n"
                         f"CALL the `return` tool with args.message: {{\"merge\":{mi},\"left\":\"{left}\",\"right\":\"{right}\",\"winner_commit\":<1..{mc_n}>}}\n"
                         f"Example tool call: {{\"tool\":\"return\",\"args\":{{\"message\":{{\"merge\":{mi},\"left\":\"{left}\",\"right\":\"{right}\",\"winner_commit\":1}}}}}}"
                     )
@@ -611,11 +616,13 @@ class HotpotQA(Benchmark):
                         "multi_commit_include_merges": bool(multi_commit_include_merges),
                         "multi_commit_doc_shuffle": bool(multi_commit_doc_shuffle),
                         "multi_commit_merge_closed_book": bool(multi_commit_merge_closed_book),
-                        "inject_candidate_commits": bool(inject_candidate_commits),
-                        "candidate_commit_max_chars": int(candidate_commit_max_chars),
-                        "candidate_commit_a1_max_chars": int(candidate_commit_a1_max_chars),
-                        "candidate_commit_title_max_chars": int(candidate_commit_title_max_chars),
-                        "schema_autofix_commit_mismatch": bool(kwargs.get("schema_autofix_commit_mismatch", False)),
+                    "inject_candidate_commits": bool(inject_candidate_commits),
+                    "inject_candidate_commit_keys": bool(inject_candidate_commit_keys),
+                    "candidate_commit_max_chars": int(candidate_commit_max_chars),
+                    "candidate_commit_a1_max_chars": int(candidate_commit_a1_max_chars),
+                    "candidate_commit_title_max_chars": int(candidate_commit_title_max_chars),
+                    "candidate_commit_key_max_chars": int(candidate_commit_key_max_chars),
+                    "schema_autofix_commit_mismatch": bool(kwargs.get("schema_autofix_commit_mismatch", False)),
                         # GoC folding policy overrides
                         "goc_fold_policy": kwargs.get("goc_fold_policy", kwargs.get("fold_policy", None)),
                         "goc_phase_end_fold": kwargs.get("goc_phase_end_fold", None),

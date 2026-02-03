@@ -1862,6 +1862,38 @@ class ToolLoopLLMAgent:
             return None
         return val
 
+    def _normalize_sort_key(self, text: str, *, max_chars: int = 160) -> Tuple[str, bool]:
+        """Deterministic normalization for merge key comparisons."""
+        if text is None:
+            return "", False
+        s = str(text).replace("\n", " ").strip()
+        if not s:
+            return "", False
+        truncated = False
+        # First sentence or first max_chars (pre-normalization)
+        try:
+            m = re.search(r"[.!?]", s)
+            if m:
+                s = s[: m.start()]
+        except Exception:
+            pass
+        if len(s) > int(max_chars or 160):
+            s = s[: int(max_chars or 160)]
+            truncated = True
+        # Normalize
+        try:
+            s = s.lower()
+            s = re.sub(r"\s+", " ", s)
+            s = s.strip(" \t\n\r\"'`.,;:!?")
+            if s.endswith("."):
+                s = s[:-1].rstrip()
+        except Exception:
+            pass
+        if len(s) > int(max_chars or 160):
+            s = s[: int(max_chars or 160)]
+            truncated = True
+        return s, truncated
+
     def _resolve_to_leaf_commit(self, node, *, max_n: int = 0, max_hops: int = 8):
         """Resolve Ck/Mk/idx to a leaf commit index; loop-safe."""
         seen = set()
@@ -2553,6 +2585,10 @@ class ToolLoopLLMAgent:
                     inject_candidates = False
 
                 if inject_candidates:
+                    try:
+                        inject_keys = bool(task_meta.get("inject_candidate_commit_keys", True))
+                    except Exception:
+                        inject_keys = True
                     stage_kind = None
                     merge_idx = None
                     try:
@@ -2641,17 +2677,25 @@ class ToolLoopLLMAgent:
                         max_chars = int(task_meta.get("candidate_commit_max_chars", 900) or 900)
                         a1_max = int(task_meta.get("candidate_commit_a1_max_chars", 240) or 240)
                         title_max = int(task_meta.get("candidate_commit_title_max_chars", 80) or 80)
+                        key_max = int(task_meta.get("candidate_commit_key_max_chars", 160) or 160)
 
                         # Local formatter to avoid cross-function dependency
                         def _format_candidate_block_local(cands):
                             lines = ["[CANDIDATE_COMMITS]"]
-                            trunc = {"a1": False, "title": False}
+                            trunc = {"a1": False, "title": False, "key": False}
                             used = []
+                            keys = []
                             for c in cands:
                                 titles = self._committed_supporting_titles_by_commit.get(c)
                                 a1 = self._committed_answers_by_commit.get(c)
                                 if not titles or not a1:
                                     continue
+                                key = ""
+                                key_trunc = False
+                                if inject_keys:
+                                    key, key_trunc = self._normalize_sort_key(str(a1), max_chars=key_max)
+                                    if key_trunc:
+                                        trunc["key"] = True
                                 t_out = []
                                 for t in list(titles)[:2]:
                                     ts = str(t).replace("\n", " ").strip()
@@ -2663,22 +2707,47 @@ class ToolLoopLLMAgent:
                                 if len(a1s) > a1_max:
                                     a1s = a1s[:a1_max]
                                     trunc["a1"] = True
-                                line = f"C{c}: titles={json.dumps(t_out)} ; a1={json.dumps(a1s)}"
+                                if inject_keys:
+                                    line = f"C{c}: key={json.dumps(key)} ; titles={json.dumps(t_out)} ; a1={json.dumps(a1s)}"
+                                else:
+                                    line = f"C{c}: titles={json.dumps(t_out)} ; a1={json.dumps(a1s)}"
                                 test = "\n".join(lines + [line, "[/CANDIDATE_COMMITS]"])
                                 if len(test) > max_chars:
-                                    break
+                                    # Prefer keeping key, drop a1 if needed.
+                                    if inject_keys:
+                                        line_key_only = f"C{c}: key={json.dumps(key)} ; titles={json.dumps(t_out)} ; a1=\"\""
+                                        test_key_only = "\n".join(lines + [line_key_only, "[/CANDIDATE_COMMITS]"])
+                                        if len(test_key_only) > max_chars:
+                                            break
+                                        line = line_key_only
+                                        trunc["a1"] = True
+                                    else:
+                                        break
                                 lines.append(line)
                                 used.append(int(c))
+                                if inject_keys:
+                                    keys.append(str(key))
                             if not used:
                                 return "", trunc, []
                             lines.append("[/CANDIDATE_COMMITS]")
-                            return "\n".join(lines), trunc, used
+                            return "\n".join(lines), trunc, used, keys
 
-                        block, truncs, used = _format_candidate_block_local(candidates)
+                        block, truncs, used, used_keys = _format_candidate_block_local(candidates)
                         if block:
                             # Prepend inside ACTIVE_CONTEXT
                             ctx = block + "\n" + ctx
                             try:
+                                event_keys = []
+                                key_truncated = False
+                                if inject_keys:
+                                    for k in used_keys:
+                                        ks = str(k)
+                                        if len(ks) > 80:
+                                            ks = ks[:80]
+                                            key_truncated = True
+                                        event_keys.append(ks)
+                                    if truncs.get("key"):
+                                        key_truncated = True
                                 self._trace({
                                     "type": "candidate_commits_injected",
                                     "task_id": task_id,
@@ -2690,6 +2759,8 @@ class ToolLoopLLMAgent:
                                     "candidate_indices": used,
                                     "chars": len(block),
                                     "truncations": truncs,
+                                    "keys": event_keys if inject_keys else [],
+                                    "key_truncated": bool(key_truncated) if inject_keys else False,
                                 })
                             except Exception:
                                 pass

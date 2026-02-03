@@ -80,6 +80,8 @@ def _scan_trace_files(trace_files: List[Path]) -> Tuple[
     int,
     Dict[Tuple[str, str], int],
     Dict[Tuple[str, str], Dict[str, int]],
+    Dict[Tuple[str, str], int],
+    Dict[Tuple[str, str], int],
 ]:
     trace_map: Dict[Tuple[str, str], Path] = {}
     return_blocked_map: Dict[Tuple[str, str], int] = {}
@@ -87,6 +89,8 @@ def _scan_trace_files(trace_files: List[Path]) -> Tuple[
     auto_inject_total = 0
     autofix_map: Dict[Tuple[str, str], int] = {}
     schema_error_map: Dict[Tuple[str, str], Dict[str, int]] = {}
+    key_inject_map: Dict[Tuple[str, str], int] = {}
+    key_trunc_map: Dict[Tuple[str, str], int] = {}
 
     for p in trace_files:
         method = None
@@ -94,6 +98,8 @@ def _scan_trace_files(trace_files: List[Path]) -> Tuple[
         return_blocked = 0
         autofix = 0
         schema_errors: Dict[str, int] = {}
+        key_inject = 0
+        key_trunc = 0
         saw_finish = False
         for ev in _iter_jsonl(p):
             if method is None:
@@ -111,6 +117,10 @@ def _scan_trace_files(trace_files: List[Path]) -> Tuple[
                 saw_finish = True
             if ev.get("type") == "user_turn_injected" and ev.get("reason") == "auto":
                 auto_inject_total += 1
+            if ev.get("type") == "candidate_commits_injected":
+                key_inject += 1
+                if bool(ev.get("key_truncated")):
+                    key_trunc += 1
 
         if method is None or task_id is None:
             stem = p.stem
@@ -128,8 +138,12 @@ def _scan_trace_files(trace_files: List[Path]) -> Tuple[
                 autofix_map[key] = int(autofix)
             if schema_errors:
                 schema_error_map[key] = dict(schema_errors)
+            if key_inject:
+                key_inject_map[key] = int(key_inject)
+            if key_trunc:
+                key_trunc_map[key] = int(key_trunc)
 
-    return trace_map, return_blocked_map, finish_map, auto_inject_total, autofix_map, schema_error_map
+    return trace_map, return_blocked_map, finish_map, auto_inject_total, autofix_map, schema_error_map, key_inject_map, key_trunc_map
 
 
 def _collect_result_rows(out_dir: Path, runner: str) -> List[Dict[str, Any]]:
@@ -180,7 +194,16 @@ def _build_summary_min(exp_id: str, out_dir: Path, runner: str) -> Tuple[
 ]:
     rows = _collect_result_rows(out_dir, runner)
     trace_files = _collect_trace_files(out_dir)
-    trace_map, return_blocked_map, finish_map, auto_inject_total, autofix_map, schema_error_map = _scan_trace_files(trace_files)
+    (
+        trace_map,
+        return_blocked_map,
+        finish_map,
+        auto_inject_total,
+        autofix_map,
+        schema_error_map,
+        key_inject_map,
+        key_trunc_map,
+    ) = _scan_trace_files(trace_files)
 
     by_method: Dict[str, Dict[str, Any]] = {}
     total_tasks_by_method: Dict[str, int] = {}
@@ -198,6 +221,8 @@ def _build_summary_min(exp_id: str, out_dir: Path, runner: str) -> Tuple[
                 "return_blocked": [],
                 "schema_autofix": 0,
                 "schema_error_counts": {},
+                "merge_key_inject": 0,
+                "merge_key_trunc": 0,
                 "completion": 0,
                 "correct": 0,
                 "total": 0,
@@ -255,6 +280,10 @@ def _build_summary_min(exp_id: str, out_dir: Path, runner: str) -> Tuple[
         if key in schema_error_map:
             for k, v in schema_error_map.get(key, {}).items():
                 stats["schema_error_counts"][k] = stats["schema_error_counts"].get(k, 0) + int(v or 0)
+        if key in key_inject_map:
+            stats["merge_key_inject"] += int(key_inject_map.get(key, 0) or 0)
+        if key in key_trunc_map:
+            stats["merge_key_trunc"] += int(key_trunc_map.get(key, 0) or 0)
 
         fail_reason = _infer_fail_reason(row, rb)
         if fail_reason:
@@ -283,6 +312,8 @@ def _build_summary_min(exp_id: str, out_dir: Path, runner: str) -> Tuple[
             "max_return_blocked": max_return_blocked,
             "schema_autofix_commit_mismatch_count": int(stats["schema_autofix"]),
             "schema_error_type_counts": stats["schema_error_counts"],
+            "merge_key_injection_count": int(stats["merge_key_inject"]),
+            "merge_key_truncation_count": int(stats["merge_key_trunc"]),
             "fail_counts": stats["fail_counts"],
         }
 
