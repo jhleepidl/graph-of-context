@@ -44,6 +44,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
     tool_calls: List[int] = []
     open_calls: List[int] = []
     prompt_tokens: List[int] = []
+    records: List[Dict[str, Any]] = []
 
     for task in tasks:
         env = PolicyOpsEnv(
@@ -52,11 +53,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
             open_budget=task.budgets.get("open_budget", 5),
         )
         if args.method == "topk":
-            pred, prompt, _ = run_topk_rag(task, env, client)
+            pred, opened_ids, prompt = run_topk_rag(task, env, client)
         elif args.method == "full":
-            pred, prompt, _ = run_full_history(task, env, client)
+            pred, opened_ids, prompt = run_full_history(task, env, client)
         elif args.method == "goc":
-            pred, prompt, _ = run_goc_heuristic(task, env)
+            pred, opened_ids, prompt = run_goc_heuristic(task, env, client)
         else:
             raise ValueError(f"Unknown method: {args.method}")
 
@@ -64,6 +65,15 @@ def cmd_eval(args: argparse.Namespace) -> None:
         tool_calls.append(env.tool_call_count)
         open_calls.append(env.open_count)
         prompt_tokens.append(len(prompt.split()) if prompt else 0)
+        records.append(
+            {
+                "task_id": task.task_id,
+                "method": args.method,
+                "opened_clause_ids": opened_ids,
+                "tool_calls": env.tool_call_count,
+                "open_calls": env.open_count,
+            }
+        )
 
     aggregate = aggregate_metrics(metrics)
     report = {
@@ -77,6 +87,9 @@ def cmd_eval(args: argparse.Namespace) -> None:
             "open_calls_avg": sum(open_calls) / len(open_calls) if open_calls else 0.0,
             "prompt_tokens_avg": sum(prompt_tokens) / len(prompt_tokens) if prompt_tokens else 0.0,
         },
+        "tool_calls": sum(tool_calls),
+        "open_calls": sum(open_calls),
+        "records": records,
     }
 
     run_dir = Path(base_dir) / "runs" / args.method

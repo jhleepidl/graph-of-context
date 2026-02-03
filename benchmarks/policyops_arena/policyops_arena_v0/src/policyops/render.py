@@ -60,10 +60,45 @@ def render_clause_text(
         return override_hint
 
     if kind == "update":
-        line1 = f"Effective immediately, this notice supersedes prior guidance on {slot_text}."
-        line2 = "Use this update when prior documents conflict or are outdated."
-        line3 = " ".join(scope_parts) if scope_parts else "Scope matches the affected programs."
-        return f"{line1} {line2} {line3}"
+        scope_summary = " ".join(scope_parts) if scope_parts else "All regions and tiers."
+        if decision == "allow":
+            if conditions:
+                line1 = (
+                    f"Effective immediately, this update clarifies that {slot_text} is permitted "
+                    f"under the following conditions: {', '.join(conditions)}."
+                )
+            else:
+                line1 = (
+                    f"Effective immediately, this update clarifies that {slot_text} is permitted "
+                    "without additional conditions."
+                )
+            line2 = "This update replaces prior guidance and should be followed going forward."
+            line3 = scope_summary
+        elif decision == "deny":
+            line1 = (
+                f"Effective immediately, this update states that {slot_text} is not permitted "
+                f"for the following scope: {scope_summary}"
+            )
+            line2 = "This update replaces prior guidance and should be followed going forward."
+            line3 = ""
+        elif decision == "require_condition":
+            if conditions:
+                line1 = (
+                    f"Effective immediately, {slot_text} is permitted only if the following "
+                    f"requirements are met: {', '.join(conditions)}."
+                )
+            else:
+                line1 = (
+                    f"Effective immediately, {slot_text} is permitted only if additional "
+                    "requirements are met."
+                )
+            line2 = "This update replaces prior guidance and should be followed going forward."
+            line3 = scope_summary
+        else:
+            line1 = f"Effective immediately, this update revises prior guidance on {slot_text}."
+            line2 = "Follow this update when prior documents conflict or are outdated."
+            line3 = scope_summary
+        return " ".join([part for part in [line1, line2, line3] if part])
 
     if kind == "exception":
         line1 = f"This is an exception to the general rule about {slot_text}."

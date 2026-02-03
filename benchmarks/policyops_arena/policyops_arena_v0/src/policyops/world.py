@@ -44,16 +44,34 @@ def evaluate_context(
     if not active:
         return "needs_more_info", [], [], debug
 
+    # Pre-update competitive pool for evidence checks.
+    pre_update_active = list(active)
+    pre_update_overridden: set[str] = set()
+    pre_update_ids = {clause.clause_id for clause in pre_update_active}
+    for clause in pre_update_active:
+        for target in clause.targets.get("overrides", []):
+            if target in pre_update_ids:
+                pre_update_overridden.add(target)
+    pre_update_pool = [
+        clause
+        for clause in pre_update_active
+        if clause.clause_id not in pre_update_overridden and clause.kind != "procedure"
+    ]
+    pre_update_pool_ids = {clause.clause_id for clause in pre_update_pool}
+
     # Remove revoked clauses via updates.
     revoked: set[str] = set()
     update_clauses = [
         clause for clause in active if clause.kind == "update" and clause.targets.get("revokes")
     ]
+    updates_affecting: List[Clause] = []
     for clause in update_clauses:
-        for target in clause.targets.get("revokes", []):
-            revoked.add(target)
-    if revoked:
-        debug["used_updates"] = [c.clause_id for c in update_clauses if set(c.targets.get("revokes", [])) & revoked]
+        targets = set(clause.targets.get("revokes", []))
+        if targets & pre_update_pool_ids:
+            updates_affecting.append(clause)
+        revoked.update(targets)
+    if updates_affecting:
+        debug["used_updates"] = [c.clause_id for c in updates_affecting]
     active = [clause for clause in active if clause.clause_id not in revoked]
 
     # Apply exception overrides.
@@ -72,11 +90,7 @@ def evaluate_context(
     if not active:
         return "needs_more_info", [], [], debug
 
-    supplemental = [
-        clause
-        for clause in active
-        if clause.kind == "procedure" or clause.effect.get("decision") == "require_condition"
-    ]
+    supplemental = [clause for clause in active if clause.kind == "procedure"]
     primary = [clause for clause in active if clause not in supplemental]
     if not primary:
         primary = list(active)
@@ -115,15 +129,16 @@ def evaluate_context(
             evidence.append(target)
 
     # Include updates that revoked competing clauses.
-    for clause in update_clauses:
+    for clause in updates_affecting:
         if clause.clause_id not in evidence:
             evidence.append(clause.clause_id)
 
-    # Include priority clause evidence if used.
+    # Include priority clause evidence only if priority tie-breaker applied.
     if debug.get("used_priority"):
-        for clause_id in world.meta.get("priority_clause_ids", []):
-            if clause_id not in evidence:
-                evidence.append(clause_id)
+        priority_ids = world.meta.get("priority_clause_ids", [])
+        if priority_ids:
+            if priority_ids[0] not in evidence:
+                evidence.append(priority_ids[0])
 
     # Include definition clauses for terms used.
     term_definitions = world.meta.get("term_definitions", {})
