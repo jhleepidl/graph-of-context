@@ -18,6 +18,9 @@ class PolicyOpsEnv:
         self.tool_call_count = 0
         self.open_count = 0
         self._doc_by_id = {doc.doc_id: doc for doc in world.documents}
+        self.last_search_results: List[Dict[str, Any]] = []
+        self.last_search_query: Optional[str] = None
+        self.last_search_top_k: Optional[int] = None
 
     def reset_budgets(self, tool_call_budget: int, open_budget: int) -> None:
         self.tool_call_budget = tool_call_budget
@@ -34,7 +37,11 @@ class PolicyOpsEnv:
         self, query: str, filters: Optional[Dict[str, Any]] = None, top_k: int = 10
     ) -> List[Dict[str, Any]]:
         self._consume_tool()
-        return self.index.search(query=query, filters=filters, top_k=top_k)
+        results = self.index.search(query=query, filters=filters, top_k=top_k)
+        self.last_search_results = list(results)
+        self.last_search_query = query
+        self.last_search_top_k = top_k
+        return results
 
     def open(self, clause_id: str) -> Dict[str, Any]:
         self._consume_tool()

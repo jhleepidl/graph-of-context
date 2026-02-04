@@ -6,9 +6,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-UPDATE_KW = ["effective", "supersede", "revoke", "update", "amend"]
+UPDATE_KW = ["effective immediately", "supersede", "revoke", "prior guidance", "amend"]
+COND_KW = ["allowed only after", "conditions:", "provided that", "must", "require"]
 DEF_KW = ["definition", "means", "for the purposes of"]
-EXC_KW = ["except", "unless", "however", "provided that"]
+EXC_KW = ["except", "unless", "however"]
+
+KEYWORD_WEIGHTS = {
+    "update": 3.0,
+    "condition": 2.5,
+    "definition": 2.0,
+    "exception": 1.5,
+}
 
 
 def _keyword_hit(snippet: str, keywords: List[str]) -> bool:
@@ -43,6 +51,9 @@ class Controller:
             "exception_first",
             "recency_biased",
             "balanced",
+            "alpha_0_2",
+            "alpha_0_5",
+            "alpha_0_8",
         ]
     )
     epsilon: float = 0.1
@@ -63,17 +74,49 @@ class Controller:
             context_features.get("purpose"),
             context_features.get("data_type"),
             str(context_features.get("open_budget")),
+            str(context_features.get("top1_score")),
+            str(context_features.get("top5_mean")),
+            str(context_features.get("score_gap")),
+            str(context_features.get("top5_update_hits")),
+            str(context_features.get("top5_condition_hits")),
+            str(context_features.get("top5_definition_hits")),
+            str(context_features.get("top5_exception_hits")),
         ]
         return "|".join([str(p) for p in parts])
 
-    def build_context_features(self, task_context: Dict[str, Any], open_budget: int) -> Dict[str, Any]:
-        return {
+    def build_context_features(
+        self,
+        task_context: Dict[str, Any],
+        open_budget: int,
+        search_stats: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        base = {
             "slot": task_context.get("slot"),
             "region": task_context.get("region"),
             "tier": task_context.get("tier"),
             "purpose": task_context.get("purpose"),
             "data_type": task_context.get("data_type"),
             "open_budget": open_budget,
+        }
+        if search_stats:
+            base.update(search_stats)
+        return base
+
+    def compute_search_stats(self, seed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        scores = [float(item.get("score", 0.0)) for item in seed_results]
+        top1 = scores[0] if scores else 0.0
+        top5 = scores[:5]
+        top5_mean = sum(top5) / len(top5) if top5 else 0.0
+        score_gap = top1 - top5_mean
+        top5_items = seed_results[:5]
+        return {
+            "top1_score": round(top1, 4),
+            "top5_mean": round(top5_mean, 4),
+            "score_gap": round(score_gap, 4),
+            "top5_update_hits": sum(1 for item in top5_items if _keyword_hit(str(item.get("snippet", "")).lower(), UPDATE_KW)),
+            "top5_condition_hits": sum(1 for item in top5_items if _keyword_hit(str(item.get("snippet", "")).lower(), COND_KW)),
+            "top5_definition_hits": sum(1 for item in top5_items if _keyword_hit(str(item.get("snippet", "")).lower(), DEF_KW)),
+            "top5_exception_hits": sum(1 for item in top5_items if _keyword_hit(str(item.get("snippet", "")).lower(), EXC_KW)),
         }
 
     def select_action(self, context_features: Dict[str, Any], explore: bool = True) -> str:
@@ -114,8 +157,15 @@ class Controller:
             snippet = str(item.get("snippet", "")).lower()
             base_score = float(item.get("score", 0.0))
             update_hit = _keyword_hit(snippet, UPDATE_KW)
+            cond_hit = _keyword_hit(snippet, COND_KW)
             def_hit = _keyword_hit(snippet, DEF_KW)
             exc_hit = _keyword_hit(snippet, EXC_KW)
+            keyword_priority = (
+                (KEYWORD_WEIGHTS["update"] if update_hit else 0.0)
+                + (KEYWORD_WEIGHTS["condition"] if cond_hit else 0.0)
+                + (KEYWORD_WEIGHTS["definition"] if def_hit else 0.0)
+                + (KEYWORD_WEIGHTS["exception"] if exc_hit else 0.0)
+            )
 
             if action == "update_first":
                 bonus = (3.0 if update_hit else 0.0) + (1.0 if def_hit else 0.0) + (1.0 if exc_hit else 0.0)
@@ -128,7 +178,15 @@ class Controller:
             else:  # balanced
                 bonus = (2.0 if update_hit else 0.0) + (1.5 if def_hit else 0.0) + (1.0 if exc_hit else 0.0)
 
-            ranked.append((base_score + bonus, clause_id))
+            if action.startswith("alpha_"):
+                try:
+                    alpha = float(action.split("_", 1)[1].replace("_", "."))
+                except ValueError:
+                    alpha = 0.5
+                score = alpha * base_score + (1.0 - alpha) * keyword_priority
+            else:
+                score = base_score + bonus
+            ranked.append((score, clause_id))
 
         ranked.sort(key=lambda item: item[0], reverse=True)
         return [clause_id for _, clause_id in ranked]
@@ -148,6 +206,9 @@ class Controller:
                 "exception_first",
                 "recency_biased",
                 "balanced",
+                "alpha_0_2",
+                "alpha_0_5",
+                "alpha_0_8",
             ]
             stats = data.get("stats", {})
             ctrl = cls(actions=actions, epsilon=float(data.get("epsilon", epsilon)), stats=stats)

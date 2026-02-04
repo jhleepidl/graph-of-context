@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .env import PolicyOpsEnv
 from .controller import Controller
+from .world import evaluate_context
 
 ALLOWED_DECISIONS = {"allow", "deny", "require_condition", "needs_more_info"}
 
@@ -104,6 +105,16 @@ class OpenAIClient(LLMClient):
                 return msg["content"]
         return ""
 
+
+def run_engine_oracle(task: Any, env: PolicyOpsEnv) -> Dict[str, Any]:
+    decision, conditions, evidence, _ = evaluate_context(env.world, task.context)
+    return {
+        "decision": decision,
+        "conditions": conditions,
+        "evidence": evidence,
+        "customer_message": "",
+    }
+
 def _build_prompt(ticket: str, clauses: List[Dict[str, Any]]) -> str:
     header = (
         "You are a policy assistant. Respond with JSON only using this schema:\n"
@@ -119,6 +130,23 @@ def _build_prompt(ticket: str, clauses: List[Dict[str, Any]]) -> str:
     body.append("")
     body.append("Return JSON only.")
     return header + "\n".join(body)
+
+
+def _enrich_search_results(env: PolicyOpsEnv, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+    for item in results:
+        clause_id = item.get("clause_id")
+        clause = env.world.clauses.get(clause_id) if clause_id else None
+        enriched.append(
+            {
+                **item,
+                "kind": clause.kind if clause else None,
+                "slot": clause.slot if clause else None,
+                "published_at": clause.published_at if clause else None,
+                "authority": clause.authority if clause else None,
+            }
+        )
+    return enriched
 
 
 def _extract_conditions(*candidates: Any) -> List[str]:
@@ -229,9 +257,9 @@ def _parse_goc_prediction(raw: str, opened_ids: List[str]) -> Tuple[Dict[str, An
 
 
 def run_topk_rag(
-    task: Any, env: PolicyOpsEnv, client: LLMClient
-) -> Tuple[Dict[str, Any], List[str], str, str | None]:
-    results = env.search(task.user_ticket, top_k=10)
+    task: Any, env: PolicyOpsEnv, client: LLMClient, primary_top_k: int = 20
+) -> Tuple[Dict[str, Any], List[str], str, str | None, Dict[str, Any]]:
+    results = env.search(task.user_ticket, top_k=primary_top_k)
     opened: List[Dict[str, Any]] = []
     opened_ids: List[str] = []
     for item in results:
@@ -243,15 +271,21 @@ def run_topk_rag(
     prompt = _build_prompt(task.user_ticket, opened)
     raw = client.generate(prompt)
     prediction = _parse_prediction(raw)
-    return prediction, opened_ids, prompt, raw
+    diag = {
+        "primary_search_results": _enrich_search_results(env, results),
+        "primary_search_top_k": primary_top_k,
+        "primary_search_query": task.user_ticket,
+    }
+    return prediction, opened_ids, prompt, raw, diag
 
 
 def run_full_history(
-    task: Any, env: PolicyOpsEnv, client: LLMClient
-) -> Tuple[Dict[str, Any], List[str], str, str | None]:
-    results = env.search(task.user_ticket, top_k=10)
+    task: Any, env: PolicyOpsEnv, client: LLMClient, primary_top_k: int = 20
+) -> Tuple[Dict[str, Any], List[str], str, str | None, Dict[str, Any]]:
+    primary_results = env.search(task.user_ticket, top_k=primary_top_k)
     expanded_query = f"{task.user_ticket} update supersede exception definition"
-    results += env.search(expanded_query, top_k=10)
+    expanded_results = env.search(expanded_query, top_k=primary_top_k)
+    results = list(primary_results) + list(expanded_results)
 
     seen = set()
     opened: List[Dict[str, Any]] = []
@@ -270,7 +304,83 @@ def run_full_history(
     prompt = _build_prompt(task.user_ticket, opened)
     raw = client.generate(prompt)
     prediction = _parse_prediction(raw)
-    return prediction, opened_ids, prompt, raw
+    diag = {
+        "primary_search_results": _enrich_search_results(env, primary_results),
+        "primary_search_top_k": primary_top_k,
+        "primary_search_query": task.user_ticket,
+        "secondary_search_results": _enrich_search_results(env, expanded_results),
+        "secondary_search_query": expanded_query,
+    }
+    return prediction, opened_ids, prompt, raw, diag
+
+
+def run_oracle(
+    task: Any, env: PolicyOpsEnv, client: LLMClient, primary_top_k: int = 20
+) -> Tuple[Dict[str, Any], List[str], str, str | None, Dict[str, Any]]:
+    gold_ids = list(task.gold.gold_evidence or [])
+    opened: List[Dict[str, Any]] = []
+    opened_ids: List[str] = []
+    opened_set: set[str] = set()
+    used_search_fallback = False
+
+    for clause_id in gold_ids:
+        if len(opened_ids) >= env.open_budget:
+            break
+        if clause_id in opened_set:
+            continue
+        try:
+            clause = env.open(clause_id)
+        except RuntimeError as exc:
+            if "budget" in str(exc):
+                break
+            continue
+        except Exception:
+            continue
+        opened.append(clause)
+        opened_ids.append(clause["clause_id"])
+        opened_set.add(clause["clause_id"])
+
+    primary_results: List[Dict[str, Any]] = []
+    if len(opened_ids) < env.open_budget:
+        try:
+            results = env.search(task.user_ticket, top_k=primary_top_k)
+            used_search_fallback = True
+        except Exception:
+            results = []
+        primary_results = results
+        for item in results:
+            if len(opened_ids) >= env.open_budget:
+                break
+            clause_id = item.get("clause_id")
+            if not clause_id or clause_id in opened_set:
+                continue
+            try:
+                clause = env.open(clause_id)
+            except RuntimeError as exc:
+                if "budget" in str(exc):
+                    break
+                continue
+            except Exception:
+                continue
+            opened.append(clause)
+            opened_ids.append(clause["clause_id"])
+            opened_set.add(clause["clause_id"])
+
+    prompt = _build_prompt(task.user_ticket, opened)
+    raw_output = client.generate(prompt)
+    prediction = _parse_prediction(raw_output)
+    gold_set = set(gold_ids)
+    opened_gold_count = len(set(opened_ids) & gold_set)
+    coverage = opened_gold_count / max(1, len(gold_set))
+    oracle_meta = {
+        "oracle_opened_gold_count": opened_gold_count,
+        "oracle_gold_coverage": coverage,
+        "oracle_used_search_fallback": used_search_fallback,
+        "primary_search_results": _enrich_search_results(env, primary_results),
+        "primary_search_top_k": primary_top_k,
+        "primary_search_query": task.user_ticket,
+    }
+    return prediction, opened_ids, prompt, raw_output, oracle_meta
 
 
 def run_goc_heuristic(
@@ -279,7 +389,10 @@ def run_goc_heuristic(
     client: LLMClient,
     controller: Optional[Controller] = None,
     controller_mode: str = "off",
-) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None]:
+    primary_top_k: int = 20,
+    force_open_top_n: int = 1,
+    force_open_source: str = "primary",
+) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
     errors: List[str] = []
     fallback_prediction = {
         "decision": "needs_more_info",
@@ -288,13 +401,13 @@ def run_goc_heuristic(
         "customer_message": "",
     }
     try:
-        seed_results = env.search(task.user_ticket, top_k=20)
+        seed_results = env.search(task.user_ticket, top_k=primary_top_k)
     except Exception as exc:  # noqa: BLE001 - defensive
         seed_results = []
         errors.append(f"search_error: {exc}")
     expanded_query = f"{task.user_ticket} exception supersede revoke definition effective immediately"
     try:
-        expanded_results = env.search(expanded_query, top_k=20)
+        expanded_results = env.search(expanded_query, top_k=primary_top_k)
     except Exception as exc:  # noqa: BLE001 - defensive
         expanded_results = []
         errors.append(f"search_error: {exc}")
@@ -306,7 +419,8 @@ def run_goc_heuristic(
     controller_action: str | None = None
     ordered_clause_ids: List[str] = []
     if controller and controller_mode != "off":
-        context_features = controller.build_context_features(task.context, env.open_budget)
+        search_stats = controller.compute_search_stats(seed_results)
+        context_features = controller.build_context_features(task.context, env.open_budget, search_stats)
         controller_action = controller.select_action(
             context_features, explore=controller_mode == "train"
         )
@@ -330,6 +444,33 @@ def run_goc_heuristic(
     opened: List[Dict[str, Any]] = []
     opened_ids: List[str] = []
     opened_set: set[str] = set()
+    forced_open_ids: List[str] = []
+
+    if force_open_top_n > 0:
+        if force_open_source == "merged":
+            force_candidates = ranked
+        else:
+            force_candidates = sorted(seed_results, key=lambda item: item.get("score", 0.0), reverse=True)
+        for item in force_candidates[:force_open_top_n]:
+            if len(opened_set) >= env.open_budget:
+                break
+            clause_id = item.get("clause_id")
+            if not clause_id or clause_id in opened_set:
+                continue
+            try:
+                clause = env.open(clause_id)
+            except RuntimeError as exc:
+                errors.append(f"open_error: {exc}")
+                if "budget" in str(exc):
+                    break
+                continue
+            except Exception as exc:  # noqa: BLE001 - defensive
+                errors.append(f"open_error: {exc}")
+                continue
+            opened.append(clause)
+            opened_set.add(clause["clause_id"])
+            opened_ids.append(clause["clause_id"])
+            forced_open_ids.append(clause["clause_id"])
     if ordered_clause_ids:
         ranked_ids = ordered_clause_ids
     else:
@@ -372,8 +513,10 @@ def run_goc_heuristic(
     if controller and controller_mode == "train" and controller_action:
         gold_ids = set(task.gold.gold_evidence or [])
         opened_id_set = set(opened_ids)
+        winning_clause = task.gold.gold_evidence[0] if task.gold.gold_evidence else None
+        opened_has_winning_clause = 1.0 if winning_clause and winning_clause in opened_id_set else 0.0
         coverage = len(opened_id_set & gold_ids) / max(1, len(gold_ids))
-        bonus = 0.0
+        critical_kind_hit_count = 0
         critical_kinds = {"update", "definition", "exception"}
         gold_kinds = {
             env.world.clauses[cid].kind
@@ -385,11 +528,24 @@ def run_goc_heuristic(
                 env.world.clauses.get(cid) and env.world.clauses[cid].kind == kind
                 for cid in opened_id_set
             ):
-                bonus += 0.1
-        penalty = -0.01 * len(opened_ids)
-        reward = coverage + bonus + penalty
-        context_features = controller.build_context_features(task.context, env.open_budget)
+                critical_kind_hit_count += 1
+        reward = (
+            opened_has_winning_clause
+            + 0.2 * coverage
+            + 0.1 * min(3, critical_kind_hit_count)
+            + 0.01 * len(opened_ids)
+        )
+        search_stats = controller.compute_search_stats(seed_results)
+        context_features = controller.build_context_features(task.context, env.open_budget, search_stats)
         controller.update(controller_action, context_features, reward)
 
     error = "; ".join(errors) if errors else None
-    return prediction, opened_ids, prompt, raw_output, error, controller_action
+    diag = {
+        "primary_search_results": _enrich_search_results(env, seed_results),
+        "primary_search_top_k": primary_top_k,
+        "primary_search_query": task.user_ticket,
+        "secondary_search_results": _enrich_search_results(env, expanded_results),
+        "secondary_search_query": expanded_query,
+        "forced_open_ids": forced_open_ids,
+    }
+    return prediction, opened_ids, prompt, raw_output, error, controller_action, diag
