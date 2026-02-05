@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from .bridged_ab import compute_bridged_ab_slices
+
 
 def _resolve_base_dir(report_path: Path) -> Path:
     parts = report_path.resolve().parts
@@ -61,6 +63,8 @@ def analyze_failure_slice(report_path: Path, top_k: int = 20) -> Path:
     lines: List[str] = []
     lines.append(f"# Failure Slice Report\n")
     lines.append(f"- Source report: {report_path}\n")
+    lines.append(f"- run_id: {payload.get('run_id')}\n")
+    lines.append(f"- git_sha: {payload.get('git_sha')}\n")
     lines.append(f"- Failures: {len(failures)}\n")
 
     if not failures:
@@ -84,6 +88,56 @@ def analyze_failure_slice(report_path: Path, top_k: int = 20) -> Path:
         if raw_preview:
             lines.append(f"- raw_output_preview: {raw_preview}")
         lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
+def analyze_bridged_ab(report_path: Path, method: str = "goc") -> Path:
+    report_path = _latest_report_path(report_path)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    method_report = payload.get("method_reports", {}).get(method, {})
+    records = method_report.get("records", [])
+    slices = compute_bridged_ab_slices(records)
+
+    base_dir = _resolve_base_dir(report_path)
+    out_dir = base_dir / "runs" / "analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"{stamp}_bridged_ab.md"
+
+    lines: List[str] = []
+    lines.append("# Bridged A×B Slice Report\n")
+    lines.append(f"- Source report: {report_path}\n")
+    lines.append(f"- Method: {method}\n")
+    lines.append(f"- Records: {slices.get('n_records', 0)}\n")
+
+    axes = slices.get("axes", {})
+    cells = slices.get("cells", {})
+    a_keys = axes.get("A", [])
+    b_keys = axes.get("B", [])
+    header = "|A/B|" + "|".join(b_keys) + "|"
+    sep = "|---|" + "|".join(["---"] * len(b_keys)) + "|"
+    lines.append(header)
+    lines.append(sep)
+    for a_key in a_keys:
+        row = [a_key]
+        for b_key in b_keys:
+            cell = cells.get(a_key, {}).get(b_key)
+            if not cell:
+                row.append("n=0")
+                continue
+            extra = ""
+            if a_key == "A2_opened_wrong_bridge":
+                extra = (
+                    f", probe_gold={cell.get('bridge_probe_contains_gold_canonical_rate',0):.2f}, "
+                    f"opened_gold={cell.get('bridge_opened_contains_gold_canonical_rate',0):.2f}"
+                )
+            row.append(
+                f"n={cell.get('n',0)}, acc={cell.get('decision_accuracy',0):.2f}, "
+                f"cov_core={cell.get('opened_gold_coverage_core_mean',0):.2f}{extra}"
+            )
+        lines.append("|" + "|".join(row) + "|")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path

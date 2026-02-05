@@ -612,6 +612,8 @@ def run_goc_heuristic(
     agent_query_policy: str = "single_hop",
     hop1_query_mode: str = "stripped",
     bridge_reward_bonus: float = 0.0,
+    open_split_mode: str = "all_union_rank",
+    open_split_hop1: int = 0,
 ) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
     errors: List[str] = []
     fallback_prediction = {
@@ -621,13 +623,17 @@ def run_goc_heuristic(
         "customer_message": "",
     }
     reward_breakdown: Dict[str, float] | None = None
+    hop1_query = task.user_ticket
     hop2_query = ""
+    hop2_candidate_query = ""
     used_canonical_terms: List[str] = []
     used_update_kw = False
     hop2_executed = False
     hop2_query_contains_canonical = False
+    hop2_skip_reason: str | None = None
     extracted_facets: Dict[str, List[str]] = {}
-    bridge_clause_id: str | None = None
+    bridge_probe_clause_id: str | None = None
+    bridge_gold_clause_id: str | None = getattr(task, "bridge_clause_id", None)
     opened_probe_ids: List[str] = []
     opened_for_prompt_ids: List[str] = []
     opened_total_ids: List[str] = []
@@ -636,8 +642,12 @@ def run_goc_heuristic(
     opened_for_prompt_clauses: List[Dict[str, Any]] = []
     bridge_opened_in_probe = False
     bridge_opened_in_prompt = False
+    bridge_probe_is_slot_specific = False
     bridge_needed = bool(getattr(task, "bridge_clause_id", None))
     scenario_mode = getattr(task, "scenario_mode", "v0")
+    bridge_clause = None  # selected bridge clause (if any)
+    hop1_results: List[Dict[str, Any]] = []
+    hop2_results: List[Dict[str, Any]] = []
 
     def _strip_ticket(text: str) -> str:
         lowered = text.lower()
@@ -685,8 +695,7 @@ def run_goc_heuristic(
             hop1_results = []
             errors.append(f"search_error: {exc}")
         # Open first bridge doc to extract canonical terms.
-        bridge_clause = None
-        if scenario_mode == "bridged_v1_1":
+        if scenario_mode == "bridged_v1_1" and bridge_needed:
             preferred = [
                 item
                 for item in hop1_results
@@ -711,69 +720,73 @@ def run_goc_heuristic(
                 opened_probe_ids.append(cid)
                 opened_total_ids.append(cid)
                 opened_set.add(cid)
-                bridge_clause_id = cid
+                bridge_probe_clause_id = cid
                 bridge_clause = clause
                 bridge_opened_in_probe = True
+                bridge_probe_is_slot_specific = (
+                    clause.bridge_for_slot == task.context.get("slot")
+                    if clause.bridge_for_slot
+                    else False
+                )
                 if clause.canonical_terms:
                     used_canonical_terms = list(clause.canonical_terms)
                 else:
                     used_canonical_terms = _extract_canonical_from_text(clause.text)
                 break
-        if not bridge_clause:
-            for item in hop1_results:
-                cid = item.get("clause_id")
-                clause = env.world.clauses.get(cid) if cid else None
-                if not clause:
-                    continue
-                if item.get("is_bridge_doc") or clause.bridge_for_slot:
-                    bridge_clause_id = cid
-                    bridge_clause = clause
-                    if clause.canonical_terms:
-                        used_canonical_terms = list(clause.canonical_terms)
-                    else:
-                        used_canonical_terms = _extract_canonical_from_text(clause.text)
-                    break
-        for item in hop1_results:
-            cid = item.get("clause_id")
-            clause = env.world.clauses.get(cid) if cid else None
-            if not clause:
-                continue
-            if item.get("is_bridge_doc") or clause.bridge_for_slot:
-                bridge_clause_id = cid
-                bridge_clause = clause
-                break
         extracted_facets = extract_facets(task.user_ticket)
-        hop2_terms: List[str] = []
-        for term in used_canonical_terms[:2]:
-            if term and term not in hop2_terms:
-                hop2_terms.append(term)
-        slot_term = task.context.get("slot")
-        if slot_term and slot_term not in hop2_terms:
-            hop2_terms.append(slot_term)
-        facet_terms: List[str] = []
-        for key in ["region", "purpose", "data_type", "product", "tier", "action"]:
-            facet_terms.extend(extracted_facets.get(key, []))
-        for term in facet_terms:
-            if term and term not in hop2_terms:
-                hop2_terms.append(term)
-            if len(hop2_terms) >= 6:
-                break
-        if getattr(task, "needs_update_resolution", False):
-            hop2_terms.extend(["effective immediately", "supersedes"])
-            used_update_kw = True
-        hop2_query = " ".join(hop2_terms).strip()
-        hop2_query_contains_canonical = any(
-            term.lower() in hop2_query.lower() for term in used_canonical_terms
-        )
-        hop2_token_count = len(re.findall(r"[A-Za-z0-9_']+", hop2_query))
-        if hop2_query and hop2_token_count >= 3:
-            hop2_executed = True
-            try:
-                hop2_results = env.search(hop2_query, top_k=primary_top_k)
-            except Exception as exc:  # noqa: BLE001 - defensive
+        if bridge_needed:
+            hop2_terms: List[str] = []
+            for term in used_canonical_terms[:2]:
+                if term and term not in hop2_terms:
+                    hop2_terms.append(term)
+            slot_term = task.context.get("slot")
+            if slot_term and slot_term not in hop2_terms:
+                hop2_terms.append(slot_term)
+            facet_terms: List[str] = []
+            for key in ["region", "purpose", "data_type", "product", "tier", "action"]:
+                facet_terms.extend(extracted_facets.get(key, []))
+            for term in facet_terms:
+                if term and term not in hop2_terms:
+                    hop2_terms.append(term)
+                if len(hop2_terms) >= 6:
+                    break
+            if getattr(task, "needs_update_resolution", False):
+                hop2_terms.extend(["effective immediately", "supersedes"])
+                used_update_kw = True
+            hop2_candidate_query = " ".join(hop2_terms).strip()
+            hop2_query_contains_canonical = any(
+                term.lower() in hop2_candidate_query.lower() for term in used_canonical_terms
+            )
+            hop2_token_count = len(re.findall(r"[A-Za-z0-9_']+", hop2_candidate_query))
+            hop2_has_signal = bool(hop2_query_contains_canonical or used_update_kw)
+            if env.open_budget <= 0:
+                hop2_skip_reason = "budget"
+            elif not used_canonical_terms:
+                hop2_skip_reason = "no_canonical_extracted"
+            elif hop2_token_count < 3:
+                hop2_skip_reason = "too_short"
+            elif not hop2_has_signal:
+                hop2_skip_reason = "other"
+            if (
+                hop2_candidate_query
+                and hop2_token_count >= 3
+                and hop2_has_signal
+                and env.open_budget > 0
+            ):
+                hop2_executed = True
+                hop2_query = hop2_candidate_query
+                try:
+                    hop2_results = env.search(hop2_query, top_k=primary_top_k)
+                except Exception as exc:  # noqa: BLE001 - defensive
+                    hop2_results = []
+                    errors.append(f"search_error: {exc}")
+            else:
+                hop2_query = ""
                 hop2_results = []
-                errors.append(f"search_error: {exc}")
+                if hop2_skip_reason is None:
+                    hop2_skip_reason = "other"
         else:
+            hop2_skip_reason = "disabled"
             hop2_query = ""
             hop2_results = []
         seed_results = _merge_hybrid_results(
@@ -785,20 +798,23 @@ def run_goc_heuristic(
         rewrite_queries = [hop1_query, hop2_query] if hop2_query else [hop1_query]
         search_variants = [
             {"stage": "hop1_base", "query": hop1_query, "results": hop1_results},
-            {
-                "stage": "hop2_canonical",
-                "query": hop2_query,
-                "results": hop2_results,
-                "query_meta": {
-                    "used_canonical_terms": used_canonical_terms,
-                    "used_update_kw": used_update_kw,
-                    "extracted_facets": extracted_facets,
-                    "hop2_executed": hop2_executed,
-                },
-                "depends_on": f"query:{task.task_id}:hop1_base",
-            },
-            {"stage": "hybrid_merged", "query": "hybrid_merged", "results": seed_results},
         ]
+        if hop2_executed:
+            search_variants.append(
+                {
+                    "stage": "hop2_canonical",
+                    "query": hop2_query,
+                    "results": hop2_results,
+                    "query_meta": {
+                        "used_canonical_terms": used_canonical_terms,
+                        "used_update_kw": used_update_kw,
+                        "extracted_facets": extracted_facets,
+                        "hop2_executed": hop2_executed,
+                    },
+                    "depends_on": f"query:{task.task_id}:hop1_base",
+                }
+            )
+        search_variants.append({"stage": "hybrid_merged", "query": "hybrid_merged", "results": seed_results})
     else:
         try:
             seed_results, rewrite_queries, search_variants = _search_with_rewrite(
@@ -816,6 +832,7 @@ def run_goc_heuristic(
             errors.append(f"search_error: {exc}")
             rewrite_queries = [task.user_ticket]
             search_variants = []
+        hop2_skip_reason = "disabled"
     expanded_query = None
     expanded_results: List[Dict[str, Any]] = []
     if agent_query_policy != "two_hop_bridge":
@@ -867,6 +884,10 @@ def run_goc_heuristic(
     opened: List[Dict[str, Any]] = []
     opened_ids: List[str] = []
     forced_open_ids: List[str] = []
+    hop1_id_set = {item.get("clause_id") for item in hop1_results if item.get("clause_id")}
+    hop2_id_set = {item.get("clause_id") for item in hop2_results if item.get("clause_id")}
+    open_from_hop1_ids: List[str] = []
+    open_from_hop2_ids: List[str] = []
 
     if force_open_top_n > 0:
         if force_open_source == "merged":
@@ -894,32 +915,73 @@ def run_goc_heuristic(
             opened_for_prompt_ids.append(clause["clause_id"])
             opened_total_ids.append(clause["clause_id"])
             forced_open_ids.append(clause["clause_id"])
-    if ordered_clause_ids:
-        ranked_ids = ordered_clause_ids
-    else:
-        ranked_ids = [item["clause_id"] for item in ranked]
-    for clause_id in ranked_ids:
-        if len(opened_set) >= env.open_budget:
-            break
-        if clause_id in opened_set:
-            continue
-        try:
-            clause = env.open(clause_id)
-        except RuntimeError as exc:
-            errors.append(f"open_error: {exc}")
-            if "budget" in str(exc):
-                break
-            continue
-        except Exception as exc:  # noqa: BLE001 - defensive
-            errors.append(f"open_error: {exc}")
-            continue
-        opened_for_prompt_clauses.append(clause)
-        opened_set.add(clause["clause_id"])
-        opened_for_prompt_ids.append(clause["clause_id"])
-        opened_total_ids.append(clause["clause_id"])
+            if clause_id in hop2_id_set:
+                open_from_hop2_ids.append(clause_id)
+            elif clause_id in hop1_id_set:
+                open_from_hop1_ids.append(clause_id)
+    hop1_ranked_ids = [
+        item.get("clause_id")
+        for item in sorted(hop1_results, key=lambda it: it.get("score", 0.0), reverse=True)
+        if item.get("clause_id")
+    ]
+    hop2_ranked_ids = [
+        item.get("clause_id")
+        for item in sorted(hop2_results, key=lambda it: it.get("score", 0.0), reverse=True)
+        if item.get("clause_id")
+    ]
 
-    if bridge_clause_id:
-        bridge_opened_in_prompt = bridge_clause_id in opened_for_prompt_ids
+    def _open_from_candidates(candidates: List[str], max_count: int, origin: str | None = None) -> None:
+        nonlocal opened_for_prompt_clauses
+        for clause_id in candidates:
+            if len(opened_set) >= env.open_budget:
+                break
+            if max_count <= 0:
+                break
+            if clause_id in opened_set:
+                continue
+            try:
+                clause = env.open(clause_id)
+            except RuntimeError as exc:
+                errors.append(f"open_error: {exc}")
+                if "budget" in str(exc):
+                    break
+                continue
+            except Exception as exc:  # noqa: BLE001 - defensive
+                errors.append(f"open_error: {exc}")
+                continue
+            opened_for_prompt_clauses.append(clause)
+            opened_set.add(clause["clause_id"])
+            opened_for_prompt_ids.append(clause["clause_id"])
+            opened_total_ids.append(clause["clause_id"])
+            if origin == "hop1":
+                open_from_hop1_ids.append(clause_id)
+            elif origin == "hop2":
+                open_from_hop2_ids.append(clause_id)
+            else:
+                if clause_id in hop2_id_set:
+                    open_from_hop2_ids.append(clause_id)
+                elif clause_id in hop1_id_set:
+                    open_from_hop1_ids.append(clause_id)
+            max_count -= 1
+
+    if open_split_mode == "split_hop1_hop2" and agent_query_policy == "two_hop_bridge":
+        hop1_quota = max(0, min(open_split_hop1, env.open_budget))
+        hop2_quota = max(0, env.open_budget - hop1_quota)
+        _open_from_candidates(hop1_ranked_ids, hop1_quota, origin="hop1")
+        _open_from_candidates(hop2_ranked_ids, hop2_quota, origin="hop2")
+    else:
+        if ordered_clause_ids:
+            ranked_ids = ordered_clause_ids
+        else:
+            ranked_ids = [item["clause_id"] for item in ranked]
+        if agent_query_policy == "two_hop_bridge" and hop2_id_set:
+            pref = [cid for cid in hop2_results[: min(3, primary_top_k)] if cid.get("clause_id")]
+            hop2_pref_ids = [item.get("clause_id") for item in pref if item.get("clause_id")]
+            ranked_ids = hop2_pref_ids + [cid for cid in ranked_ids if cid not in hop2_pref_ids]
+        _open_from_candidates(ranked_ids, env.open_budget, origin=None)
+
+    if bridge_probe_clause_id:
+        bridge_opened_in_prompt = bridge_probe_clause_id in opened_for_prompt_ids
 
     opened_ids = list(opened_total_ids)
     prompt = _build_goc_prompt(task.user_ticket, opened_for_prompt_clauses, opened_for_prompt_ids)
@@ -952,7 +1014,7 @@ def run_goc_heuristic(
             r_cov = 0.5 * coverage
             r_open_penalty = -0.01 * float(env.open_count)
             r_bridge = 0.0
-            if bridge_reward_bonus and bridge_clause_id and bridge_clause_id in opened_id_set:
+            if bridge_reward_bonus and bridge_probe_clause_id and bridge_probe_clause_id in opened_id_set:
                 r_bridge = float(bridge_reward_bonus)
             reward = r_win + r_cov + r_open_penalty + r_bridge
             search_stats = controller.compute_search_stats(seed_results)
@@ -967,23 +1029,42 @@ def run_goc_heuristic(
             }
 
     error = "; ".join(errors) if errors else None
+    opened_id_set = set(opened_total_ids or opened_ids)
+    bridge_opened_any = any(
+        env.world.clauses.get(cid)
+        and (
+            env.world.clauses[cid].kind in {"definition", "glossary"}
+            or env.world.clauses[cid].bridge_for_slot
+            or getattr(env.world.clauses[cid], "is_bridge_doc", False)
+        )
+        for cid in opened_id_set
+    )
     diag = {
         "primary_search_results": _enrich_search_results(env, seed_results),
         "primary_search_top_k": primary_top_k,
         "primary_search_query": task.user_ticket,
+        "hop1_search_results": _enrich_search_results(env, hop1_results),
+        "hop2_search_results": _enrich_search_results(env, hop2_results),
         "secondary_search_results": _enrich_search_results(env, expanded_results),
         "secondary_search_query": expanded_query,
         "forced_open_ids": forced_open_ids,
         "rewrite_used": use_query_rewrite,
         "rewrite_queries": rewrite_queries,
         "agent_query_policy": agent_query_policy,
-        "bridge_clause_id": bridge_clause_id,
+        "bridge_gold_clause_id": bridge_gold_clause_id,
+        "bridge_probe_clause_id": bridge_probe_clause_id,
+        "bridge_probe_is_slot_specific": bridge_probe_is_slot_specific,
+        "bridge_needed": bridge_needed,
+        "bridge_opened_any": bridge_opened_any,
+        "bridge_opened_gold": bool(bridge_gold_clause_id and bridge_gold_clause_id in opened_id_set),
         "canonical_used_in_query2": hop2_query_contains_canonical,
         "used_canonical_terms": used_canonical_terms,
         "used_update_kw": used_update_kw,
+        "hop2_candidate_query": hop2_candidate_query,
         "hop2_query": hop2_query,
         "hop2_executed": hop2_executed,
         "hop2_query_contains_canonical": hop2_query_contains_canonical,
+        "hop2_skip_reason": hop2_skip_reason,
         "extracted_facets": extracted_facets,
         "hop1_query_mode": hop1_query_mode,
         "hop1_query_text": hop1_query if agent_query_policy == "two_hop_bridge" else "",
@@ -991,13 +1072,19 @@ def run_goc_heuristic(
         and getattr(task, "slot_hint_alias", "") in (hop1_query or ""),
         "hop1_query_contains_canonical": bool(getattr(task, "canonical_slot_term", None))
         and getattr(task, "canonical_slot_term", "") in (hop1_query or ""),
+        "open_split_mode": open_split_mode,
+        "open_split_hop1": open_split_hop1,
         "opened_probe_clause_ids": opened_probe_ids,
         "opened_for_prompt_clause_ids": opened_for_prompt_ids,
         "opened_total_clause_ids": opened_total_ids or opened_ids,
-        "bridge_opened": bool(bridge_clause_id and bridge_clause_id in (opened_total_ids or opened_ids)),
+        "open_from_hop1_count": len(open_from_hop1_ids),
+        "open_from_hop2_count": len(open_from_hop2_ids),
+        "prompt_includes_from_hop2": bool(open_from_hop2_ids),
+        "opened_doc_ids_hop1": open_from_hop1_ids[:5],
+        "opened_doc_ids_hop2": open_from_hop2_ids[:5],
+        "bridge_opened": bool(bridge_probe_clause_id and bridge_probe_clause_id in opened_id_set),
         "bridge_opened_in_probe": bridge_opened_in_probe,
         "bridge_opened_in_prompt": bridge_opened_in_prompt,
-        "bridge_needed": bridge_needed,
     }
     if reward_breakdown:
         diag["controller_reward_breakdown"] = reward_breakdown

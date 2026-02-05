@@ -78,3 +78,4 @@ PYTHONPATH=src:../.. python -m policyops.run analyze --report runs/compare/<late
 - v0 uses BM25 only (no embeddings/vector DB).
 - `pydantic` is optional; dataclasses are used if unavailable.
 - Baselines build prompts but require an external LLM client to produce real predictions.
+- bridged_v1_1 can mix canonical-in-ticket tasks via `--bridged_mix_canonical_in_ticket_rate` to measure when bridges/hop2 are unnecessary.

@@ -8,6 +8,7 @@ import random
 import hashlib
 from datetime import datetime
 from pathlib import Path
+import subprocess
 from typing import Any, Dict, List
 
 from .baselines import (
@@ -22,8 +23,10 @@ from .baselines import (
     run_topk_rag,
 )
 from .controller import Controller, RerankController
-from .diagnostics import compute_retrieval_diagnostics
-from .analysis import analyze_failure_slice
+from .diagnostics import compute_retrieval_diagnostics, merge_search_results_union
+from .symbolic_judge import judge_from_opened_clauses
+from .analysis import analyze_failure_slice, analyze_bridged_ab
+from .bridged_ab import compute_bridged_ab_slices
 try:
     from goc_logger.graph import GoCGraph
     from goc_logger.log import append_event, build_event
@@ -245,7 +248,9 @@ def _evaluate_method(
                 rewrite_mode=args.query_rewrite_mode,
                 merge_rank_fusion=args.merge_rank_fusion,
             )
-        elif method == "goc":
+        elif method in {"goc", "goc_base"}:
+            if method == "goc_base":
+                agent_query_policy = "single_hop"
             pred, opened_ids, prompt, raw_output, error, controller_action, diag = run_goc_heuristic(
                 task,
                 env,
@@ -263,6 +268,8 @@ def _evaluate_method(
                 hop1_query_mode=getattr(args, "hop1_query_mode", "stripped"),
                 bridge_reward_bonus=float(getattr(args, "bridge_reward_bonus", 0.0)),
                 controller_policy=controller_policy,
+                open_split_mode=getattr(args, "open_split_mode", "all_union_rank"),
+                open_split_hop1=int(getattr(args, "open_split_hop1", 0)),
             )
             if controller_action:
                 controller_actions[controller_action] = controller_actions.get(controller_action, 0) + 1
@@ -311,8 +318,53 @@ def _evaluate_method(
             save_snapshot=False,
             snapshot_k=args.search_snapshot_k,
         )
+        hop1_results = (
+            diag.get("hop1_search_results")
+            if isinstance(diag, dict) and diag.get("hop1_search_results") is not None
+            else primary_results
+        )
+        hop2_results = (
+            diag.get("hop2_search_results")
+            if isinstance(diag, dict) and diag.get("hop2_search_results") is not None
+            else []
+        )
+        union_results = merge_search_results_union(hop1_results, hop2_results)
+        hop1_diag = compute_retrieval_diagnostics(
+            opened_ids=opened_ids,
+            gold_ids=list(task.gold.gold_evidence or []),
+            search_results=hop1_results,
+            top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
+            if isinstance(diag, dict)
+            else args.primary_search_top_k,
+            save_snapshot=False,
+        )
+        hop2_diag = compute_retrieval_diagnostics(
+            opened_ids=opened_ids,
+            gold_ids=list(task.gold.gold_evidence or []),
+            search_results=hop2_results,
+            top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
+            if isinstance(diag, dict)
+            else args.primary_search_top_k,
+            save_snapshot=False,
+        )
+        union_diag = compute_retrieval_diagnostics(
+            opened_ids=opened_ids,
+            gold_ids=list(task.gold.gold_evidence or []),
+            search_results=union_results,
+            top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
+            if isinstance(diag, dict)
+            else args.primary_search_top_k,
+            save_snapshot=False,
+        )
 
-        if method == "engine":
+        if getattr(args, "judge", "llm") == "symbolic":
+            pred = judge_from_opened_clauses(task, opened_ids, world)
+            prompt = ""
+            raw_output = None
+            normalize_reason = None
+            decision_before_norm = pred.get("decision")
+            decision_after_norm = pred.get("decision")
+        elif method == "engine":
             normalize_reason = None
             decision_before_norm = pred.get("decision")
             decision_after_norm = pred.get("decision")
@@ -376,6 +428,7 @@ def _evaluate_method(
             "gold_decision": task.gold.decision,
             "decision_correct": pred_decision == task.gold.decision,
             "scenario_mode": scenario_mode,
+            "agent_query_policy": agent_query_policy,
             "slot_hint_alias": getattr(task, "slot_hint_alias", None),
             "canonical_slot_term": getattr(task, "canonical_slot_term", None),
             "bridge_clause_id": bridge_clause_id,
@@ -415,11 +468,112 @@ def _evaluate_method(
         }
         if isinstance(diag, dict):
             record.update(diag)
+        if method != "goc":
+            record.setdefault("hop2_executed", False)
+            record.setdefault("hop2_skip_reason", "no_hop2_method")
+            record.setdefault("hop2_query", "")
+            record.setdefault("hop2_candidate_query", "")
+            record.setdefault("hop2_query_contains_canonical", False)
+            record.setdefault("hop2_query_contains_gold_canonical", False)
+        if agent_query_policy != "two_hop_bridge":
+            record.setdefault("hop2_executed", False)
+            record.setdefault("hop2_skip_reason", record.get("hop2_skip_reason") or "no_hop2_method")
+            record.setdefault("hop2_query", record.get("hop2_query") or "")
+            record.setdefault("hop2_candidate_query", record.get("hop2_candidate_query") or "")
+            record.setdefault("hop2_query_contains_canonical", False)
+        # Gold-canonical diagnostic (analysis only; no policy impact)
+        gold_canonical = (getattr(task, "canonical_slot_term", None) or "").lower()
+        hop2_q = (record.get("hop2_query") or record.get("hop2_candidate_query") or "")
+        record["hop2_query_contains_gold_canonical"] = (
+            bool(gold_canonical) and gold_canonical in hop2_q.lower()
+        )
+        # Bridge canonical diagnostics (analysis-only)
+        probe_id = record.get("bridge_probe_clause_id")
+        opened_ids_set = set(record.get("opened_total_clause_ids") or record.get("opened_clause_ids") or [])
+        bridge_probe_text = ""
+        if probe_id and probe_id in world.clauses:
+            bridge_probe_text = world.clauses[probe_id].text.lower()
+        record["bridge_probe_contains_gold_canonical"] = (
+            bool(gold_canonical) and gold_canonical in bridge_probe_text
+        )
+        record["bridge_opened_contains_gold_canonical"] = (
+            bool(gold_canonical)
+            and any(
+                (world.clauses.get(cid) and gold_canonical in world.clauses[cid].text.lower())
+                for cid in opened_ids_set
+                if cid in world.clauses
+            )
+        )
         if not args.save_search_snapshot:
             record.pop("rewrite_queries", None)
             record.pop("rewrite_used", None)
             record.pop("hop1_query_text", None)
+        if scenario_mode == "bridged_v1_1":
+            for key, default in [
+                ("bridge_needed", bool(bridge_clause_id)),
+                ("bridge_opened_any", False),
+                ("bridge_opened_gold", False),
+                ("bridge_probe_clause_id", None),
+                ("bridge_probe_is_slot_specific", None),
+                ("bridge_gold_clause_id", getattr(task, "bridge_clause_id", None)),
+                ("hop2_candidate_query", ""),
+                ("hop2_executed", False),
+                ("hop2_query", ""),
+                ("hop2_query_contains_canonical", False),
+                ("hop2_skip_reason", None),
+                ("open_from_hop1_count", 0),
+                ("open_from_hop2_count", 0),
+                ("prompt_includes_from_hop2", False),
+            ]:
+                record.setdefault(key, default)
+            opened_ids_set = set(record.get("opened_total_clause_ids") or record.get("opened_clause_ids") or [])
+            if record.get("bridge_opened_any") is False:
+                record["bridge_opened_any"] = any(
+                    (cid in world.clauses)
+                    and (
+                        bool(getattr(world.clauses[cid], "bridge_for_slot", None))
+                        or bool(getattr(world.clauses[cid], "is_bridge_doc", False))
+                    )
+                    for cid in opened_ids_set
+                )
+            if record.get("bridge_opened_gold") is False and bridge_clause_id:
+                record["bridge_opened_gold"] = bridge_clause_id in opened_ids_set
         record.update(retrieval_diag)
+        hit_hop1 = (
+            hop1_diag.get("winning_clause_rank") is not None
+            and hop1_diag.get("winning_clause_rank") <= (record.get("open_budget") or 0)
+        )
+        hit_hop2 = (
+            hop2_diag.get("winning_clause_rank") is not None
+            and hop2_diag.get("winning_clause_rank") <= (record.get("open_budget") or 0)
+        )
+        hit_union = (
+            union_diag.get("winning_clause_rank") is not None
+            and union_diag.get("winning_clause_rank") <= (record.get("open_budget") or 0)
+        )
+        record.update(
+            {
+                "gold_in_search_topk_hop1": hop1_diag.get("gold_in_search_topk"),
+                "gold_in_search_topk_hop2": hop2_diag.get("gold_in_search_topk"),
+                "gold_in_search_topk_union": union_diag.get("gold_in_search_topk"),
+                "winning_clause_rank_hop1": hop1_diag.get("winning_clause_rank"),
+                "winning_clause_rank_hop2": hop2_diag.get("winning_clause_rank"),
+                "winning_clause_rank_union": union_diag.get("winning_clause_rank"),
+                "opened_has_winning_clause_union": union_diag.get("opened_has_winning_clause"),
+                "hit_at_open_budget_hop1": hit_hop1,
+                "hit_at_open_budget_hop2": hit_hop2,
+                "hit_at_open_budget_union": hit_union,
+            }
+        )
+        feasible_open_rate = (
+            1.0 if record.get("hit_at_open_budget_union") else 0.0
+        )
+        realized_open_rate = 1.0 if record.get("opened_has_winning_clause") else 0.0
+        record["feasible_open_rate"] = feasible_open_rate
+        record["realized_open_rate"] = realized_open_rate
+        record["selection_gap"] = feasible_open_rate - realized_open_rate
+        denom = feasible_open_rate if feasible_open_rate > 0 else 1e-6
+        record["selection_efficiency"] = realized_open_rate / denom
         record.update(
             {
                 "opened_gold_count_core": retrieval_diag_core.get("opened_gold_count"),
@@ -457,6 +611,9 @@ def _evaluate_method(
             record["raw_path"] = str(raw_path)
         record["goc_graph_jsonl_path"] = str(goc_graph_task_path) if goc_graph_task_path else None
         record["goc_graph_dot_path"] = str(goc_graph_dot_path) if goc_graph_dot_path else None
+        if method == "goc" and getattr(args, "goc_graph_sample_rate", 1.0) <= 0.0:
+            record["goc_graph_jsonl_path"] = None
+            record["goc_graph_dot_path"] = None
         records.append(record)
 
         if goc_graph and goc_graph_path:
@@ -526,6 +683,8 @@ def _evaluate_method(
                     results = primary_results if idx == 0 else []
                     variants.append({"stage": stage, "query": query, "results": results})
 
+            if agent_query_policy == "two_hop_bridge":
+                variants = [v for v in variants if v.get("stage") != "hybrid_merged"]
             for variant in variants:
                 stage = variant.get("stage") or "primary"
                 query = variant.get("query") or ""
@@ -959,6 +1118,28 @@ def _evaluate_method(
         ) / len(records)
     else:
         aggregate["opened_gold_coverage_core_mean"] = 0.0
+    pred_dist = {"allow": 0, "deny": 0, "require_condition": 0, "needs_more_info": 0}
+    for rec in records:
+        pred = rec.get("pred_decision")
+        if pred in pred_dist:
+            pred_dist[pred] += 1
+        else:
+            pred_dist[pred] = pred_dist.get(pred, 0) + 1
+    aggregate["pred_decision_distribution"] = pred_dist
+    non_rc = [r for r in records if r.get("gold_decision") != "require_condition"]
+    if non_rc:
+        aggregate["spurious_require_condition_rate"] = sum(
+            1 for r in non_rc if r.get("pred_decision") == "require_condition"
+        ) / len(non_rc)
+    else:
+        aggregate["spurious_require_condition_rate"] = 0.0
+    gold_rc = [r for r in records if r.get("gold_decision") == "require_condition"]
+    if gold_rc:
+        aggregate["missed_require_condition_rate"] = sum(
+            1 for r in gold_rc if r.get("pred_decision") != "require_condition"
+        ) / len(gold_rc)
+    else:
+        aggregate["missed_require_condition_rate"] = 0.0
     bridge_records = [r for r in records if r.get("bridge_clause_id")]
     if bridge_records:
         aggregate["bridge_found_rate"] = sum(1 for r in bridge_records if r.get("bridge_found")) / len(
@@ -990,6 +1171,24 @@ def _evaluate_method(
         ) / len(records_with_rank)
     else:
         aggregate["decision_accuracy_when_winning_rank_exists"] = 0.0
+    def _mean_metric(key: str) -> float | None:
+        vals = [r.get(key) for r in records if isinstance(r.get(key), (int, float))]
+        return sum(vals) / len(vals) if vals else 0.0
+    aggregate["gold_in_search_topk_rate_hop1"] = _mean_metric("gold_in_search_topk_hop1")
+    aggregate["gold_in_search_topk_rate_hop2"] = _mean_metric("gold_in_search_topk_hop2")
+    aggregate["gold_in_search_topk_rate_union"] = _mean_metric("gold_in_search_topk_union")
+    aggregate["winning_clause_rank_mean_hop1"] = _mean_metric("winning_clause_rank_hop1")
+    aggregate["winning_clause_rank_mean_hop2"] = _mean_metric("winning_clause_rank_hop2")
+    aggregate["winning_clause_rank_mean_union"] = _mean_metric("winning_clause_rank_union")
+    aggregate["hit_at_open_budget_union"] = _mean_metric("hit_at_open_budget_union")
+    aggregate["opened_has_winning_clause_rate_union"] = _mean_metric(
+        "opened_has_winning_clause_union"
+    )
+    aggregate["feasible_open_rate"] = _mean_metric("feasible_open_rate")
+    aggregate["realized_open_rate"] = _mean_metric("realized_open_rate")
+    aggregate["selection_gap"] = _mean_metric("selection_gap")
+    aggregate["selection_efficiency"] = _mean_metric("selection_efficiency")
+    aggregate["bridged_ab_slices"] = compute_bridged_ab_slices(records)
     action_reward_mean = {}
     action_counts = {}
     action_cov_mean = {}
@@ -1067,6 +1266,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         distractor_strength=args.distractor_strength,
         scenario_mode=args.scenario_mode,
         bridge_prob=args.bridge_prob,
+        bridged_mix_canonical_in_ticket_rate=getattr(args, "bridged_mix_canonical_in_ticket_rate", 0.0),
         alias_density=args.alias_density,
         canonical_density=args.canonical_density,
         bridge_kind=args.bridge_kind,
@@ -1369,10 +1569,40 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 sum(oracle_cov) / len(oracle_cov) if oracle_cov else 0.0
             )
 
+    git_sha = None
+    try:
+        git_sha = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path.cwd())
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        git_sha = None
+    task_open_budgets = {t.budgets.get("open_budget", 5) for t in eval_tasks}
+    open_budget = list(task_open_budgets)[0] if len(task_open_budgets) == 1 else None
+    mix_rate = getattr(args, "bridged_mix_canonical_in_ticket_rate", None)
+    if mix_rate is None:
+        mix_rate = sum(1 for t in eval_tasks if not getattr(t, "bridge_clause_id", None)) / max(
+            1, len(eval_tasks)
+        )
+    scenario_params = {
+        "scenario_mode": getattr(args, "scenario_mode", "v0"),
+        "bridge_bonus": getattr(args, "bridge_bonus", 1.5),
+        "bridged_mix_canonical_in_ticket_rate": mix_rate,
+        "open_budget": open_budget,
+        "open_split_mode": getattr(args, "open_split_mode", "all_union_rank"),
+        "open_split_hop1": getattr(args, "open_split_hop1", 0),
+        "hop1_query_mode": getattr(args, "hop1_query_mode", "stripped"),
+        "agent_query_policy": getattr(args, "agent_query_policy", "single_hop"),
+    }
     compare_report = {
         "methods": methods,
         "model": args.model,
         "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": timestamp,
+        "git_sha": git_sha,
+        "invoked_cmdline": " ".join(sys.argv),
+        "scenario_params": scenario_params,
         "llm_backend": llm_backend,
         "client_class": client_class,
         "resolved_model": resolved_model,
@@ -1613,6 +1843,30 @@ def _run_compare_with_tasks(
             "gold_score_gap_mean": sum(gold_score_gap_vals) / len(gold_score_gap_vals)
             if gold_score_gap_vals
             else None,
+            "gold_in_search_topk_rate_hop1": method_report["metrics"].get(
+                "gold_in_search_topk_rate_hop1"
+            ),
+            "gold_in_search_topk_rate_hop2": method_report["metrics"].get(
+                "gold_in_search_topk_rate_hop2"
+            ),
+            "gold_in_search_topk_rate_union": method_report["metrics"].get(
+                "gold_in_search_topk_rate_union"
+            ),
+            "winning_clause_rank_mean_hop1": method_report["metrics"].get(
+                "winning_clause_rank_mean_hop1"
+            ),
+            "winning_clause_rank_mean_hop2": method_report["metrics"].get(
+                "winning_clause_rank_mean_hop2"
+            ),
+            "winning_clause_rank_mean_union": method_report["metrics"].get(
+                "winning_clause_rank_mean_union"
+            ),
+            "hit_at_open_budget_union": method_report["metrics"].get(
+                "hit_at_open_budget_union"
+            ),
+            "opened_has_winning_clause_rate_union": method_report["metrics"].get(
+                "opened_has_winning_clause_rate_union"
+            ),
         }
         if method == "oracle":
             oracle_cov = [
@@ -1624,10 +1878,41 @@ def _run_compare_with_tasks(
                 sum(oracle_cov) / len(oracle_cov) if oracle_cov else 0.0
             )
 
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    git_sha = None
+    try:
+        git_sha = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path.cwd())
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        git_sha = None
+    task_open_budgets = {t.budgets.get("open_budget", 5) for t in eval_tasks}
+    open_budget = list(task_open_budgets)[0] if len(task_open_budgets) == 1 else None
+    mix_rate = getattr(args, "bridged_mix_canonical_in_ticket_rate", None)
+    if mix_rate is None:
+        mix_rate = sum(1 for t in eval_tasks if not getattr(t, "bridge_clause_id", None)) / max(
+            1, len(eval_tasks)
+        )
+    scenario_params = {
+        "scenario_mode": getattr(args, "scenario_mode", "v0"),
+        "bridge_bonus": getattr(args, "bridge_bonus", 1.5),
+        "bridged_mix_canonical_in_ticket_rate": mix_rate,
+        "open_budget": open_budget,
+        "open_split_mode": getattr(args, "open_split_mode", "all_union_rank"),
+        "open_split_hop1": getattr(args, "open_split_hop1", 0),
+        "hop1_query_mode": getattr(args, "hop1_query_mode", "stripped"),
+        "agent_query_policy": getattr(args, "agent_query_policy", "single_hop"),
+    }
     compare_report = {
         "methods": methods,
         "model": args.model,
         "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": run_id,
+        "git_sha": git_sha,
+        "invoked_cmdline": " ".join(sys.argv),
+        "scenario_params": scenario_params,
         "llm_backend": llm_backend,
         "client_class": client_class,
         "resolved_model": resolved_model,
@@ -1670,6 +1955,14 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                 seed=seed,
                 n_docs=args.n_docs,
                 n_tasks=args.n_tasks,
+                scenario_mode=getattr(args, "scenario_mode", "v0"),
+                bridge_prob=getattr(args, "bridge_prob", 0.8),
+                alias_density=getattr(args, "alias_density", 0.9),
+                canonical_density=getattr(args, "canonical_density", 0.95),
+                bridge_kind=getattr(args, "bridge_kind", "definition"),
+                bridged_mix_canonical_in_ticket_rate=getattr(
+                    args, "bridged_mix_canonical_in_ticket_rate", 0.0
+                ),
             )
 
         world = load_world(seed_dir / "data" / "worlds")
@@ -1710,6 +2003,18 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "winning_clause_rank_mean": metrics.get("winning_clause_rank_mean"),
                     "min_gold_rank_mean": metrics.get("min_gold_rank_mean"),
                     "gold_score_gap_mean": metrics.get("gold_score_gap_mean"),
+                    "gold_in_search_topk_rate_hop1": metrics.get("gold_in_search_topk_rate_hop1"),
+                    "gold_in_search_topk_rate_hop2": metrics.get("gold_in_search_topk_rate_hop2"),
+                    "gold_in_search_topk_rate_union": metrics.get("gold_in_search_topk_rate_union"),
+                    "winning_clause_rank_mean_hop1": metrics.get("winning_clause_rank_mean_hop1"),
+                    "winning_clause_rank_mean_hop2": metrics.get("winning_clause_rank_mean_hop2"),
+                    "winning_clause_rank_mean_union": metrics.get("winning_clause_rank_mean_union"),
+                    "hit_at_open_budget_union": metrics.get("hit_at_open_budget_union"),
+                    "opened_has_winning_clause_rate_union": metrics.get(
+                        "opened_has_winning_clause_rate_union"
+                    ),
+                    "selection_gap": metrics.get("selection_gap"),
+                    "selection_efficiency": metrics.get("selection_efficiency"),
                 }
                 summary_rows.append(row)
 
@@ -1735,6 +2040,16 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "winning_clause_rank_mean",
         "min_gold_rank_mean",
         "gold_score_gap_mean",
+        "gold_in_search_topk_rate_hop1",
+        "gold_in_search_topk_rate_hop2",
+        "gold_in_search_topk_rate_union",
+        "winning_clause_rank_mean_hop1",
+        "winning_clause_rank_mean_hop2",
+        "winning_clause_rank_mean_union",
+        "hit_at_open_budget_union",
+        "opened_has_winning_clause_rate_union",
+        "selection_gap",
+        "selection_efficiency",
     ]
     with summary_csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1747,8 +2062,13 @@ def cmd_sweep(args: argparse.Namespace) -> None:
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
-    output_path = analyze_failure_slice(Path(args.report), top_k=args.k)
-    print(f"Failure slice report saved to {output_path}")
+    mode = getattr(args, "mode", "failure_slice")
+    if mode == "bridged_ab":
+        output_path = analyze_bridged_ab(Path(args.report), method=args.method)
+        print(f"Bridged A×B report saved to {output_path}")
+    else:
+        output_path = analyze_failure_slice(Path(args.report), top_k=args.k)
+        print(f"Failure slice report saved to {output_path}")
 
 
 def cmd_ablate_controller(args: argparse.Namespace) -> None:
@@ -1835,6 +2155,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--distractor_strength", type=float, default=0.3)
     gen.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1"], default="v0")
     gen.add_argument("--bridge_prob", type=float, default=0.8)
+    gen.add_argument("--bridged_mix_canonical_in_ticket_rate", type=float, default=0.0)
     gen.add_argument("--alias_density", type=float, default=0.9)
     gen.add_argument("--canonical_density", type=float, default=0.95)
     gen.add_argument("--bridge_kind", choices=["definition", "glossary"], default="definition")
@@ -1845,6 +2166,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--method", choices=["topk", "full", "goc", "oracle", "engine"], required=True)
     ev.add_argument("--model", type=str, default="gpt-4.1-mini")
     ev.add_argument("--llm", choices=["dummy", "openai"], default="openai")
+    ev.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
     ev.add_argument("--dotenv", type=str, default=".env")
     ev.add_argument("--out_dir", type=Path, default=None)
     ev.add_argument(
@@ -1875,6 +2197,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--bridge_bonus", type=float, default=1.5)
     ev.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
+    ev.add_argument("--open_split_mode", choices=["all_union_rank", "split_hop1_hop2"], default="all_union_rank")
+    ev.add_argument("--open_split_hop1", type=int, default=0)
     ev.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     ev.add_argument("--use_query_rewrite", action="store_true", default=True)
     ev.add_argument("--no_query_rewrite", action="store_false", dest="use_query_rewrite")
@@ -1901,6 +2225,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--methods", nargs="+", default=["topk", "full", "goc", "oracle", "engine"])
     cmp.add_argument("--model", type=str, default="gpt-4.1-mini")
     cmp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
+    cmp.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
     cmp.add_argument("--dotenv", type=str, default=".env")
     cmp.add_argument("--out_dir", type=Path, default=None)
     cmp.add_argument(
@@ -1931,6 +2256,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cmp.add_argument("--bridge_bonus", type=float, default=1.5)
     cmp.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
+    cmp.add_argument("--open_split_mode", choices=["all_union_rank", "split_hop1_hop2"], default="all_union_rank")
+    cmp.add_argument("--open_split_hop1", type=int, default=0)
     cmp.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     cmp.add_argument("--use_query_rewrite", action="store_true", default=True)
     cmp.add_argument("--no_query_rewrite", action="store_false", dest="use_query_rewrite")
@@ -1963,7 +2290,13 @@ def build_parser() -> argparse.ArgumentParser:
     swp.add_argument("--methods", nargs="+", default=["topk", "full", "goc", "oracle", "engine"])
     swp.add_argument("--model", type=str, default="gpt-4.1-mini")
     swp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
+    swp.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
     swp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1"], default="v0")
+    swp.add_argument("--bridge_prob", type=float, default=0.8)
+    swp.add_argument("--alias_density", type=float, default=0.9)
+    swp.add_argument("--canonical_density", type=float, default=0.95)
+    swp.add_argument("--bridge_kind", choices=["definition", "glossary"], default="definition")
+    swp.add_argument("--bridged_mix_canonical_in_ticket_rate", type=float, default=0.0)
     swp.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     swp.add_argument(
         "--search_score_mode",
@@ -1972,6 +2305,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     swp.add_argument("--bridge_bonus", type=float, default=1.5)
     swp.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
+    swp.add_argument("--open_split_mode", choices=["all_union_rank", "split_hop1_hop2"], default="all_union_rank")
+    swp.add_argument("--open_split_hop1", type=int, default=0)
     swp.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     swp.add_argument("--dotenv", type=str, default=".env")
     swp.add_argument("--out_dir", type=Path, default=None)
@@ -2019,12 +2354,15 @@ def build_parser() -> argparse.ArgumentParser:
     ana = sub.add_parser("analyze", help="Analyze compare report failure slices")
     ana.add_argument("--report", type=str, required=True)
     ana.add_argument("--k", type=int, default=20)
+    ana.add_argument("--mode", choices=["failure_slice", "bridged_ab"], default="failure_slice")
+    ana.add_argument("--method", type=str, default="goc")
     ana.set_defaults(func=cmd_analyze)
 
     abl = sub.add_parser("ablate_controller", help="Compare controller off vs rerank on")
     abl.add_argument("--methods", nargs="+", default=["goc"])
     abl.add_argument("--model", type=str, default="gpt-4.1-mini")
     abl.add_argument("--llm", choices=["dummy", "openai"], default="openai")
+    abl.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
     abl.add_argument("--dotenv", type=str, default=".env")
     abl.add_argument("--out_dir", type=Path, default=None)
     abl.add_argument(

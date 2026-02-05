@@ -186,20 +186,21 @@ def test_eval_smoke(tmp_path: Path) -> None:
         "method_reports": {
             "goc": {
                 "records": [
-                    {
-                        "task_id": "T1001",
-                        "gold_in_search_topk": True,
-                        "opened_gold_coverage": 0.0,
-                        "winning_clause_rank": 10,
-                        "open_budget": 5,
-                        "gold_decision": "allow",
-                        "pred_decision": "deny",
-                        "opened_has_winning_clause": False,
-                        "decision_correct": False,
-                        "evidence_before_pad": [],
-                        "evidence_after_pad": ["C1"],
-                        "gold_evidence_ids": ["C1"],
-                    },
+                        {
+                            "task_id": "T1001",
+                            "gold_in_search_topk": True,
+                            "opened_gold_coverage": 0.0,
+                            "winning_clause_rank": 10,
+                            "open_budget": 5,
+                            "gold_decision": "allow",
+                            "pred_decision": "deny",
+                            "opened_has_winning_clause": False,
+                            "decision_correct": False,
+                            "evidence_before_pad": [],
+                            "evidence_after_pad": ["C1"],
+                            "gold_evidence_ids": ["C1"],
+                            "selection_gap": 0.8,
+                        },
                     {
                         "task_id": "T1002",
                         "gold_in_search_topk": False,
@@ -221,6 +222,7 @@ def test_eval_smoke(tmp_path: Path) -> None:
     fake_out = triage_compare(fake_path, method="goc", max_per_bucket=1)
     assert (fake_out / "E_budget_edge_fail").exists()
     assert (fake_out / "F_evidence_padding_artifact").exists()
+    assert (fake_out / "SEL_GAP").exists()
 
     controller_dir = tmp_path / "controller_eval"
     generate_world_and_tasks(
@@ -466,9 +468,12 @@ def test_eval_smoke(tmp_path: Path) -> None:
         debug_task_ids="",
     )
     cmd_compare(engine_args)
-    engine_report = json.loads(
-        list((tmp_path / "runs" / "compare").glob("*.json"))[-1].read_text(encoding="utf-8")
+    engine_reports = sorted(
+        (tmp_path / "runs" / "compare").glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
     )
+    engine_report = json.loads(engine_reports[0].read_text(encoding="utf-8"))
     engine_summary = engine_report.get("summary", {}).get("engine", {})
     assert engine_summary.get("decision_accuracy") == 1.0
 

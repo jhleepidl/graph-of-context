@@ -112,6 +112,11 @@ def triage_compare(
             and r.get("hop2_query_contains_canonical") is False,
             "bridged_v1_1, bridge_needed=True, decision_correct=False, hop2_executed=True, canonical_used_in_query2=False",
         ),
+        "SEL_GAP": (
+            lambda r: isinstance(r.get("selection_gap"), (int, float))
+            and r.get("selection_gap") >= 0.5,
+            "selection_gap>=0.5",
+        ),
         "F_evidence_padding_artifact": (
             lambda r: (
                 not r.get("evidence_before_pad")

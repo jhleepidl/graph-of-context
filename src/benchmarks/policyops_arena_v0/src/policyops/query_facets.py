@@ -36,7 +36,7 @@ _ACTIONS = ["share", "export", "store", "retain", "delete", "transfer"]
 
 def _match_terms(text: str, terms: List[str]) -> bool:
     for term in terms:
-        if re.search(rf"\\b{re.escape(term)}\\b", text):
+        if re.search(rf"\b{re.escape(term)}\b", text):
             return True
     return False
 
@@ -55,8 +55,8 @@ def extract_facets(ticket_text: str) -> Dict[str, List[str]]:
         "region": _extract_from_map(text, _REGION_MAP),
         "purpose": _extract_from_map(text, _PURPOSE_MAP),
         "data_type": _extract_from_map(text, _DATA_TYPE_MAP),
-        "product": [p for p in _PRODUCTS if re.search(rf"\\b{re.escape(p)}\\b", text)],
-        "tier": [t for t in _TIERS if re.search(rf"\\b{re.escape(t)}\\b", text)],
-        "action": [a for a in _ACTIONS if re.search(rf"\\b{re.escape(a)}\\b", text)],
+        "product": [p for p in _PRODUCTS if re.search(rf"\b{re.escape(p)}\b", text)],
+        "tier": [t for t in _TIERS if re.search(rf"\b{re.escape(t)}\b", text)],
+        "action": [a for a in _ACTIONS if re.search(rf"\b{re.escape(a)}\b", text)],
     }
     return facets

@@ -3,6 +3,29 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+def merge_search_results_union(
+    hop1_results: List[Dict[str, Any]], hop2_results: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in hop1_results or []:
+        cid = item.get("clause_id")
+        if not cid:
+            continue
+        merged[cid] = dict(item)
+    for item in hop2_results or []:
+        cid = item.get("clause_id")
+        if not cid:
+            continue
+        if cid in merged:
+            if float(item.get("score", 0.0)) > float(merged[cid].get("score", 0.0)):
+                merged[cid]["score"] = item.get("score", 0.0)
+        else:
+            merged[cid] = dict(item)
+    results = list(merged.values())
+    results.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return results
+
+
 def compute_retrieval_diagnostics(
     opened_ids: List[str],
     gold_ids: List[str],

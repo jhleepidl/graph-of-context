@@ -187,6 +187,7 @@ def generate_world(
     distractor_strength: float = 0.3,
     scenario_mode: str = "v0",
     bridge_prob: float = 0.8,
+    bridged_mix_canonical_in_ticket_rate: float = 0.0,
     alias_density: float = 0.9,
     canonical_density: float = 0.95,
     bridge_kind: str = "definition",
@@ -584,6 +585,7 @@ def generate_tasks(
     n_tasks: int = 200,
     scenario_mode: str = "v0",
     bridge_prob: float = 0.8,
+    bridged_mix_canonical_in_ticket_rate: float = 0.0,
     alias_density: float = 0.9,
     products: Optional[List[str]] = None,
     tiers: Optional[List[str]] = None,
@@ -619,12 +621,17 @@ def generate_tasks(
         if scenario_mode == "bridged_v1_1":
             alias, canonical = BRIDGE_TERMS.get(slot, (slot_text, slot_text))
             canonical_slot_term = canonical
-            if rng.random() < alias_density:
+            if rng.random() < bridged_mix_canonical_in_ticket_rate:
+                slot_text = canonical
+                slot_hint_alias = None
+                bridge_clause_id = None
+            elif rng.random() < alias_density:
                 slot_text = alias
                 slot_hint_alias = alias
+                bridge_clause_id = world.meta.get("bridge_clause_by_slot", {}).get(slot)
             else:
                 slot_text = canonical
-            bridge_clause_id = world.meta.get("bridge_clause_by_slot", {}).get(slot)
+                bridge_clause_id = world.meta.get("bridge_clause_by_slot", {}).get(slot)
         ticket = (
             f"Customer asks about {slot_text} for the {context['product']} "
             f"{context['tier']} plan in {context['region']}. "
@@ -689,6 +696,7 @@ def generate_world_and_tasks(
     distractor_strength: float = 0.3,
     scenario_mode: str = "v0",
     bridge_prob: float = 0.8,
+    bridged_mix_canonical_in_ticket_rate: float = 0.0,
     alias_density: float = 0.9,
     canonical_density: float = 0.95,
     bridge_kind: str = "definition",
@@ -711,6 +719,7 @@ def generate_world_and_tasks(
         distractor_strength=distractor_strength,
         scenario_mode=scenario_mode,
         bridge_prob=bridge_prob,
+        bridged_mix_canonical_in_ticket_rate=bridged_mix_canonical_in_ticket_rate,
         alias_density=alias_density,
         canonical_density=canonical_density,
         bridge_kind=bridge_kind,
@@ -728,6 +737,7 @@ def generate_world_and_tasks(
         n_tasks=n_tasks,
         scenario_mode=scenario_mode,
         bridge_prob=bridge_prob,
+        bridged_mix_canonical_in_ticket_rate=bridged_mix_canonical_in_ticket_rate,
         alias_density=alias_density,
         products=products,
         tiers=tiers,
