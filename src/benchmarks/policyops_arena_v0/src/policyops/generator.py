@@ -451,6 +451,7 @@ def generate_world(
                 bridge_for_slot=slot,
                 bridge_targets=[canonical],
                 has_update_keywords=False,
+                is_bridge_doc=True,
             )
             clauses.append(bridge_clause)
             bridge_clause_by_slot[slot] = clause_id
@@ -506,6 +507,7 @@ def generate_world(
                 bridge_for_slot=other_slot,
                 bridge_targets=[canonical_other],
                 has_update_keywords=False,
+                is_bridge_doc=True,
             )
             clauses.append(distract_clause)
             doc_id = f"D{len(documents) + len(extra_docs) + 1:04d}"
@@ -617,13 +619,12 @@ def generate_tasks(
         if scenario_mode == "bridged_v1_1":
             alias, canonical = BRIDGE_TERMS.get(slot, (slot_text, slot_text))
             canonical_slot_term = canonical
-            use_bridge = rng.random() < bridge_prob
-            if use_bridge and rng.random() < alias_density:
+            if rng.random() < alias_density:
                 slot_text = alias
                 slot_hint_alias = alias
             else:
                 slot_text = canonical
-            bridge_clause_id = world.meta.get("bridge_clause_by_slot", {}).get(slot) if use_bridge else None
+            bridge_clause_id = world.meta.get("bridge_clause_by_slot", {}).get(slot)
         ticket = (
             f"Customer asks about {slot_text} for the {context['product']} "
             f"{context['tier']} plan in {context['region']}. "
@@ -631,7 +632,19 @@ def generate_tasks(
         )
         decision, conditions, evidence, debug = evaluate_context(world, context)
         needs_update_resolution = bool(debug.get("used_updates"))
-        gold = Gold(decision=decision, conditions=conditions, gold_evidence=evidence)
+        meta_ids = [
+            cid
+            for cid in evidence
+            if (world.clauses.get(cid) and world.clauses[cid].kind == "priority")
+        ]
+        core_ids = [cid for cid in evidence if cid not in meta_ids]
+        gold = Gold(
+            decision=decision,
+            conditions=conditions,
+            gold_evidence=evidence,
+            gold_evidence_core=core_ids,
+            gold_evidence_meta=meta_ids,
+        )
         task = Task(
             task_id=f"T{idx + 1:04d}",
             timestamp=(base_date + timedelta(days=idx)).strftime("%Y-%m-%d"),

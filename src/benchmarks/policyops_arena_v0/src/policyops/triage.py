@@ -99,21 +99,27 @@ def triage_compare(
         ),
         "G_bridge_fail": (
             lambda r: r.get("scenario_mode") == "bridged_v1_1"
-            and r.get("gold_in_search_topk") is True
-            and not r.get("bridge_found")
-            and r.get("decision_correct") is False,
-            "bridged_v1_1, gold_in_search_topk=True, bridge_found=False, decision_correct=False",
+            and r.get("bridge_needed") is True
+            and r.get("decision_correct") is False
+            and r.get("bridge_opened") is False,
+            "bridged_v1_1, bridge_needed=True, decision_correct=False, bridge_opened=False",
         ),
         "H_canonical_query_fail": (
-            lambda r: r.get("agent_query_policy") == "two_hop_bridge"
-            and r.get("canonical_used_in_query2") is False,
-            "two_hop_bridge and canonical_used_in_query2=False",
+            lambda r: r.get("scenario_mode") == "bridged_v1_1"
+            and r.get("bridge_needed") is True
+            and r.get("decision_correct") is False
+            and r.get("hop2_executed") is True
+            and r.get("hop2_query_contains_canonical") is False,
+            "bridged_v1_1, bridge_needed=True, decision_correct=False, hop2_executed=True, canonical_used_in_query2=False",
         ),
         "F_evidence_padding_artifact": (
             lambda r: (
                 not r.get("evidence_before_pad")
                 or len(r.get("evidence_before_pad") or []) == 0
-                or len(set(r.get("evidence_before_pad") or []) & set(r.get("gold_evidence_ids") or []))
+                or len(
+                    set(r.get("evidence_before_pad") or [])
+                    & set(r.get("gold_evidence_core_ids") or r.get("gold_evidence_ids") or [])
+                )
                 == 0
             )
             and len(r.get("evidence_after_pad") or []) > 0,
@@ -148,13 +154,22 @@ def triage_compare(
                 "gold_decision": rec.get("gold_decision"),
                 "opened_clause_ids": rec.get("opened_clause_ids"),
                 "forced_open_ids": rec.get("forced_open_ids"),
+                "opened_probe_clause_ids": rec.get("opened_probe_clause_ids"),
+                "opened_for_prompt_clause_ids": rec.get("opened_for_prompt_clause_ids"),
+                "opened_total_clause_ids": rec.get("opened_total_clause_ids"),
                 "opened_gold_coverage": rec.get("opened_gold_coverage"),
                 "gold_in_search_topk": rec.get("gold_in_search_topk"),
                 "winning_clause_rank": winning_clause_rank,
                 "min_gold_rank": min_gold_rank,
                 "open_budget": open_budget,
+                "budget_used": rec.get("open_calls"),
                 "budget_gap": budget_gap,
                 "gold_score_gap": rec.get("gold_score_gap"),
+                "bridge_clause_id": rec.get("bridge_clause_id"),
+                "hop1_query": rec.get("hop1_query_text"),
+                "hop2_query": rec.get("hop2_query"),
+                "meta_evidence_present": rec.get("meta_evidence_present"),
+                "core_evidence_size": rec.get("core_evidence_size"),
             }
 
             graph_jsonl = rec.get("goc_graph_jsonl_path")

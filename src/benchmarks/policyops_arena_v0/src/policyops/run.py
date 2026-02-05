@@ -260,6 +260,8 @@ def _evaluate_method(
                 rewrite_mode=args.query_rewrite_mode,
                 merge_rank_fusion=args.merge_rank_fusion,
                 agent_query_policy=agent_query_policy,
+                hop1_query_mode=getattr(args, "hop1_query_mode", "stripped"),
+                bridge_reward_bonus=float(getattr(args, "bridge_reward_bonus", 0.0)),
                 controller_policy=controller_policy,
             )
             if controller_action:
@@ -286,6 +288,9 @@ def _evaluate_method(
             raise ValueError(f"Unknown method: {method}")
 
         primary_results = diag.get("primary_search_results", []) if isinstance(diag, dict) else []
+        gold_core_ids = list(
+            getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
+        )
         retrieval_diag = compute_retrieval_diagnostics(
             opened_ids=opened_ids,
             gold_ids=list(task.gold.gold_evidence or []),
@@ -294,6 +299,16 @@ def _evaluate_method(
             if isinstance(diag, dict)
             else args.primary_search_top_k,
             save_snapshot=args.save_search_snapshot,
+            snapshot_k=args.search_snapshot_k,
+        )
+        retrieval_diag_core = compute_retrieval_diagnostics(
+            opened_ids=opened_ids,
+            gold_ids=gold_core_ids,
+            search_results=primary_results,
+            top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
+            if isinstance(diag, dict)
+            else args.primary_search_top_k,
+            save_snapshot=False,
             snapshot_k=args.search_snapshot_k,
         )
 
@@ -366,17 +381,27 @@ def _evaluate_method(
             "bridge_clause_id": bridge_clause_id,
             "needs_update_resolution": getattr(task, "needs_update_resolution", False),
             "bridge_found": bridge_found,
-            "canonical_used_in_query2": bool(diag.get("canonical_used_in_query2"))
+            "canonical_used_in_query2": bool(diag.get("hop2_query_contains_canonical"))
             if isinstance(diag, dict)
             else False,
             "update_found_when_needed": update_found_when_needed,
             "winning_rank_exists": winning_rank_exists,
             "evidence_precision": task_metrics.get("evidence_precision"),
             "evidence_recall": task_metrics.get("evidence_recall"),
+            "evidence_precision_core": task_metrics.get("evidence_precision_core"),
+            "evidence_recall_core": task_metrics.get("evidence_recall_core"),
             "critical_evidence_hit": task_metrics.get("critical_evidence_hit"),
             "pred_evidence_count": len(pred_for_record.get("evidence", []) or []),
             "gold_evidence_count": len(task.gold.gold_evidence or []),
             "gold_evidence_ids": list(task.gold.gold_evidence or []),
+            "gold_evidence_core_ids": list(
+                getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
+            ),
+            "gold_evidence_meta_ids": list(getattr(task.gold, "gold_evidence_meta", None) or []),
+            "meta_evidence_present": bool(getattr(task.gold, "gold_evidence_meta", None)),
+            "core_evidence_size": len(
+                getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
+            ),
             "evidence_before_pad": evidence_before,
             "evidence_after_pad": evidence_after,
             "error": error,
@@ -393,7 +418,23 @@ def _evaluate_method(
         if not args.save_search_snapshot:
             record.pop("rewrite_queries", None)
             record.pop("rewrite_used", None)
+            record.pop("hop1_query_text", None)
         record.update(retrieval_diag)
+        record.update(
+            {
+                "opened_gold_count_core": retrieval_diag_core.get("opened_gold_count"),
+                "opened_gold_coverage_core": retrieval_diag_core.get("opened_gold_coverage"),
+                "opened_has_winning_clause_core": retrieval_diag_core.get(
+                    "opened_has_winning_clause"
+                ),
+                "gold_in_search_topk_core": retrieval_diag_core.get("gold_in_search_topk"),
+                "min_gold_rank_core": retrieval_diag_core.get("min_gold_rank"),
+                "winning_clause_rank_core": retrieval_diag_core.get("winning_clause_rank"),
+                "best_gold_score_core": retrieval_diag_core.get("best_gold_score"),
+                "best_non_gold_score_core": retrieval_diag_core.get("best_non_gold_score"),
+                "gold_score_gap_core": retrieval_diag_core.get("gold_score_gap"),
+            }
+        )
         if args.evidence_padding_mode in {"schema_only", "global"}:
             record["evidence_before_pad"] = evidence_before
             record["evidence_after_pad"] = evidence_after
@@ -663,6 +704,8 @@ def _evaluate_method(
                 elif controller_action:
                     selected_by = "controller_bandit"
                 reason = selected_by
+                probe_ids = set(diag.get("opened_probe_clause_ids", []) if isinstance(diag, dict) else [])
+                open_stage = "probe" if cid in probe_ids else "prompt"
                 bm25_meta = first_seen.get(cid, {})
                 rerank_score = rerank_scores.get(cid) if rerank_scores else None
                 controller_context_key = None
@@ -701,6 +744,8 @@ def _evaluate_method(
                     "opened",
                     open_step=idx,
                     reason=reason,
+                    open_stage=open_stage,
+                    selected_for_prompt=open_stage == "prompt",
                     selected_by=selected_by,
                     from_query_id=bm25_meta.get("query_id"),
                     bm25_rank=bm25_meta.get("rank"),
@@ -716,6 +761,8 @@ def _evaluate_method(
                     {
                         "clause_id": cid,
                         "reason": reason,
+                        "open_stage": open_stage,
+                        "selected_for_prompt": open_stage == "prompt",
                         "open_index": idx,
                         "selected_by": selected_by,
                         "from_query_id": bm25_meta.get("query_id"),
@@ -775,9 +822,14 @@ def _evaluate_method(
                 "summary",
                 text="prompt_materialization",
             )
+            prompt_clause_ids = (
+                diag.get("opened_for_prompt_clause_ids", [])
+                if isinstance(diag, dict) and diag.get("opened_for_prompt_clause_ids") is not None
+                else opened_ids
+            )
             prompt_payload = goc_graph.materialize_prompt(
                 prompt_id,
-                [f"doc:{cid}" for cid in opened_ids],
+                [f"doc:{cid}" for cid in prompt_clause_ids],
                 budget_info={"open_budget": env.open_budget},
                 controller_info=controller_info,
             )
@@ -901,6 +953,12 @@ def _evaluate_method(
 
     aggregate = aggregate_metrics(metrics)
     aggregate["gold_decision_distribution"] = gold_decision_distribution(tasks)
+    if records:
+        aggregate["opened_gold_coverage_core_mean"] = sum(
+            r.get("opened_gold_coverage_core", 0.0) for r in records
+        ) / len(records)
+    else:
+        aggregate["opened_gold_coverage_core_mean"] = 0.0
     bridge_records = [r for r in records if r.get("bridge_clause_id")]
     if bridge_records:
         aggregate["bridge_found_rate"] = sum(1 for r in bridge_records if r.get("bridge_found")) / len(
@@ -1152,6 +1210,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     methods = args.methods or ["topk", "full", "goc", "oracle", "engine"]
     train_tasks, eval_tasks = _split_tasks(tasks, args.task_split, args.train_ratio, args.split_seed)
+    if args.controller_mode == "train" and not train_tasks:
+        train_tasks = eval_tasks
     controller: Controller | RerankController | None = None
     controller_mode = "off"
     state_path = None
@@ -1436,13 +1496,14 @@ def _run_compare_with_tasks(
                 train_args = argparse.Namespace(**vars(args))
                 train_args.save_prompts = False
                 train_args.save_raw = False
+                train_out_dir = Path(base_dir) / "runs" / "controller_train"
                 _evaluate_method(
                     "goc",
                     world,
                     train_tasks,
                     train_args,
                     DummyClient(),
-                    output_dir / "controller_train",
+                    train_out_dir,
                     controller=controller,
                     controller_mode="train",
                     controller_policy="rerank",
@@ -1455,13 +1516,14 @@ def _run_compare_with_tasks(
                 train_args = argparse.Namespace(**vars(args))
                 train_args.save_prompts = False
                 train_args.save_raw = False
+                train_out_dir = Path(base_dir) / "runs" / "controller_train"
                 _evaluate_method(
                     "goc",
                     world,
                     train_tasks,
                     train_args,
                     DummyClient(),
-                    output_dir / "controller_train",
+                    train_out_dir,
                     controller=controller,
                     controller_mode="train",
                     controller_policy="bandit",
@@ -1812,6 +1874,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="bm25_plus_bridge_bonus",
     )
     ev.add_argument("--bridge_bonus", type=float, default=1.5)
+    ev.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
+    ev.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     ev.add_argument("--use_query_rewrite", action="store_true", default=True)
     ev.add_argument("--no_query_rewrite", action="store_false", dest="use_query_rewrite")
     ev.add_argument(
@@ -1866,6 +1930,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="bm25_plus_bridge_bonus",
     )
     cmp.add_argument("--bridge_bonus", type=float, default=1.5)
+    cmp.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
+    cmp.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     cmp.add_argument("--use_query_rewrite", action="store_true", default=True)
     cmp.add_argument("--no_query_rewrite", action="store_false", dest="use_query_rewrite")
     cmp.add_argument(
@@ -1905,6 +1971,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="bm25_plus_bridge_bonus",
     )
     swp.add_argument("--bridge_bonus", type=float, default=1.5)
+    swp.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
+    swp.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     swp.add_argument("--dotenv", type=str, default=".env")
     swp.add_argument("--out_dir", type=Path, default=None)
     swp.add_argument(

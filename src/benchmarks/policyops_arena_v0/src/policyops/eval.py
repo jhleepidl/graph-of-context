@@ -40,6 +40,8 @@ def evaluate_prediction(pred: Dict[str, Any], gold: Gold, world: World) -> Dict[
     pred_evidence = set(pred.get("evidence", []) or [])
     gold_evidence = set(gold.gold_evidence or [])
     evidence_precision, evidence_recall = _precision_recall(pred_evidence, gold_evidence)
+    core_ids = set(getattr(gold, "gold_evidence_core", []) or gold.gold_evidence or [])
+    evidence_precision_core, evidence_recall_core = _precision_recall(pred_evidence, core_ids)
 
     # Critical evidence hit ratio.
     required_kinds = set()
@@ -61,6 +63,8 @@ def evaluate_prediction(pred: Dict[str, Any], gold: Gold, world: World) -> Dict[
         "condition_f1": cond_f1,
         "evidence_precision": evidence_precision,
         "evidence_recall": evidence_recall,
+        "evidence_precision_core": evidence_precision_core,
+        "evidence_recall_core": evidence_recall_core,
         "critical_evidence_hit": critical_hit,
     }
 

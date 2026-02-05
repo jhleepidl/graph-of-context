@@ -54,12 +54,15 @@ if USE_PYDANTIC:
         bridge_for_slot: Optional[str] = None
         bridge_targets: List[str] = Field(default_factory=list)
         has_update_keywords: bool = False
+        is_bridge_doc: bool = False
 
 
     class Gold(_BaseModel):
         decision: str
         conditions: List[str]
         gold_evidence: List[str]
+        gold_evidence_core: List[str] = Field(default_factory=list)
+        gold_evidence_meta: List[str] = Field(default_factory=list)
 
 
     class Task(_BaseModel):
@@ -117,6 +120,7 @@ else:
         bridge_for_slot: Optional[str] = None
         bridge_targets: List[str] = field(default_factory=list)
         has_update_keywords: bool = False
+        is_bridge_doc: bool = False
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)
@@ -127,6 +131,8 @@ else:
         decision: str
         conditions: List[str]
         gold_evidence: List[str]
+        gold_evidence_core: List[str] = field(default_factory=list)
+        gold_evidence_meta: List[str] = field(default_factory=list)
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)

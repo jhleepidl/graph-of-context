@@ -29,6 +29,13 @@ def test_bridged_scenario_two_hop_and_scoring(tmp_path: Path) -> None:
     task = next(t for t in tasks if t.bridge_clause_id)
     assert task.slot_hint_alias
     assert task.canonical_slot_term
+    bridge_clause = world.clauses.get(task.bridge_clause_id)
+    assert bridge_clause is not None
+    assert bridge_clause.is_bridge_doc is True
+    assert bridge_clause.bridge_for_slot == task.context.get("slot")
+    assert bridge_clause.canonical_terms
+    core_counts = [len(getattr(t.gold, "gold_evidence_core", []) or []) for t in tasks]
+    assert sum(1 for c in core_counts if c >= 1) >= 3
 
     env = PolicyOpsEnv(
         world,
@@ -94,13 +101,47 @@ def test_bridged_scenario_two_hop_and_scoring(tmp_path: Path) -> None:
     report = json.loads(compare_reports[-1].read_text(encoding="utf-8"))
     goc_records = report.get("method_reports", {}).get("goc", {}).get("records", [])
     assert goc_records
+    assert all(r.get("open_calls") <= r.get("open_budget") for r in goc_records)
+    assert any(r.get("bridge_opened_in_probe") for r in goc_records)
+    assert any(r.get("hop2_executed") and r.get("hop2_query_contains_canonical") for r in goc_records)
 
     graph_path = tmp_path / "goc_graph.jsonl"
-    lines = [json.loads(line) for line in graph_path.read_text(encoding="utf-8").splitlines()]
+    task_id = goc_records[0].get("task_id")
+    lines = []
+    for line in graph_path.read_text(encoding="utf-8").splitlines():
+        data = json.loads(line)
+        if data.get("task_id") == task_id:
+            lines.append(data)
     search_events = [line for line in lines if line.get("event_type") == "SEARCH"]
     assert len(search_events) >= 2
+    assert all(
+        "secondary" not in (evt.get("payload", {}).get("query_id") or "")
+        for evt in search_events
+    )
     assert any(
         task.canonical_slot_term in evt.get("payload", {}).get("query", "")
         for evt in search_events
         if isinstance(evt.get("payload", {}).get("query"), str)
+    )
+    open_events = [line for line in lines if line.get("event_type") == "OPEN"]
+    assert open_events
+    assert all(evt["payload"].get("open_stage") in {"probe", "prompt"} for evt in open_events)
+    assert any(evt["payload"].get("open_stage") == "probe" for evt in open_events)
+    opened_ids = [evt["payload"].get("clause_id") for evt in open_events if evt["payload"].get("clause_id")]
+    assert len(opened_ids) == len(set(opened_ids))
+
+    # reward shaping flag
+    reward_args = argparse.Namespace(**vars(compare_args))
+    reward_args.use_controller = True
+    reward_args.controller_mode = "train"
+    reward_args.controller_policy = "bandit"
+    reward_args.bridge_reward_bonus = 0.2
+    cmd_compare(reward_args)
+    train_reports = list((tmp_path / "runs" / "controller_train").glob("*.json"))
+    assert train_reports
+    reward_report = json.loads(train_reports[-1].read_text())
+    reward_records = reward_report.get("records", [])
+    assert any(
+        rec.get("controller_reward_breakdown") and "r_bridge" in rec["controller_reward_breakdown"]
+        for rec in reward_records
     )

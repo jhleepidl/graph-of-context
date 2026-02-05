@@ -136,9 +136,15 @@ class ClauseIndex:
                     "bonus_applied": bonus,
                     "snippet": make_snippet(clause.text),
                     "doc_id": clause.doc_id,
+                    "kind": clause.kind,
+                    "slot": clause.slot,
+                    "published_at": clause.published_at,
+                    "authority": clause.authority,
                     "query_contains_canonical": query_contains_canonical,
                     "query_contains_update_kw": query_contains_update_kw,
-                    "is_bridge_doc": bool(clause.bridge_for_slot) or clause.kind in {"definition", "glossary"},
+                    "is_bridge_doc": bool(clause.bridge_for_slot)
+                    or clause.kind in {"definition", "glossary"}
+                    or bool(getattr(clause, "is_bridge_doc", False)),
                     "bridge_for_slot": clause.bridge_for_slot,
                 }
             )
