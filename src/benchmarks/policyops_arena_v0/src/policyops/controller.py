@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -17,6 +18,8 @@ KEYWORD_WEIGHTS = {
     "definition": 2.0,
     "exception": 1.5,
 }
+
+RERANK_COND_KW = ["allowed only after", "conditions:", "provided that", "must", "require"]
 
 
 def _keyword_hit(snippet: str, keywords: List[str]) -> bool:
@@ -40,6 +43,15 @@ def _merge_results(seed_results: List[Dict[str, Any]], expanded_results: List[Di
             if not current.get("snippet") and snippet:
                 current["snippet"] = snippet
     return merged
+
+
+def _parse_date_ordinal(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").toordinal()
+    except Exception:
+        return None
 
 
 @dataclass
@@ -150,8 +162,19 @@ class Controller:
         action: str,
         seed_results: List[Dict[str, Any]],
         expanded_results: List[Dict[str, Any]],
+        clause_lookup: Dict[str, Any] | None = None,
     ) -> List[str]:
         merged = _merge_results(seed_results, expanded_results)
+        recency_ordinals: Dict[str, int] = {}
+        for clause_id, item in merged.items():
+            published_at = item.get("published_at")
+            if not published_at and clause_lookup and clause_id in clause_lookup:
+                published_at = getattr(clause_lookup[clause_id], "published_at", None)
+            ordinal = _parse_date_ordinal(str(published_at)) if published_at else None
+            if ordinal is not None:
+                recency_ordinals[clause_id] = ordinal
+        min_ord = min(recency_ordinals.values()) if recency_ordinals else None
+        max_ord = max(recency_ordinals.values()) if recency_ordinals else None
         ranked: List[Tuple[float, str]] = []
         for clause_id, item in merged.items():
             snippet = str(item.get("snippet", "")).lower()
@@ -184,6 +207,14 @@ class Controller:
                 except ValueError:
                     alpha = 0.5
                 score = alpha * base_score + (1.0 - alpha) * keyword_priority
+            elif action == "recency_biased":
+                recency_bonus = 0.0
+                if clause_id in recency_ordinals and min_ord is not None and max_ord is not None:
+                    if max_ord > min_ord:
+                        recency_bonus = (recency_ordinals[clause_id] - min_ord) / (max_ord - min_ord)
+                    else:
+                        recency_bonus = 1.0
+                score = base_score + (2.0 * recency_bonus)
             else:
                 score = base_score + bonus
             ranked.append((score, clause_id))
@@ -214,3 +245,136 @@ class Controller:
             ctrl = cls(actions=actions, epsilon=float(data.get("epsilon", epsilon)), stats=stats)
             return ctrl
         return cls(epsilon=epsilon)
+
+
+class RerankController:
+    def __init__(self, weights: Dict[str, float] | None = None, lr: float = 0.1) -> None:
+        self.weights = weights or {
+            "bm25": 1.0,
+            "is_update": 0.5,
+            "is_exception": 0.4,
+            "is_definition": 0.4,
+            "has_conditions_kw": 0.3,
+            "recency": 0.2,
+            "slot_match": 0.6,
+            "bias": 0.0,
+        }
+        self.lr = lr
+
+    def _normalize_scores(self, candidates: List[Dict[str, Any]]) -> Dict[str, float]:
+        max_score = max((float(item.get("score", 0.0)) for item in candidates), default=0.0)
+        if max_score <= 0:
+            return {item["clause_id"]: 0.0 for item in candidates if item.get("clause_id")}
+        return {
+            item["clause_id"]: float(item.get("score", 0.0)) / max_score
+            for item in candidates
+            if item.get("clause_id")
+        }
+
+    def _recency_norm(self, candidates: List[Dict[str, Any]], clause_lookup: Dict[str, Any]) -> Dict[str, float]:
+        ords: Dict[str, int] = {}
+        for item in candidates:
+            clause_id = item.get("clause_id")
+            if not clause_id:
+                continue
+            published_at = item.get("published_at")
+            if not published_at and clause_id in clause_lookup:
+                published_at = getattr(clause_lookup[clause_id], "published_at", None)
+            ordinal = _parse_date_ordinal(str(published_at)) if published_at else None
+            if ordinal is not None:
+                ords[clause_id] = ordinal
+        if not ords:
+            return {}
+        min_ord = min(ords.values())
+        max_ord = max(ords.values())
+        if max_ord == min_ord:
+            return {cid: 1.0 for cid in ords}
+        return {cid: (ord_val - min_ord) / (max_ord - min_ord) for cid, ord_val in ords.items()}
+
+    def _features(
+        self,
+        item: Dict[str, Any],
+        clause_lookup: Dict[str, Any],
+        task_context: Dict[str, Any],
+        bm25_norm: Dict[str, float],
+        recency_norm: Dict[str, float],
+    ) -> Dict[str, float]:
+        clause_id = item.get("clause_id")
+        clause = clause_lookup.get(clause_id) if clause_id else None
+        snippet = str(item.get("snippet", "")).lower()
+        return {
+            "bm25": bm25_norm.get(clause_id, 0.0),
+            "is_update": 1.0 if clause and clause.kind == "update" else 0.0,
+            "is_exception": 1.0 if clause and clause.kind == "exception" else 0.0,
+            "is_definition": 1.0 if clause and clause.kind == "definition" else 0.0,
+            "has_conditions_kw": 1.0 if _keyword_hit(snippet, RERANK_COND_KW) else 0.0,
+            "recency": recency_norm.get(clause_id, 0.0),
+            "slot_match": 1.0
+            if clause and task_context.get("slot") and clause.slot == task_context.get("slot")
+            else 0.0,
+        }
+
+    def score_candidates(
+        self,
+        seed_results: List[Dict[str, Any]],
+        expanded_results: List[Dict[str, Any]],
+        world: Any,
+        task_context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        merged = _merge_results(seed_results, expanded_results)
+        candidates = list(merged.values())
+        bm25_norm = self._normalize_scores(candidates)
+        recency_norm = self._recency_norm(candidates, world.clauses)
+        scores: Dict[str, float] = {}
+        for item in candidates:
+            clause_id = item.get("clause_id")
+            if not clause_id:
+                continue
+            feats = self._features(item, world.clauses, task_context, bm25_norm, recency_norm)
+            score = self.weights.get("bias", 0.0)
+            for name, value in feats.items():
+                score += self.weights.get(name, 0.0) * value
+            scores[clause_id] = score
+        return scores
+
+    def update_weights(
+        self,
+        seed_results: List[Dict[str, Any]],
+        expanded_results: List[Dict[str, Any]],
+        world: Any,
+        task_context: Dict[str, Any],
+        gold: Any,
+    ) -> None:
+        merged = _merge_results(seed_results, expanded_results)
+        candidates = list(merged.values())
+        if not candidates:
+            return
+        bm25_norm = self._normalize_scores(candidates)
+        recency_norm = self._recency_norm(candidates, world.clauses)
+        gold_set = set(gold.gold_evidence or [])
+        for item in candidates:
+            clause_id = item.get("clause_id")
+            if not clause_id:
+                continue
+            feats = self._features(item, world.clauses, task_context, bm25_norm, recency_norm)
+            label = 1.0 if clause_id in gold_set else 0.0
+            score = self.weights.get("bias", 0.0)
+            for name, value in feats.items():
+                score += self.weights.get(name, 0.0) * value
+            pred = 1.0 / (1.0 + pow(2.718281828, -score))
+            grad = pred - label
+            for name, value in feats.items():
+                self.weights[name] = self.weights.get(name, 0.0) - self.lr * grad * value
+            self.weights["bias"] = self.weights.get("bias", 0.0) - self.lr * grad
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"weights": self.weights, "lr": self.lr}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path, lr: float = 0.1) -> "RerankController":
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return cls(weights=data.get("weights", {}), lr=float(data.get("lr", lr)))
+        return cls(lr=lr)

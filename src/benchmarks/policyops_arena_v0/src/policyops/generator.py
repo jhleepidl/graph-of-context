@@ -62,6 +62,15 @@ SLOT_TERMS = {
     "retain_logs_90d": ["TERM_LOGS", "TERM_RETENTION"],
 }
 
+BRIDGE_TERMS = {
+    "export_identifiers": ("export identifiers", "identifier export"),
+    "export_logs": ("export logs", "telemetry export"),
+    "share_health_data": ("health data sharing", "clinical data sharing"),
+    "retain_logs_90d": ("retain logs 90 days", "log retention 90 days"),
+}
+
+UPDATE_KEYWORDS = ["effective immediately", "supersedes", "amendment", "revoke"]
+
 
 def _make_applies_if(
     rng: random.Random,
@@ -119,6 +128,10 @@ def _build_clause(
     term_label: Optional[str] = None,
     term_definition: Optional[str] = None,
     override_hint: Optional[str] = None,
+    canonical_terms: Optional[List[str]] = None,
+    aliases: Optional[List[str]] = None,
+    bridge_for_slot: Optional[str] = None,
+    bridge_targets: Optional[List[str]] = None,
 ) -> Clause:
     targets = targets or {"overrides": [], "revokes": [], "defines": []}
     text = render_clause_text(
@@ -131,6 +144,10 @@ def _build_clause(
         term_definition=term_definition,
         override_hint=override_hint,
     )
+    canonical_terms = canonical_terms or []
+    aliases = aliases or []
+    bridge_targets = bridge_targets or []
+    has_update_keywords = kind == "update" or any(kw in text.lower() for kw in UPDATE_KEYWORDS)
     return Clause(
         clause_id=clause_id,
         doc_id="",
@@ -144,7 +161,19 @@ def _build_clause(
         conditions=conditions,
         targets=targets,
         terms_used=terms_used,
+        canonical_terms=canonical_terms,
+        aliases=aliases,
+        bridge_for_slot=bridge_for_slot,
+        bridge_targets=bridge_targets,
+        has_update_keywords=has_update_keywords,
     )
+
+
+def _replace_slot_text(text: str, slot: str, replacement: str) -> str:
+    slot_text = SLOT_LABELS.get(slot, slot.replace("_", " "))
+    if slot_text in text:
+        return text.replace(slot_text, replacement)
+    return text
 
 
 def generate_world(
@@ -156,6 +185,11 @@ def generate_world(
     update_rate: float = 0.3,
     definition_density: float = 0.4,
     distractor_strength: float = 0.3,
+    scenario_mode: str = "v0",
+    bridge_prob: float = 0.8,
+    alias_density: float = 0.9,
+    canonical_density: float = 0.95,
+    bridge_kind: str = "definition",
     authorities: Optional[List[str]] = None,
     products: Optional[List[str]] = None,
     tiers: Optional[List[str]] = None,
@@ -386,21 +420,156 @@ def generate_world(
         clauses.append(clause)
 
     # Assign clauses to documents.
+    bridge_clause_by_slot: Dict[str, str] = {}
+    extra_doc_ids: List[str] = []
+    if scenario_mode == "bridged_v1_1":
+        extra_docs: List[Document] = []
+        for slot in SLOTS:
+            alias, canonical = BRIDGE_TERMS.get(slot, (slot.replace("_", " "), slot.replace("_", " ")))
+            clause_id = _next_clause_id(clause_counter)
+            clause_counter += 1
+            bridge_text = (
+                f"For the purposes of this policy, '{canonical}' includes {alias} ('{alias}')."
+                if bridge_kind == "definition"
+                else f"Glossary: '{alias}' refers to '{canonical}'."
+            )
+            bridge_clause = Clause(
+                clause_id=clause_id,
+                doc_id="",
+                published_at="",
+                authority=rng.choice(authorities),
+                text=bridge_text,
+                kind=bridge_kind,
+                slot="definition",
+                applies_if={},
+                effect={"decision": "needs_more_info"},
+                conditions=[],
+                targets={"overrides": [], "revokes": [], "defines": []},
+                terms_used=[],
+                canonical_terms=[canonical],
+                aliases=[alias],
+                bridge_for_slot=slot,
+                bridge_targets=[canonical],
+                has_update_keywords=False,
+            )
+            clauses.append(bridge_clause)
+            bridge_clause_by_slot[slot] = clause_id
+
+            doc_id = f"D{len(documents) + len(extra_docs) + 1:04d}"
+            published_at = (base_date + timedelta(days=(len(documents) + len(extra_docs)) * 3)).strftime(
+                "%Y-%m-%d"
+            )
+            extra_docs.append(
+                Document(
+                    doc_id=doc_id,
+                    doc_type="glossary" if bridge_kind == "glossary" else "policy",
+                    title=f"Bridge {slot} {len(extra_docs) + 1}",
+                    published_at=published_at,
+                    authority=bridge_clause.authority,
+                    jurisdiction=list(regions),
+                    applies_to={"products": list(products), "tiers": list(tiers)},
+                    sections=[clause_id],
+                )
+            )
+            bridge_clause.doc_id = doc_id
+            bridge_clause.published_at = published_at
+            extra_doc_ids.append(doc_id)
+
+        # Add distractor bridge-like clauses.
+        slot_list = list(SLOTS)
+        for slot in SLOTS:
+            other_slot = rng.choice([s for s in slot_list if s != slot])
+            alias, _canonical = BRIDGE_TERMS.get(slot, (slot.replace("_", " "), slot.replace("_", " ")))
+            _alias_other, canonical_other = BRIDGE_TERMS.get(
+                other_slot, (other_slot.replace("_", " "), other_slot.replace("_", " "))
+            )
+            clause_id = _next_clause_id(clause_counter)
+            clause_counter += 1
+            distract_text = (
+                f"For the purposes of this policy, '{canonical_other}' includes {alias} ('{alias}')."
+            )
+            distract_clause = Clause(
+                clause_id=clause_id,
+                doc_id="",
+                published_at="",
+                authority=rng.choice(authorities),
+                text=distract_text,
+                kind=bridge_kind,
+                slot="definition",
+                applies_if={},
+                effect={"decision": "needs_more_info"},
+                conditions=[],
+                targets={"overrides": [], "revokes": [], "defines": []},
+                terms_used=[],
+                canonical_terms=[canonical_other],
+                aliases=[alias],
+                bridge_for_slot=other_slot,
+                bridge_targets=[canonical_other],
+                has_update_keywords=False,
+            )
+            clauses.append(distract_clause)
+            doc_id = f"D{len(documents) + len(extra_docs) + 1:04d}"
+            published_at = (base_date + timedelta(days=(len(documents) + len(extra_docs)) * 3)).strftime(
+                "%Y-%m-%d"
+            )
+            extra_docs.append(
+                Document(
+                    doc_id=doc_id,
+                    doc_type="glossary" if bridge_kind == "glossary" else "policy",
+                    title=f"Distractor {slot} {len(extra_docs) + 1}",
+                    published_at=published_at,
+                    authority=distract_clause.authority,
+                    jurisdiction=list(regions),
+                    applies_to={"products": list(products), "tiers": list(tiers)},
+                    sections=[clause_id],
+                )
+            )
+            distract_clause.doc_id = doc_id
+            distract_clause.published_at = published_at
+            extra_doc_ids.append(doc_id)
+
+        documents.extend(extra_docs)
+
+        for clause in clauses:
+            if clause.slot in SLOTS:
+                alias, canonical = BRIDGE_TERMS.get(clause.slot, (clause.slot, clause.slot))
+                clause.canonical_terms = [canonical]
+                clause.aliases = [alias]
+                if rng.random() < canonical_density:
+                    clause.text = _replace_slot_text(clause.text, clause.slot, canonical)
+                elif rng.random() < alias_density:
+                    clause.text = _replace_slot_text(clause.text, clause.slot, alias)
+                clause.has_update_keywords = clause.kind == "update" or any(
+                    kw in clause.text.lower() for kw in UPDATE_KEYWORDS
+                )
+
+    doc_lookup = {doc.doc_id: doc for doc in documents}
+    doc_capacity = {doc.doc_id: clauses_per_doc for doc in documents}
+    for doc_id in extra_doc_ids:
+        doc_capacity[doc_id] = 0
+
     for clause in clauses:
-        doc = pick_doc(clause.kind)
-        clause.doc_id = doc.doc_id
-        clause.published_at = doc.published_at
-        clause.authority = doc.authority
-        doc.sections.append(clause.clause_id)
-        if clause.kind == "update":
-            doc.doc_type = rng.choice(UPDATE_DOC_TYPES)
-        elif doc.doc_type == "policy":
-            doc.doc_type = rng.choice(POLICY_DOC_TYPES)
+        if clause.doc_id:
+            doc = doc_lookup.get(clause.doc_id)
+        else:
+            doc = pick_doc(clause.kind)
+            clause.doc_id = doc.doc_id
+            clause.published_at = doc.published_at
+            clause.authority = doc.authority
+        if doc:
+            doc.sections.append(clause.clause_id)
+            if clause.kind == "update":
+                doc.doc_type = rng.choice(UPDATE_DOC_TYPES)
+            elif doc.doc_type == "policy":
+                doc.doc_type = rng.choice(POLICY_DOC_TYPES)
 
     meta = {
         "term_definitions": term_definitions,
         "priority_clause_ids": priority_clause_ids,
         "authority_priority": {"security": 0, "legal": 1, "product": 2, "support": 3},
+        "scenario_mode": scenario_mode,
+        "bridge_clause_by_slot": bridge_clause_by_slot,
+        "bridge_terms": {slot: {"alias": BRIDGE_TERMS[slot][0], "canonical": BRIDGE_TERMS[slot][1]} for slot in SLOTS},
     }
 
     return World(documents=documents, clauses={c.clause_id: c for c in clauses}, meta=meta)
@@ -411,6 +580,9 @@ def generate_tasks(
     *,
     seed: int = 0,
     n_tasks: int = 200,
+    scenario_mode: str = "v0",
+    bridge_prob: float = 0.8,
+    alias_density: float = 0.9,
     products: Optional[List[str]] = None,
     tiers: Optional[List[str]] = None,
     regions: Optional[List[str]] = None,
@@ -437,12 +609,28 @@ def generate_tasks(
             "data_type": rng.choice(data_types),
             "purpose": rng.choice(purposes),
         }
+        slot_text = SLOT_LABELS.get(slot, slot)
+        slot_hint_alias = None
+        canonical_slot_term = None
+        bridge_clause_id = None
+        needs_update_resolution = False
+        if scenario_mode == "bridged_v1_1":
+            alias, canonical = BRIDGE_TERMS.get(slot, (slot_text, slot_text))
+            canonical_slot_term = canonical
+            use_bridge = rng.random() < bridge_prob
+            if use_bridge and rng.random() < alias_density:
+                slot_text = alias
+                slot_hint_alias = alias
+            else:
+                slot_text = canonical
+            bridge_clause_id = world.meta.get("bridge_clause_by_slot", {}).get(slot) if use_bridge else None
         ticket = (
-            f"Customer asks about {SLOT_LABELS.get(slot, slot)} for the {context['product']} "
+            f"Customer asks about {slot_text} for the {context['product']} "
             f"{context['tier']} plan in {context['region']}. "
             f"Data type: {context['data_type']}. Purpose: {context['purpose']}."
         )
-        decision, conditions, evidence, _ = evaluate_context(world, context)
+        decision, conditions, evidence, debug = evaluate_context(world, context)
+        needs_update_resolution = bool(debug.get("used_updates"))
         gold = Gold(decision=decision, conditions=conditions, gold_evidence=evidence)
         task = Task(
             task_id=f"T{idx + 1:04d}",
@@ -451,6 +639,11 @@ def generate_tasks(
             context=context,
             budgets={"tool_call_budget": 50, "open_budget": 5},
             gold=gold,
+            scenario_mode=scenario_mode,
+            slot_hint_alias=slot_hint_alias,
+            canonical_slot_term=canonical_slot_term,
+            bridge_clause_id=bridge_clause_id,
+            needs_update_resolution=needs_update_resolution,
         )
         tasks.append(task)
 
@@ -481,6 +674,11 @@ def generate_world_and_tasks(
     update_rate: float = 0.3,
     definition_density: float = 0.4,
     distractor_strength: float = 0.3,
+    scenario_mode: str = "v0",
+    bridge_prob: float = 0.8,
+    alias_density: float = 0.9,
+    canonical_density: float = 0.95,
+    bridge_kind: str = "definition",
     authorities: Optional[List[str]] = None,
     products: Optional[List[str]] = None,
     tiers: Optional[List[str]] = None,
@@ -498,6 +696,11 @@ def generate_world_and_tasks(
         update_rate=update_rate,
         definition_density=definition_density,
         distractor_strength=distractor_strength,
+        scenario_mode=scenario_mode,
+        bridge_prob=bridge_prob,
+        alias_density=alias_density,
+        canonical_density=canonical_density,
+        bridge_kind=bridge_kind,
         authorities=authorities,
         products=products,
         tiers=tiers,
@@ -510,6 +713,9 @@ def generate_world_and_tasks(
         world,
         seed=seed,
         n_tasks=n_tasks,
+        scenario_mode=scenario_mode,
+        bridge_prob=bridge_prob,
+        alias_density=alias_density,
         products=products,
         tiers=tiers,
         regions=regions,

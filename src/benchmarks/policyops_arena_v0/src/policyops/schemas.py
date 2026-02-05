@@ -49,6 +49,11 @@ if USE_PYDANTIC:
         conditions: List[str]
         targets: Dict[str, List[str]]
         terms_used: List[str]
+        canonical_terms: List[str] = Field(default_factory=list)
+        aliases: List[str] = Field(default_factory=list)
+        bridge_for_slot: Optional[str] = None
+        bridge_targets: List[str] = Field(default_factory=list)
+        has_update_keywords: bool = False
 
 
     class Gold(_BaseModel):
@@ -64,6 +69,11 @@ if USE_PYDANTIC:
         context: Dict[str, Any]
         budgets: Dict[str, int]
         gold: Gold
+        scenario_mode: str = "v0"
+        slot_hint_alias: Optional[str] = None
+        canonical_slot_term: Optional[str] = None
+        bridge_clause_id: Optional[str] = None
+        needs_update_resolution: bool = False
 
 
     class World(_BaseModel):
@@ -102,6 +112,11 @@ else:
         conditions: List[str]
         targets: Dict[str, List[str]]
         terms_used: List[str]
+        canonical_terms: List[str] = field(default_factory=list)
+        aliases: List[str] = field(default_factory=list)
+        bridge_for_slot: Optional[str] = None
+        bridge_targets: List[str] = field(default_factory=list)
+        has_update_keywords: bool = False
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)
@@ -125,6 +140,11 @@ else:
         context: Dict[str, Any]
         budgets: Dict[str, int]
         gold: Gold
+        scenario_mode: str = "v0"
+        slot_hint_alias: Optional[str] = None
+        canonical_slot_term: Optional[str] = None
+        bridge_clause_id: Optional[str] = None
+        needs_update_resolution: bool = False
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)

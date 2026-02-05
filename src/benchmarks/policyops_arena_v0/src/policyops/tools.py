@@ -26,6 +26,26 @@ def make_snippet(text: str, length: int = 160) -> str:
     return snippet[:length].rstrip() + "..."
 
 
+def query_rewrite(ticket_text: str, task_meta: Dict[str, Any], mode: str = "expanded") -> List[str]:
+    q0 = ticket_text.strip()
+    structured_parts: List[str] = []
+    for key in ["slot", "region", "tier", "purpose", "data_type"]:
+        value = task_meta.get(key)
+        if value:
+            structured_parts.append(f"{key}:{value}")
+    q1 = " ".join(structured_parts) if structured_parts else q0
+    slot = task_meta.get("slot") or ""
+    conflict_terms = "exception update supersede revoke definition effective immediately"
+    q2 = f"{slot} {conflict_terms}".strip()
+    if mode == "base":
+        return [q0]
+    if mode == "structured":
+        return [q1]
+    if mode == "hybrid":
+        return [q0, q1]
+    return [q0, q1, q2]
+
+
 class _FallbackBM25:
     def __init__(self, corpus: List[List[str]]) -> None:
         self.corpus = corpus
@@ -81,19 +101,45 @@ class ClauseIndex:
         return True
 
     def search(
-        self, query: str, filters: Optional[Dict[str, Any]] = None, top_k: int = 10
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        top_k: int = 10,
+        search_score_mode: str = "bm25",
+        bridge_bonus: float = 1.5,
     ) -> List[Dict[str, Any]]:
         tokens = tokenize(query)
+        query_lower = query.lower()
+        update_keywords = ["effective immediately", "supersedes", "amendment", "revoke"]
+        query_contains_update_kw = any(kw in query_lower for kw in update_keywords)
         scores = self.bm25.get_scores(tokens)
         scored: List[Dict[str, Any]] = []
         for idx, clause in enumerate(self.clauses):
             if not self._passes_filters(clause, filters):
                 continue
+            bm25_score = float(scores[idx])
+            bonus = 0.0
+            query_contains_canonical = any(
+                term.lower() in query_lower for term in (clause.canonical_terms or [])
+            )
+            if search_score_mode == "bm25_plus_bridge_bonus":
+                if query_contains_canonical:
+                    bonus += bridge_bonus
+                if query_contains_update_kw and clause.has_update_keywords:
+                    bonus += bridge_bonus
+            score = bm25_score + bonus
             scored.append(
                 {
                     "clause_id": clause.clause_id,
-                    "score": float(scores[idx]),
+                    "score": score,
+                    "bm25_score": bm25_score,
+                    "bonus_applied": bonus,
                     "snippet": make_snippet(clause.text),
+                    "doc_id": clause.doc_id,
+                    "query_contains_canonical": query_contains_canonical,
+                    "query_contains_update_kw": query_contains_update_kw,
+                    "is_bridge_doc": bool(clause.bridge_for_slot) or clause.kind in {"definition", "glossary"},
+                    "bridge_for_slot": clause.bridge_for_slot,
                 }
             )
         scored.sort(key=lambda item: item["score"], reverse=True)

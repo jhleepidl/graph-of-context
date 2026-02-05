@@ -20,21 +20,21 @@ pip install -r requirements.txt
 If you want `python -m policyops.run ...` to work without installation, run from this folder with:
 
 ```bash
-PYTHONPATH=src python -m policyops.run --help
+PYTHONPATH=src:../.. python -m policyops.run --help
 ```
 
 ## Generate
 
 ```bash
-PYTHONPATH=src python -m policyops.run generate --seed 0 --n_docs 30 --n_tasks 200
+PYTHONPATH=src:../.. python -m policyops.run generate --seed 0 --n_docs 30 --n_tasks 200
 ```
 
 ## Evaluate
 
 ```bash
-PYTHONPATH=src python -m policyops.run eval --method topk --model gpt-4o-mini
-PYTHONPATH=src python -m policyops.run eval --method full --model gpt-4o-mini
-PYTHONPATH=src python -m policyops.run eval --method goc --model gpt-4o-mini
+PYTHONPATH=src:../.. python -m policyops.run eval --method topk --model gpt-4o-mini
+PYTHONPATH=src:../.. python -m policyops.run eval --method full --model gpt-4o-mini
+PYTHONPATH=src:../.. python -m policyops.run eval --method goc --model gpt-4o-mini
 ```
 
 ## Standard Commands
@@ -42,13 +42,13 @@ PYTHONPATH=src python -m policyops.run eval --method goc --model gpt-4o-mini
 Data generation:
 
 ```bash
-PYTHONPATH=src python -m policyops.run generate --seed 0 --n_docs 60 --n_tasks 200
+PYTHONPATH=src:../.. python -m policyops.run generate --seed 0 --n_docs 60 --n_tasks 200
 ```
 
 Controller train (LLM off):
 
 ```bash
-PYTHONPATH=src python -m policyops.run compare \
+PYTHONPATH=src:../.. python -m policyops.run compare \
   --llm dummy --model dummy \
   --methods goc \
   --use_controller --controller_mode train \
@@ -58,7 +58,7 @@ PYTHONPATH=src python -m policyops.run compare \
 Eval (LLM on):
 
 ```bash
-PYTHONPATH=src python -m policyops.run compare \
+PYTHONPATH=src:../.. python -m policyops.run compare \
   --llm openai --model gpt-4.1-mini \
   --methods topk full goc oracle \
   --use_controller --controller_mode eval \
@@ -70,7 +70,7 @@ PYTHONPATH=src python -m policyops.run compare \
 Failure slice analysis:
 
 ```bash
-PYTHONPATH=src python -m policyops.run analyze --report runs/compare/<latest>.json
+PYTHONPATH=src:../.. python -m policyops.run analyze --report runs/compare/<latest>.json
 ```
 
 ## Notes

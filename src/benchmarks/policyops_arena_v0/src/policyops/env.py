@@ -10,11 +10,20 @@ UPDATE_DOC_TYPES = {"announcement", "release_note"}
 
 
 class PolicyOpsEnv:
-    def __init__(self, world: World, tool_call_budget: int = 50, open_budget: int = 5) -> None:
+    def __init__(
+        self,
+        world: World,
+        tool_call_budget: int = 50,
+        open_budget: int = 5,
+        search_score_mode: str = "bm25",
+        bridge_bonus: float = 1.5,
+    ) -> None:
         self.world = world
         self.index = ClauseIndex(world)
         self.tool_call_budget = tool_call_budget
         self.open_budget = open_budget
+        self.search_score_mode = search_score_mode
+        self.bridge_bonus = bridge_bonus
         self.tool_call_count = 0
         self.open_count = 0
         self._doc_by_id = {doc.doc_id: doc for doc in world.documents}
@@ -37,7 +46,13 @@ class PolicyOpsEnv:
         self, query: str, filters: Optional[Dict[str, Any]] = None, top_k: int = 10
     ) -> List[Dict[str, Any]]:
         self._consume_tool()
-        results = self.index.search(query=query, filters=filters, top_k=top_k)
+        results = self.index.search(
+            query=query,
+            filters=filters,
+            top_k=top_k,
+            search_score_mode=self.search_score_mode,
+            bridge_bonus=self.bridge_bonus,
+        )
         self.last_search_results = list(results)
         self.last_search_query = query
         self.last_search_top_k = top_k
