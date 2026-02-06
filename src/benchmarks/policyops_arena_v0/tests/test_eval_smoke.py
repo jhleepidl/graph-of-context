@@ -279,7 +279,8 @@ def test_eval_smoke(tmp_path: Path) -> None:
     eval_args.goc_graph_schema = "v1"
     eval_args.goc_graph_dir = str(controller_dir / "goc_graph_eval.jsonl")
     cmd_compare(eval_args)
-    eval_report = json.loads(list((controller_dir / "runs" / "compare").glob("*.json"))[-1].read_text())
+    eval_reports = sorted((controller_dir / "runs" / "compare").glob("*.json"))
+    eval_report = json.loads(eval_reports[-1].read_text())
     eval_records = eval_report.get("method_reports", {}).get("goc", {}).get("records", [])
     assert eval_records
     graph_path = Path(eval_records[0]["goc_graph_jsonl_path"])
@@ -310,7 +311,8 @@ def test_eval_smoke(tmp_path: Path) -> None:
     compare_args_zero.goc_graph_sample_rate = 0.0
     compare_args_zero.goc_graph_dir = str(tmp_path / "goc_graph_zero.jsonl")
     cmd_compare(compare_args_zero)
-    report_zero = json.loads(list((tmp_path / "runs" / "compare").glob("*.json"))[-1].read_text(encoding="utf-8"))
+    report_zero_paths = sorted((tmp_path / "runs" / "compare").glob("*.json"))
+    report_zero = json.loads(report_zero_paths[-1].read_text(encoding="utf-8"))
     goc_records_zero = report_zero.get("method_reports", {}).get("goc", {}).get("records", [])
     assert all(r.get("goc_graph_jsonl_path") is None for r in goc_records_zero)
 
@@ -365,7 +367,8 @@ def test_eval_smoke(tmp_path: Path) -> None:
     state = json.loads(controller_state.read_text(encoding="utf-8"))
     global_stats = state.get("stats", {}).get("global", {})
     assert len(global_stats.keys()) >= 5
-    report_train = json.loads(list((train_dir / "runs" / "compare").glob("*.json"))[-1].read_text(encoding="utf-8"))
+    report_train_paths = sorted((train_dir / "runs" / "compare").glob("*.json"))
+    report_train = json.loads(report_train_paths[-1].read_text(encoding="utf-8"))
     assert report_train["num_train_tasks"] + report_train["num_eval_tasks"] == 5
 
     sweep_args = argparse.Namespace(
@@ -421,6 +424,15 @@ def test_eval_smoke(tmp_path: Path) -> None:
     assert "winning_clause_rank_mean" in header
     assert "min_gold_rank_mean" in header
     assert "gold_score_gap_mean" in header
+    assert "judge_accuracy" in header
+    assert "acc_no_core_evidence_rate" in header
+    assert "judge_used_any_core_rate" in header
+    assert "judge_used_any_bridge_rate" in header
+    assert "judge_supporting_count_mean" in header
+    assert "feasible_open_rate" in header
+    assert "realized_open_rate" in header
+    assert "selection_gap" in header
+    assert "selection_efficiency" in header
 
     analyze_args = argparse.Namespace(
         report=str(compare_reports[-1]),
@@ -525,7 +537,8 @@ def test_eval_smoke(tmp_path: Path) -> None:
     )
     cmd_compare(rerank_args)
     assert rerank_weights.exists()
-    rerank_report = json.loads(list((rerank_dir / "runs" / "compare").glob("*.json"))[-1].read_text())
+    rerank_report_paths = sorted((rerank_dir / "runs" / "compare").glob("*.json"))
+    rerank_report = json.loads(rerank_report_paths[-1].read_text())
     goc_records = rerank_report.get("method_reports", {}).get("goc", {}).get("records", [])
     assert any(r.get("rerank_used") for r in goc_records)
 

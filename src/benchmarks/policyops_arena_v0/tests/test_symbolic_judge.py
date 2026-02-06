@@ -22,6 +22,8 @@ def test_symbolic_judge_matches_when_evidence_present(tmp_path: Path) -> None:
     opened_ids = list(task.gold.gold_evidence)
     result = judge_from_opened_clauses(task, opened_ids, world)
     assert result["decision"] == task.gold.decision
+    assert isinstance(result.get("supporting_clause_ids"), list)
+    assert result.get("supporting_clause_ids")
 
 
 def test_symbolic_judge_needs_more_info_without_evidence(tmp_path: Path) -> None:
@@ -35,3 +37,5 @@ def test_symbolic_judge_needs_more_info_without_evidence(tmp_path: Path) -> None
     task = tasks[0]
     result = judge_from_opened_clauses(task, [], world)
     assert result["decision"] == "needs_more_info"
+    assert isinstance(result.get("supporting_clause_ids"), list)
+    assert result.get("supporting_clause_ids") == []

@@ -587,6 +587,7 @@ def generate_tasks(
     bridge_prob: float = 0.8,
     bridged_mix_canonical_in_ticket_rate: float = 0.0,
     alias_density: float = 0.9,
+    exclusive_core_evidence: bool = False,
     products: Optional[List[str]] = None,
     tiers: Optional[List[str]] = None,
     regions: Optional[List[str]] = None,
@@ -603,7 +604,15 @@ def generate_tasks(
     tasks: List[Task] = []
     base_date = datetime(2025, 6, 1)
 
-    for idx in range(n_tasks):
+    attempts = 0
+    max_attempts = max(50, n_tasks * 20)
+    while len(tasks) < n_tasks:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                "Unable to generate enough tasks with exclusive_core_evidence constraints. "
+                f"Generated={len(tasks)} target={n_tasks}"
+            )
         slot = rng.choice(SLOTS)
         context = {
             "slot": slot,
@@ -652,9 +661,42 @@ def generate_tasks(
             gold_evidence_core=core_ids,
             gold_evidence_meta=meta_ids,
         )
+        if exclusive_core_evidence:
+            core_ids_set = set(core_ids)
+            if not core_ids_set:
+                continue
+            pruned_clauses = {
+                cid: clause for cid, clause in world.clauses.items() if cid not in core_ids_set
+            }
+            pruned_world = World(
+                documents=world.documents,
+                clauses=pruned_clauses,
+                meta=world.meta,
+            )
+            pruned_decision, _, _, _ = evaluate_context(pruned_world, context)
+            if pruned_decision == decision:
+                continue
+            # Reject if any non-core clause alone can yield the gold decision.
+            found_alt = False
+            for clause in pruned_clauses.values():
+                if clause.slot != slot:
+                    continue
+                solo_world = World(
+                    documents=world.documents,
+                    clauses={clause.clause_id: clause},
+                    meta=world.meta,
+                )
+                solo_decision, _, _, _ = evaluate_context(solo_world, context)
+                if solo_decision == decision:
+                    found_alt = True
+                    break
+            if found_alt:
+                continue
+
+        task_index = len(tasks)
         task = Task(
-            task_id=f"T{idx + 1:04d}",
-            timestamp=(base_date + timedelta(days=idx)).strftime("%Y-%m-%d"),
+            task_id=f"T{task_index + 1:04d}",
+            timestamp=(base_date + timedelta(days=task_index)).strftime("%Y-%m-%d"),
             user_ticket=ticket,
             context=context,
             budgets={"tool_call_budget": 50, "open_budget": 5},
@@ -670,11 +712,280 @@ def generate_tasks(
     return tasks
 
 
+def generate_threaded_tasks(
+    world: World,
+    *,
+    seed: int = 0,
+    n_threads: int = 100,
+    open_budget_e1: int = 4,
+    open_budget_e2: int = 4,
+    open_budget_e3: int = 0,
+    tool_budget_e1: int = 50,
+    tool_budget_e2: int = 50,
+    tool_budget_e3: int = 0,
+    branch_distractor_rate: float = 0.5,
+    exclusive_core_evidence: bool = False,
+    bridged_mix_canonical_in_ticket_rate: float = 0.0,
+    alias_density: float = 0.9,
+    products: Optional[List[str]] = None,
+    tiers: Optional[List[str]] = None,
+    regions: Optional[List[str]] = None,
+    data_types: Optional[List[str]] = None,
+    purposes: Optional[List[str]] = None,
+) -> Tuple[List[Task], List[Dict[str, Any]]]:
+    rng = random.Random(seed)
+    products = products or DEFAULT_PRODUCTS
+    tiers = tiers or DEFAULT_TIERS
+    regions = regions or DEFAULT_REGIONS
+    data_types = data_types or DEFAULT_DATA_TYPES
+    purposes = purposes or DEFAULT_PURPOSES
+
+    tasks: List[Task] = []
+    threads_meta: List[Dict[str, Any]] = []
+    base_date = datetime(2025, 6, 1)
+
+    def _choose_context() -> Dict[str, Any]:
+        return {
+            "slot": rng.choice(SLOTS),
+            "product": rng.choice(products),
+            "tier": rng.choice(tiers),
+            "region": rng.choice(regions),
+            "data_type": rng.choice(data_types),
+            "purpose": rng.choice(purposes),
+        }
+
+    def _find_value(options: List[str], avoid: List[str]) -> str:
+        candidates = [v for v in options if v not in avoid]
+        if candidates:
+            return rng.choice(candidates)
+        return rng.choice(options)
+
+    max_attempts = max(50, n_threads * 20)
+    attempts = 0
+    thread_index = 0
+    while thread_index < n_threads:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                "Unable to generate enough threaded tasks with constraints. "
+                f"Generated={thread_index} target={n_threads}"
+            )
+        context_base = _choose_context()
+        slot = context_base["slot"]
+        slot_text = SLOT_LABELS.get(slot, slot)
+        alias, canonical = BRIDGE_TERMS.get(slot, (slot_text, slot_text))
+
+        rule_candidates = [c for c in world.clauses.values() if c.slot == slot and c.kind == "rule"]
+        exception_candidates = [
+            c
+            for c in world.clauses.values()
+            if c.slot == slot and c.kind in {"exception", "update"}
+        ]
+        if not rule_candidates or not exception_candidates:
+            continue
+        base_rule = rng.choice(rule_candidates)
+        gold_exception = rng.choice(exception_candidates)
+
+        context_e2 = dict(context_base)
+        for key, values in gold_exception.applies_if.items():
+            if values:
+                context_e2[key] = rng.choice(values)
+
+        context_e1 = dict(context_base)
+        if gold_exception.applies_if:
+            key = rng.choice(list(gold_exception.applies_if.keys()))
+            options_map = {
+                "product": products,
+                "tier": tiers,
+                "region": regions,
+                "data_type": data_types,
+                "purpose": purposes,
+            }
+            context_e1[key] = _find_value(options_map.get(key, [context_e1[key]]), gold_exception.applies_if[key])
+
+        decision_e1, conditions_e1, evidence_e1, debug_e1 = evaluate_context(world, context_e1)
+        decision_e2, conditions_e2, evidence_e2, debug_e2 = evaluate_context(world, context_e2)
+        decision_e3, conditions_e3, evidence_e3, debug_e3 = evaluate_context(world, context_e2)
+
+        if base_rule.clause_id not in evidence_e1:
+            continue
+        if gold_exception.clause_id not in evidence_e2:
+            continue
+
+        def _split_evidence(evidence: List[str]) -> Tuple[List[str], List[str]]:
+            meta_ids = [
+                cid
+                for cid in evidence
+                if (world.clauses.get(cid) and world.clauses[cid].kind == "priority")
+            ]
+            core_ids = [cid for cid in evidence if cid not in meta_ids]
+            return core_ids, meta_ids
+
+        core_e1, meta_e1 = _split_evidence(evidence_e1)
+        core_e2, meta_e2 = _split_evidence(evidence_e2)
+        core_e3, meta_e3 = _split_evidence(evidence_e3)
+
+        # Enforce exclusive core evidence if requested.
+        if exclusive_core_evidence:
+            for ctx, decision, core_ids in [
+                (context_e1, decision_e1, core_e1),
+                (context_e2, decision_e2, core_e2),
+                (context_e2, decision_e3, core_e3),
+            ]:
+                core_ids_set = set(core_ids)
+                if not core_ids_set:
+                    break
+                pruned_clauses = {
+                    cid: clause for cid, clause in world.clauses.items() if cid not in core_ids_set
+                }
+                pruned_world = World(
+                    documents=world.documents,
+                    clauses=pruned_clauses,
+                    meta=world.meta,
+                )
+                pruned_decision, _, _, _ = evaluate_context(pruned_world, ctx)
+                if pruned_decision == decision:
+                    core_ids_set = set()
+                    break
+            if not core_ids_set:
+                continue
+
+        distractor_id = None
+        if rng.random() < branch_distractor_rate:
+            distractors = [c for c in exception_candidates if c.clause_id != gold_exception.clause_id]
+            if distractors:
+                distractor_id = rng.choice(distractors).clause_id
+
+        if rng.random() < bridged_mix_canonical_in_ticket_rate:
+            e1_slot_text = canonical
+            slot_hint_alias = None
+        elif rng.random() < alias_density:
+            e1_slot_text = alias
+            slot_hint_alias = alias
+        else:
+            e1_slot_text = canonical
+            slot_hint_alias = None
+
+        ticket_e1 = (
+            f"Episode 1: Customer asks about {e1_slot_text} for the {context_e1['product']} "
+            f"{context_e1['tier']} plan in {context_e1['region']}. "
+            f"Data type: {context_e1['data_type']}. Purpose: {context_e1['purpose']}."
+        )
+        ticket_e2 = (
+            f"Episode 2 follow-up about {canonical}: additional constraints apply. "
+            f"Refer to commit1.fact1 for the canonical term."
+        )
+        if distractor_id:
+            ticket_e2 += " Note: a related exception may also apply."
+        ticket_e3 = (
+            "Episode 3 final decision: use commit1.fact1 and commit2.fact2 to resolve the policy."
+        )
+
+        thread_id = f"TH{thread_index + 1:04d}"
+        thread_config = {
+            "open_budget_e1": open_budget_e1,
+            "open_budget_e2": open_budget_e2,
+            "open_budget_e3": open_budget_e3,
+            "tool_budget_e1": tool_budget_e1,
+            "tool_budget_e2": tool_budget_e2,
+            "tool_budget_e3": tool_budget_e3,
+            "branch_distractor_rate": branch_distractor_rate,
+        }
+
+        def _mk_task(episode_id: int, episode_kind: str, ticket: str, ctx: Dict[str, Any], decision: str, conditions: List[str], evidence: List[str], core_ids: List[str], meta_ids: List[str], needs_update: bool) -> Task:
+            task_index = len(tasks)
+            return Task(
+                task_id=f"T{task_index + 1:04d}",
+                timestamp=(base_date + timedelta(days=task_index)).strftime("%Y-%m-%d"),
+                user_ticket=ticket,
+                context=ctx,
+                budgets={
+                    "tool_call_budget": tool_budget_e1 if episode_id == 1 else tool_budget_e2 if episode_id == 2 else tool_budget_e3,
+                    "open_budget": open_budget_e1 if episode_id == 1 else open_budget_e2 if episode_id == 2 else open_budget_e3,
+                },
+                gold=Gold(
+                    decision=decision,
+                    conditions=conditions,
+                    gold_evidence=evidence,
+                    gold_evidence_core=core_ids,
+                    gold_evidence_meta=meta_ids,
+                ),
+                scenario_mode="threaded_v1_2",
+                slot_hint_alias=slot_hint_alias if episode_id == 1 else None,
+                canonical_slot_term=canonical,
+                bridge_clause_id=world.meta.get("bridge_clause_by_slot", {}).get(slot),
+                needs_update_resolution=needs_update,
+                thread_id=thread_id,
+                episode_id=episode_id,
+                episode_kind=episode_kind,
+                thread_config=thread_config,
+                branch_distractor_clause_id=distractor_id,
+            )
+
+        tasks.append(
+            _mk_task(
+                1,
+                "e1_retrieve_rule",
+                ticket_e1,
+                context_e1,
+                decision_e1,
+                conditions_e1,
+                evidence_e1,
+                core_e1,
+                meta_e1,
+                bool(debug_e1.get("used_updates")),
+            )
+        )
+        tasks.append(
+            _mk_task(
+                2,
+                "e2_exception_update",
+                ticket_e2,
+                context_e2,
+                decision_e2,
+                conditions_e2,
+                evidence_e2,
+                core_e2,
+                meta_e2,
+                bool(debug_e2.get("used_updates")),
+            )
+        )
+        tasks.append(
+            _mk_task(
+                3,
+                "e3_final_compose",
+                ticket_e3,
+                context_e2,
+                decision_e3,
+                conditions_e3,
+                evidence_e3,
+                core_e3,
+                meta_e3,
+                bool(debug_e3.get("used_updates")),
+            )
+        )
+        threads_meta.append(
+            {
+                "thread_id": thread_id,
+                "episode_task_ids": [tasks[-3].task_id, tasks[-2].task_id, tasks[-1].task_id],
+                "slot": slot,
+                "canonical_slot_term": canonical,
+                "branch_distractor_clause_id": distractor_id,
+                "thread_config": thread_config,
+            }
+        )
+        thread_index += 1
+
+    return tasks, threads_meta
+
+
 def _write_jsonl(path: Path, items: List[Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for item in items:
-            if hasattr(item, "to_dict"):
+            if isinstance(item, dict):
+                data = item
+            elif hasattr(item, "to_dict"):
                 data = item.to_dict()
             elif hasattr(item, "model_dump"):
                 data = item.model_dump()
@@ -700,12 +1011,22 @@ def generate_world_and_tasks(
     alias_density: float = 0.9,
     canonical_density: float = 0.95,
     bridge_kind: str = "definition",
+    exclusive_core_evidence: bool = False,
+    preset_name: Optional[str] = None,
     authorities: Optional[List[str]] = None,
     products: Optional[List[str]] = None,
     tiers: Optional[List[str]] = None,
     regions: Optional[List[str]] = None,
     data_types: Optional[List[str]] = None,
     purposes: Optional[List[str]] = None,
+    n_threads: Optional[int] = None,
+    open_budget_e1: int = 4,
+    open_budget_e2: int = 4,
+    open_budget_e3: int = 0,
+    tool_budget_e1: int = 50,
+    tool_budget_e2: int = 50,
+    tool_budget_e3: int = 0,
+    branch_distractor_rate: float = 0.5,
 ) -> Tuple[World, List[Task], Path, Path]:
     out_dir = Path(out_dir) if out_dir else Path(__file__).resolve().parents[2]
 
@@ -731,26 +1052,59 @@ def generate_world_and_tasks(
         purposes=purposes,
     )
 
-    tasks = generate_tasks(
-        world,
-        seed=seed,
-        n_tasks=n_tasks,
-        scenario_mode=scenario_mode,
-        bridge_prob=bridge_prob,
-        bridged_mix_canonical_in_ticket_rate=bridged_mix_canonical_in_ticket_rate,
-        alias_density=alias_density,
-        products=products,
-        tiers=tiers,
-        regions=regions,
-        data_types=data_types,
-        purposes=purposes,
-    )
+    threads_meta: List[Dict[str, Any]] = []
+    if scenario_mode == "threaded_v1_2":
+        tasks, threads_meta = generate_threaded_tasks(
+            world,
+            seed=seed,
+            n_threads=n_threads or n_tasks,
+            open_budget_e1=open_budget_e1,
+            open_budget_e2=open_budget_e2,
+            open_budget_e3=open_budget_e3,
+            tool_budget_e1=tool_budget_e1,
+            tool_budget_e2=tool_budget_e2,
+            tool_budget_e3=tool_budget_e3,
+            branch_distractor_rate=branch_distractor_rate,
+            exclusive_core_evidence=exclusive_core_evidence,
+            bridged_mix_canonical_in_ticket_rate=bridged_mix_canonical_in_ticket_rate,
+            alias_density=alias_density,
+            products=products,
+            tiers=tiers,
+            regions=regions,
+            data_types=data_types,
+            purposes=purposes,
+        )
+    else:
+        tasks = generate_tasks(
+            world,
+            seed=seed,
+            n_tasks=n_tasks,
+            scenario_mode=scenario_mode,
+            bridge_prob=bridge_prob,
+            bridged_mix_canonical_in_ticket_rate=bridged_mix_canonical_in_ticket_rate,
+            alias_density=alias_density,
+            exclusive_core_evidence=exclusive_core_evidence,
+            products=products,
+            tiers=tiers,
+            regions=regions,
+            data_types=data_types,
+            purposes=purposes,
+        )
 
     world_dir = out_dir / "data" / "worlds"
     tasks_dir = out_dir / "data" / "tasks"
     _write_jsonl(world_dir / "documents.jsonl", world.documents)
     _write_jsonl(world_dir / "clauses.jsonl", list(world.clauses.values()))
+    world.meta["exclusive_core_evidence"] = exclusive_core_evidence
+    if preset_name:
+        world.meta["preset"] = preset_name
     (world_dir / "meta.json").write_text(json.dumps(world.meta, ensure_ascii=False), encoding="utf-8")
     _write_jsonl(tasks_dir / "tasks.jsonl", tasks)
+    if scenario_mode == "threaded_v1_2":
+        threads_path = out_dir / "data" / "threads.jsonl"
+        episodes_path = out_dir / "data" / "episodes.jsonl"
+        if threads_meta:
+            _write_jsonl(threads_path, threads_meta)
+        _write_jsonl(episodes_path, tasks)
 
     return world, tasks, world_dir, tasks_dir / "tasks.jsonl"

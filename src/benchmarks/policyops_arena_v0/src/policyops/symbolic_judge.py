@@ -19,6 +19,7 @@ def judge_from_opened_clauses(
             "decision": "needs_more_info",
             "conditions": [],
             "evidence": [],
+            "supporting_clause_ids": [],
             "customer_message": "",
         }
     partial_world = World(
@@ -32,5 +33,14 @@ def judge_from_opened_clauses(
         "decision": decision,
         "conditions": conditions,
         "evidence": evidence,
+        "supporting_clause_ids": evidence,
         "customer_message": "",
     }
+
+
+def judge_threaded_final(
+    task: Any,
+    commit_clause_ids: List[str],
+    world: World,
+) -> Dict[str, Any]:
+    return judge_from_opened_clauses(task, commit_clause_ids, world)

@@ -77,6 +77,11 @@ if USE_PYDANTIC:
         canonical_slot_term: Optional[str] = None
         bridge_clause_id: Optional[str] = None
         needs_update_resolution: bool = False
+        thread_id: Optional[str] = None
+        episode_id: Optional[int] = None
+        episode_kind: Optional[str] = None
+        thread_config: Optional[Dict[str, Any]] = None
+        branch_distractor_clause_id: Optional[str] = None
 
 
     class World(_BaseModel):
@@ -151,6 +156,11 @@ else:
         canonical_slot_term: Optional[str] = None
         bridge_clause_id: Optional[str] = None
         needs_update_resolution: bool = False
+        thread_id: Optional[str] = None
+        episode_id: Optional[int] = None
+        episode_kind: Optional[str] = None
+        thread_config: Optional[Dict[str, Any]] = None
+        branch_distractor_clause_id: Optional[str] = None
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)

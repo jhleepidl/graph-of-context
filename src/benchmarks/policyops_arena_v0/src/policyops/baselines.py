@@ -595,6 +595,68 @@ def run_oracle(
     return prediction, opened_ids, prompt, raw_output, oracle_meta
 
 
+def summarize_clause_history(clauses: List[Clause], max_items: int = 8) -> str:
+    if not clauses:
+        return "No prior clauses available."
+    lines: List[str] = []
+    for clause in clauses[:max_items]:
+        decision = clause.effect.get("decision") if clause.effect else None
+        conditions = clause.conditions or []
+        cond_text = ", ".join(conditions[:3]) if conditions else "none"
+        lines.append(
+            f"{clause.clause_id}: {clause.kind} decision={decision} conditions={cond_text}"
+        )
+    return " | ".join(lines)
+
+
+def run_similarity_only(
+    task: Any,
+    env: PolicyOpsEnv,
+    client: LLMClient,
+    primary_top_k: int = 20,
+    use_query_rewrite: bool = True,
+    rewrite_queries_count: int = 3,
+    rewrite_mode: str = "expanded",
+    merge_rank_fusion: str = "max",
+) -> Tuple[Dict[str, Any], List[str], str, str | None, Dict[str, Any]]:
+    # Fallback to topk retrieval for non-threaded usage.
+    prediction, opened_ids, prompt, raw, diag = run_topk_rag(
+        task,
+        env,
+        client,
+        primary_top_k=primary_top_k,
+        use_query_rewrite=use_query_rewrite,
+        rewrite_queries_count=rewrite_queries_count,
+        rewrite_mode=rewrite_mode,
+        merge_rank_fusion=merge_rank_fusion,
+    )
+    diag["baseline_mode"] = "similarity_only"
+    return prediction, opened_ids, prompt, raw, diag
+
+
+def run_agent_fold(
+    task: Any,
+    env: PolicyOpsEnv,
+    client: LLMClient,
+    primary_top_k: int = 20,
+    use_query_rewrite: bool = True,
+    rewrite_queries_count: int = 3,
+    rewrite_mode: str = "expanded",
+    merge_rank_fusion: str = "max",
+) -> Tuple[Dict[str, Any], List[str], str, str | None, Dict[str, Any]]:
+    prediction, opened_ids, prompt, raw, diag = run_topk_rag(
+        task,
+        env,
+        client,
+        primary_top_k=primary_top_k,
+        use_query_rewrite=use_query_rewrite,
+        rewrite_queries_count=rewrite_queries_count,
+        rewrite_mode=rewrite_mode,
+        merge_rank_fusion=merge_rank_fusion,
+    )
+    diag["baseline_mode"] = "agent_fold"
+    return prediction, opened_ids, prompt, raw, diag
+
 def run_goc_heuristic(
     task: Any,
     env: PolicyOpsEnv,
@@ -614,6 +676,7 @@ def run_goc_heuristic(
     bridge_reward_bonus: float = 0.0,
     open_split_mode: str = "all_union_rank",
     open_split_hop1: int = 0,
+    open_policy: str = "current",
 ) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
     errors: List[str] = []
     fallback_prediction = {
@@ -648,6 +711,10 @@ def run_goc_heuristic(
     bridge_clause = None  # selected bridge clause (if any)
     hop1_results: List[Dict[str, Any]] = []
     hop2_results: List[Dict[str, Any]] = []
+    bridge_open_cap_hit = False
+    meta_avoided_count = 0
+    fallback_reason: str | None = None
+    hop2_pool_used_count = 0
 
     def _strip_ticket(text: str) -> str:
         lowered = text.lower()
@@ -827,6 +894,8 @@ def run_goc_heuristic(
                 rewrite_mode=rewrite_mode,
                 merge_rank_fusion=merge_rank_fusion,
             )
+            # Treat the primary search results as hop1 for single-hop variants.
+            hop1_results = list(seed_results)
         except Exception as exc:  # noqa: BLE001 - defensive
             seed_results = []
             errors.append(f"search_error: {exc}")
@@ -889,17 +958,44 @@ def run_goc_heuristic(
     open_from_hop1_ids: List[str] = []
     open_from_hop2_ids: List[str] = []
 
+    def _is_bridge_clause(cid: str) -> bool:
+        clause_obj = env.world.clauses.get(cid)
+        if not clause_obj:
+            return False
+        return bool(
+            getattr(clause_obj, "is_bridge_doc", False)
+            or getattr(clause_obj, "bridge_for_slot", None)
+            or getattr(clause_obj, "kind", None) in {"definition", "glossary"}
+        )
+
+    def _is_meta_clause(cid: str) -> bool:
+        clause_obj = env.world.clauses.get(cid)
+        if not clause_obj:
+            return False
+        return getattr(clause_obj, "kind", None) == "priority" or getattr(clause_obj, "slot", None) == "meta"
+
     if force_open_top_n > 0:
         if force_open_source == "merged":
             force_candidates = ranked
         else:
             force_candidates = sorted(seed_results, key=lambda item: item.get("score", 0.0), reverse=True)
+        force_has_non_meta = any(
+            item.get("clause_id") and not _is_meta_clause(item.get("clause_id"))
+            for item in force_candidates
+        )
         for item in force_candidates[:force_open_top_n]:
             if len(opened_set) >= env.open_budget:
                 break
             clause_id = item.get("clause_id")
             if not clause_id or clause_id in opened_set:
                 continue
+            if open_policy == "bridge_one_only":
+                if _is_bridge_clause(clause_id) and any(_is_bridge_clause(cid) for cid in opened_set):
+                    bridge_open_cap_hit = True
+                    continue
+                if _is_meta_clause(clause_id) and force_has_non_meta:
+                    meta_avoided_count += 1
+                    continue
             try:
                 clause = env.open(clause_id)
             except RuntimeError as exc:
@@ -930,14 +1026,31 @@ def run_goc_heuristic(
         if item.get("clause_id")
     ]
 
-    def _open_from_candidates(candidates: List[str], max_count: int, origin: str | None = None) -> None:
+    if open_policy == "core_first_heuristic":
+        open_policy = "soft_core_rerank"
+
+    def _open_from_candidates(
+        candidates: List[str],
+        max_count: int,
+        origin: str | None = None,
+        allow_bridge: bool = True,
+    ) -> None:
         nonlocal opened_for_prompt_clauses
-        for clause_id in candidates:
+        pending = list(candidates)
+        safety = 0
+        while pending:
             if len(opened_set) >= env.open_budget:
                 break
             if max_count <= 0:
                 break
+            safety += 1
+            if safety > len(candidates) * 3:
+                break
+            clause_id = pending.pop(0)
             if clause_id in opened_set:
+                continue
+            clause_obj = env.world.clauses.get(clause_id)
+            if not allow_bridge and clause_obj and clause_obj.is_bridge_doc:
                 continue
             try:
                 clause = env.open(clause_id)
@@ -964,7 +1077,60 @@ def run_goc_heuristic(
                     open_from_hop1_ids.append(clause_id)
             max_count -= 1
 
-    if open_split_mode == "split_hop1_hop2" and agent_query_policy == "two_hop_bridge":
+    if open_policy == "oracle_open_if_in_union":
+        from .diagnostics import merge_search_results_union
+
+        union_results = merge_search_results_union(hop1_results, hop2_results)
+        union_ids = [item.get("clause_id") for item in union_results if item.get("clause_id")]
+        winning_clause = task.gold.gold_evidence[0] if task.gold.gold_evidence else None
+        core_ids = list(getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or [])
+        preferred: List[str] = []
+        if winning_clause and winning_clause in union_ids:
+            preferred.append(winning_clause)
+        for cid in union_ids:
+            if cid in core_ids and cid not in preferred:
+                preferred.append(cid)
+        _open_from_candidates(preferred, env.open_budget, origin=None)
+    elif open_policy == "bridge_one_only":
+        if ordered_clause_ids:
+            ranked_ids = ordered_clause_ids
+        else:
+            ranked_ids = [item["clause_id"] for item in ranked]
+        if agent_query_policy == "two_hop_bridge" and hop2_ranked_ids:
+            candidate_ids = hop2_ranked_ids + [cid for cid in ranked_ids if cid not in hop2_ranked_ids]
+        else:
+            candidate_ids = list(ranked_ids)
+            if agent_query_policy == "two_hop_bridge" and not hop2_ranked_ids:
+                fallback_reason = "hop2_empty"
+        non_meta_candidates = [cid for cid in candidate_ids if not _is_meta_clause(cid)]
+        only_meta = len(non_meta_candidates) == 0
+        if only_meta:
+            fallback_reason = "only_meta" if fallback_reason is None else f"{fallback_reason}|only_meta"
+        filtered_ids: List[str] = []
+        bridge_used = sum(1 for cid in opened_set if _is_bridge_clause(cid))
+        for cid in candidate_ids:
+            if len(opened_set) + len(filtered_ids) >= env.open_budget:
+                break
+            if cid in opened_set:
+                continue
+            if _is_bridge_clause(cid):
+                if bridge_used >= 1:
+                    bridge_open_cap_hit = True
+                    continue
+            if _is_meta_clause(cid) and not only_meta:
+                meta_avoided_count += 1
+                continue
+            filtered_ids.append(cid)
+            if _is_bridge_clause(cid):
+                bridge_used += 1
+        _open_from_candidates(filtered_ids, env.open_budget - len(opened_set), origin=None, allow_bridge=True)
+    elif open_policy == "hop2_priority" and agent_query_policy == "two_hop_bridge":
+        remaining = max(0, env.open_budget - len(opened_set))
+        if hop2_ranked_ids:
+            _open_from_candidates(hop2_ranked_ids, remaining, origin="hop2", allow_bridge=False)
+        else:
+            _open_from_candidates(hop1_ranked_ids, remaining, origin="hop1", allow_bridge=False)
+    elif open_split_mode == "split_hop1_hop2" and agent_query_policy == "two_hop_bridge":
         hop1_quota = max(0, min(open_split_hop1, env.open_budget))
         hop2_quota = max(0, env.open_budget - hop1_quota)
         _open_from_candidates(hop1_ranked_ids, hop1_quota, origin="hop1")
@@ -978,11 +1144,45 @@ def run_goc_heuristic(
             pref = [cid for cid in hop2_results[: min(3, primary_top_k)] if cid.get("clause_id")]
             hop2_pref_ids = [item.get("clause_id") for item in pref if item.get("clause_id")]
             ranked_ids = hop2_pref_ids + [cid for cid in ranked_ids if cid not in hop2_pref_ids]
-        _open_from_candidates(ranked_ids, env.open_budget, origin=None)
+        if open_policy == "soft_core_rerank":
+            base_ranks = {cid: idx for idx, cid in enumerate(ranked_ids)}
+            fixed = ranked_ids[:2]
+
+            def _soft_bonus(cid: str) -> tuple[int, int]:
+                clause_obj = env.world.clauses.get(cid)
+                bonus = 0
+                if clause_obj:
+                    if clause_obj.kind in {"update", "exception"}:
+                        bonus += 3
+                    elif clause_obj.kind == "rule":
+                        bonus += 1
+                    decision = clause_obj.effect.get("decision") if clause_obj.effect else None
+                    if decision in {"deny", "allow"}:
+                        bonus += 1
+                    text = clause_obj.text.lower()
+                    slot_hint = (task.slot_hint_alias or "").lower()
+                    canonical = (task.canonical_slot_term or "").lower()
+                    if slot_hint and slot_hint in text:
+                        bonus += 1
+                    if canonical and canonical in text:
+                        bonus += 1
+                item = merged.get(cid)
+                snippet = (item.get("snippet", "") if item else "").lower()
+                if any(word in snippet for word in ["update", "revoke", "supersede", "amend", "effective"]):
+                    bonus += 1
+                if any(word in snippet for word in ["except", "unless", "however", "provided that"]):
+                    bonus += 1
+                return (bonus, -base_ranks.get(cid, 0))
+
+            rest = [cid for cid in ranked_ids if cid not in fixed]
+            rest_sorted = sorted(rest, key=_soft_bonus, reverse=True)
+            ranked_ids = fixed + rest_sorted
+        _open_from_candidates(ranked_ids, env.open_budget, origin=None, allow_bridge=True)
 
     if bridge_probe_clause_id:
         bridge_opened_in_prompt = bridge_probe_clause_id in opened_for_prompt_ids
 
+    hop2_pool_used_count = len(open_from_hop2_ids)
     opened_ids = list(opened_total_ids)
     prompt = _build_goc_prompt(task.user_ticket, opened_for_prompt_clauses, opened_for_prompt_ids)
     raw_output: str | None = None
@@ -1085,6 +1285,10 @@ def run_goc_heuristic(
         "bridge_opened": bool(bridge_probe_clause_id and bridge_probe_clause_id in opened_id_set),
         "bridge_opened_in_probe": bridge_opened_in_probe,
         "bridge_opened_in_prompt": bridge_opened_in_prompt,
+        "bridge_open_cap_hit": bridge_open_cap_hit,
+        "meta_avoided_count": meta_avoided_count,
+        "hop2_pool_used_count": hop2_pool_used_count,
+        "fallback_reason": fallback_reason,
     }
     if reward_breakdown:
         diag["controller_reward_breakdown"] = reward_breakdown

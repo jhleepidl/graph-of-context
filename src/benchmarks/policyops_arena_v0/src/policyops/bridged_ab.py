@@ -55,10 +55,13 @@ def compute_bridged_ab_slices(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         cells.setdefault(a, {}).setdefault(
             b,
             {
-                "decision_accuracy": [],
+                "decision_acc": [],
+                "judge_acc": [],
                 "opened_gold_coverage_core": [],
                 "opened_has_winning_clause_core": [],
                 "gold_in_search_topk_core": [],
+                "min_gold_core_rank_union": [],
+                "deep_rank_core_flag": [],
                 "open_calls": [],
                 "tool_calls": [],
                 "winning_clause_rank_core": [],
@@ -67,12 +70,17 @@ def compute_bridged_ab_slices(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             },
         )
         cell = cells[a][b]
-        cell["decision_accuracy"].append(1.0 if rec.get("decision_correct") else 0.0)
+        cell["decision_acc"].append(1.0 if rec.get("decision_correct") else 0.0)
+        if rec.get("judge_correct") is not None:
+            cell["judge_acc"].append(1.0 if rec.get("judge_correct") else 0.0)
         cell["opened_gold_coverage_core"].append(float(rec.get("opened_gold_coverage_core") or 0.0))
         cell["opened_has_winning_clause_core"].append(
             1.0 if rec.get("opened_has_winning_clause_core") else 0.0
         )
         cell["gold_in_search_topk_core"].append(1.0 if rec.get("gold_in_search_topk_core") else 0.0)
+        if rec.get("min_gold_core_rank_union") is not None:
+            cell["min_gold_core_rank_union"].append(float(rec.get("min_gold_core_rank_union")))
+        cell["deep_rank_core_flag"].append(1.0 if rec.get("deep_rank_core_flag") else 0.0)
         cell["open_calls"].append(float(rec.get("open_calls") or 0.0))
         cell["tool_calls"].append(float(rec.get("tool_calls") or 0.0))
         if rec.get("winning_clause_rank_core") is not None:
@@ -89,13 +97,18 @@ def compute_bridged_ab_slices(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         rendered[a_key] = {}
         for b_key, values in b_map.items():
             rendered[a_key][b_key] = {
-                "n": len(values["decision_accuracy"]),
-                "decision_accuracy": _safe_mean(values["decision_accuracy"]),
+                "n": len(values["decision_acc"]),
+                "decision_acc": _safe_mean(values["decision_acc"]),
+                "judge_acc": _safe_mean(values["judge_acc"]) if values["judge_acc"] else None,
                 "opened_gold_coverage_core_mean": _safe_mean(values["opened_gold_coverage_core"]),
                 "opened_has_winning_clause_core_rate": _safe_mean(
                     values["opened_has_winning_clause_core"]
                 ),
                 "gold_in_search_topk_core_rate": _safe_mean(values["gold_in_search_topk_core"]),
+                "core_min_rank_union_mean": _safe_mean(values["min_gold_core_rank_union"])
+                if values["min_gold_core_rank_union"]
+                else None,
+                "deep_rank_core_rate": _safe_mean(values["deep_rank_core_flag"]),
                 "open_calls_avg": _safe_mean(values["open_calls"]),
                 "tool_calls_avg": _safe_mean(values["tool_calls"]),
                 "winning_clause_rank_core_mean": _safe_mean(values["winning_clause_rank_core"]),

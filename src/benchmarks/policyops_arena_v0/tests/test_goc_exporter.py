@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from goc_logger.export import export_dot
 

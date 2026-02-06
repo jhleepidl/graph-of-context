@@ -6,7 +6,16 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 
-from goc_logger.export import export_dot
+try:
+    from goc_logger.export import export_dot
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    _root_src = Path(__file__).resolve().parents[4] / "src"
+    if str(_root_src) not in sys.path:
+        sys.path.append(str(_root_src))
+    from goc_logger.export import export_dot
 
 
 def _load_report(path: Path) -> Dict[str, Any]:
@@ -117,6 +126,10 @@ def triage_compare(
             and r.get("selection_gap") >= 0.5,
             "selection_gap>=0.5",
         ),
+        "ACC_NO_CORE_EVIDENCE": (
+            lambda r: r.get("acc_no_core_evidence") is True,
+            "judge_correct=True and opened_gold_coverage_core==0",
+        ),
         "F_evidence_padding_artifact": (
             lambda r: (
                 not r.get("evidence_before_pad")
@@ -129,6 +142,30 @@ def triage_compare(
             )
             and len(r.get("evidence_after_pad") or []) > 0,
             "evidence_before_pad empty or no gold hit, evidence_after_pad non-empty",
+        ),
+        "THREAD_E1_FAIL": (
+            lambda r: r.get("episode_id") == 1 and r.get("commit_correct") is False,
+            "threaded: commit1 missing core evidence",
+        ),
+        "THREAD_E2_FAIL": (
+            lambda r: r.get("episode_id") == 2 and r.get("commit_correct") is False,
+            "threaded: commit2 missing core evidence",
+        ),
+        "COMPOSE_FAIL": (
+            lambda r: r.get("episode_id") == 3 and r.get("thread_judge_correct") is False,
+            "threaded: final compose incorrect",
+        ),
+        "BRANCH_TRAP": (
+            lambda r: r.get("episode_id") == 2 and r.get("branch_trap") is True,
+            "threaded: distractor exception selected",
+        ),
+        "FOLD_DRIFT": (
+            lambda r: r.get("episode_id") == 3 and r.get("fold_drift") is True,
+            "threaded: fold/summary drifted from commit facts",
+        ),
+        "COST_BLOWUP": (
+            lambda r: r.get("cost_blowup") is True,
+            "threaded: prompt token budget exceeded threshold",
         ),
     }
     if buckets:
@@ -155,6 +192,9 @@ def triage_compare(
                 budget_gap = winning_clause_rank - open_budget
             case = {
                 "task_id": task_id,
+                "thread_id": rec.get("thread_id"),
+                "episode_id": rec.get("episode_id"),
+                "episode_kind": rec.get("episode_kind"),
                 "pred_decision": rec.get("pred_decision"),
                 "gold_decision": rec.get("gold_decision"),
                 "opened_clause_ids": rec.get("opened_clause_ids"),

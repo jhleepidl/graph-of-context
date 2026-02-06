@@ -4,8 +4,10 @@ import argparse
 import copy
 import csv
 import json
+import math
 import random
 import hashlib
+import sys
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -21,11 +23,22 @@ from .baselines import (
     run_goc_heuristic,
     run_oracle,
     run_topk_rag,
+    run_similarity_only,
+    run_agent_fold,
+    summarize_clause_history,
+    _parse_prediction,
 )
 from .controller import Controller, RerankController
 from .diagnostics import compute_retrieval_diagnostics, merge_search_results_union
-from .symbolic_judge import judge_from_opened_clauses
-from .analysis import analyze_failure_slice, analyze_bridged_ab
+from .symbolic_judge import judge_from_opened_clauses, judge_threaded_final
+from .analysis import (
+    analyze_failure_slice,
+    analyze_bridged_ab,
+    analyze_selection_triage,
+    analyze_slot_breakdown,
+    analyze_split_sweep_ab,
+    analyze_bundle,
+)
 from .bridged_ab import compute_bridged_ab_slices
 try:
     from goc_logger.graph import GoCGraph
@@ -44,6 +57,77 @@ from .eval import aggregate_metrics, evaluate_prediction, gold_decision_distribu
 from .generator import generate_world_and_tasks
 from .world import load_tasks, load_world
 
+CALIB_PRESET_N8 = "bridged_v1_1_calib_n8_exclcore"
+CALIB_PRESET_N10 = "bridged_v1_1_calib_n10_exclcore"
+CALIBRATED_PRESET = "bridged_v1_1_calibrated"
+THREADED_PRESET_N8 = "threaded_v1_2_calib_n8_exclcore"
+THREADED_PRESET_N10 = "threaded_v1_2_calib_n10_exclcore"
+PRESET_CONFIGS = {
+    CALIB_PRESET_N8: {
+        "scenario_mode": "bridged_v1_1",
+        "n_docs": 8,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+    },
+    CALIB_PRESET_N10: {
+        "scenario_mode": "bridged_v1_1",
+        "n_docs": 10,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+    },
+    # Backward-compatible alias; prefer CALIB_PRESET_N10/CALIB_PRESET_N8 for research runs.
+    CALIBRATED_PRESET: {
+        "scenario_mode": "bridged_v1_1",
+        "n_docs": 10,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+    },
+    THREADED_PRESET_N8: {
+        "scenario_mode": "threaded_v1_2",
+        "n_docs": 8,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+        "n_threads": 100,
+        "open_budget_e1": 4,
+        "open_budget_e2": 4,
+        "open_budget_e3": 0,
+        "tool_budget_e1": 50,
+        "tool_budget_e2": 50,
+        "tool_budget_e3": 0,
+    },
+    THREADED_PRESET_N10: {
+        "scenario_mode": "threaded_v1_2",
+        "n_docs": 10,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+        "n_threads": 100,
+        "open_budget_e1": 4,
+        "open_budget_e2": 4,
+        "open_budget_e3": 0,
+        "tool_budget_e1": 50,
+        "tool_budget_e2": 50,
+        "tool_budget_e3": 0,
+    },
+}
+DEFAULT_GENERATION = {
+    "n_docs": 30,
+    "clauses_per_doc": 5,
+    "alias_density": 0.9,
+    "canonical_density": 0.95,
+}
+DEEP_RANK_CORE_THRESHOLD = 10
+COST_BLOWUP_TOKENS = 2000
+
 
 def _default_base_dir() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -57,6 +141,533 @@ def _avg_p90(values: List[int]) -> Dict[str, float]:
     idx = int(0.9 * (len(ordered) - 1))
     p90 = ordered[idx]
     return {"avg": avg, "p90": float(p90)}
+
+
+def _extract_clause_ids(results: Any) -> List[str]:
+    if not isinstance(results, list):
+        return []
+    ids: List[str] = []
+    for item in results:
+        if isinstance(item, dict):
+            cid = item.get("clause_id")
+            if cid:
+                ids.append(str(cid))
+    return ids
+
+
+def _min_rank(results: List[Dict[str, Any]], target_ids: List[str]) -> int | None:
+    if not results or not target_ids:
+        return None
+    target_set = set(target_ids)
+    ordered = sorted(results, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    for idx, item in enumerate(ordered, start=1):
+        cid = item.get("clause_id")
+        if cid in target_set:
+            return idx
+    return None
+
+
+def _rank_summary(values: List[int]) -> Dict[str, float | None]:
+    if not values:
+        return {"mean": None, "median": None, "p90": None}
+    ordered = sorted(values)
+    mean_val = sum(ordered) / len(ordered)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 0:
+        median_val = (ordered[mid - 1] + ordered[mid]) / 2
+    else:
+        median_val = ordered[mid]
+    idx = int(0.9 * (len(ordered) - 1))
+    p90_val = ordered[idx]
+    return {"mean": float(mean_val), "median": float(median_val), "p90": float(p90_val)}
+
+
+def _tokenize(text: str) -> List[str]:
+    return [t.lower() for t in text.split() if t.strip()]
+
+
+def _select_similarity_clause_ids(
+    ticket: str,
+    clause_ids: List[str],
+    world: Any,
+    top_k: int = 4,
+) -> List[str]:
+    if not clause_ids:
+        return []
+    ticket_tokens = set(_tokenize(ticket))
+    scored: List[tuple[str, int]] = []
+    for cid in clause_ids:
+        clause = world.clauses.get(cid)
+        if not clause:
+            continue
+        tokens = set(_tokenize(clause.text))
+        score = len(ticket_tokens & tokens)
+        scored.append((cid, score))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return [cid for cid, _ in scored[:top_k]]
+
+
+def _extract_commit_supporting(
+    task: Any,
+    opened_ids: List[str],
+    world: Any,
+    episode_kind: str | None,
+) -> List[str]:
+    supporting: List[str] = []
+    core_ids = list(getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or [])
+    opened_set = set(opened_ids or [])
+    if episode_kind == "e1_retrieve_rule":
+        bridge_id = getattr(task, "bridge_clause_id", None)
+        if bridge_id and bridge_id in opened_set:
+            supporting.append(bridge_id)
+        for cid in core_ids:
+            if cid in opened_set and cid not in supporting:
+                supporting.append(cid)
+                break
+    elif episode_kind == "e2_exception_update":
+        for cid in core_ids:
+            if cid in opened_set and cid not in supporting:
+                supporting.append(cid)
+    else:
+        for cid in core_ids:
+            if cid in opened_set and cid not in supporting:
+                supporting.append(cid)
+    return supporting
+
+
+def _extract_commit_short_fact(
+    task: Any,
+    supporting_ids: List[str],
+    world: Any,
+    episode_kind: str | None,
+) -> Dict[str, Any]:
+    if not supporting_ids:
+        return {}
+    if episode_kind == "e1_retrieve_rule":
+        bridge_id = getattr(task, "bridge_clause_id", None)
+        canonical_term = None
+        if bridge_id and bridge_id in supporting_ids:
+            clause = world.clauses.get(bridge_id)
+            if clause and clause.canonical_terms:
+                canonical_term = clause.canonical_terms[0]
+        short_fact = {}
+        if canonical_term:
+            short_fact["canonical_term"] = canonical_term
+        core_ids = list(getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or [])
+        for cid in supporting_ids:
+            if cid in core_ids:
+                clause = world.clauses.get(cid)
+                if clause and clause.effect:
+                    short_fact["base_decision"] = clause.effect.get("decision")
+                break
+        return short_fact
+    if episode_kind == "e2_exception_update":
+        for cid in supporting_ids:
+            clause = world.clauses.get(cid)
+            if clause and clause.applies_if:
+                key = next(iter(clause.applies_if.keys()))
+                val = clause.applies_if.get(key, [""])[0]
+                return {"exception_condition": f"{key}={val}"}
+        return {}
+    return {}
+
+
+def _format_commit_refs(commit1: Dict[str, Any] | None, commit2: Dict[str, Any] | None, episode_id: int) -> str:
+    lines = []
+    if episode_id >= 2:
+        lines.append("commit1.fact1")
+    if episode_id >= 3:
+        lines.append("commit2.fact2")
+    if not lines:
+        return ""
+    return "Commit refs: " + ", ".join(lines)
+
+
+def _build_threaded_prompt(
+    ticket: str,
+    commit_facts: Dict[str, Any],
+    commit_clause_ids: List[str],
+    clauses: List[Any] | None = None,
+    summary_text: str | None = None,
+) -> str:
+    header = (
+        "You are a policy assistant. Use commit memory to answer the ticket.\n"
+        "Use only commit anchor clause_ids as evidence.\n"
+        'Return JSON: {"decision":"allow|deny|require_condition|needs_more_info",'
+        '"conditions":[...], "evidence":[...], "customer_message":"..."}\n'
+    )
+    body = ["Ticket:", ticket, ""]
+    body.append("Commit memory (masked refs):")
+    for key in sorted(commit_facts.keys()):
+        val = commit_facts.get(key)
+        body.append(f"- {key}: {val if val is not None else 'unknown'}")
+    body.append("")
+    body.append("Allowed evidence IDs: " + (", ".join(commit_clause_ids) if commit_clause_ids else "none"))
+    if summary_text:
+        body.append("")
+        body.append("Folded summary:")
+        body.append(summary_text)
+    if clauses:
+        body.append("")
+        body.append("Context clauses:")
+        for clause in clauses:
+            body.append(f"[{clause['clause_id']}] {clause['text']}")
+    body.append("")
+    body.append("Return JSON only.")
+    return header + "\n".join(body)
+
+
+def _is_bridge_clause(clause: Any) -> bool:
+    if not clause:
+        return False
+    return bool(
+        getattr(clause, "is_bridge_doc", False)
+        or getattr(clause, "bridge_for_slot", None)
+        or getattr(clause, "kind", None) in {"definition", "glossary"}
+    )
+
+
+def _is_meta_clause(clause: Any) -> bool:
+    if not clause:
+        return False
+    return getattr(clause, "kind", None) == "priority" or getattr(clause, "slot", None) == "meta"
+
+
+def _is_rule_clause(clause: Any) -> bool:
+    if not clause:
+        return False
+    return getattr(clause, "kind", None) in {"rule", "exception", "update", "procedure"}
+
+
+def _apply_preset(args: argparse.Namespace) -> None:
+    preset = getattr(args, "preset", None)
+    if not preset:
+        return
+    config = PRESET_CONFIGS.get(preset)
+    if not config:
+        return
+    if hasattr(args, "scenario_mode") and config.get("scenario_mode"):
+        args.scenario_mode = config["scenario_mode"]
+    for key in (
+        "n_docs",
+        "clauses_per_doc",
+        "alias_density",
+        "canonical_density",
+        "exclusive_core_evidence",
+        "n_threads",
+        "open_budget_e1",
+        "open_budget_e2",
+        "open_budget_e3",
+        "tool_budget_e1",
+        "tool_budget_e2",
+        "tool_budget_e3",
+        "branch_distractor_rate",
+    ):
+        if hasattr(args, key) and config.get(key) is not None:
+            current = getattr(args, key)
+            if current is None or isinstance(current, bool):
+                setattr(args, key, config[key])
+
+
+def _apply_generation_defaults(args: argparse.Namespace) -> None:
+    for key, value in DEFAULT_GENERATION.items():
+        if hasattr(args, key) and getattr(args, key) is None:
+            setattr(args, key, value)
+
+
+def quickcheck_compare_report(
+    report: Dict[str, Any],
+    *,
+    label: str = "compare",
+    print_fn: Any = print,
+) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+
+    def _add_check(name: str, passed: bool, details: str) -> None:
+        checks.append({"name": name, "passed": passed, "details": details})
+        if print_fn:
+            status = "PASS" if passed else "FAIL"
+            print_fn(f"[quickcheck:{label}] {name}: {status} ({details})")
+
+    method_reports = report.get("method_reports", {}) or {}
+
+    # goc_base invariants
+    goc_base_report = method_reports.get("goc_base")
+    if not goc_base_report:
+        _add_check("goc_base_invariants", True, "no goc_base report found")
+    else:
+        records = goc_base_report.get("records", []) or []
+        hop2_nonempty = 0
+        union_mismatch = 0
+        for rec in records:
+            hop2 = rec.get("hop2_search_results")
+            if not isinstance(hop2, list) or len(hop2) != 0:
+                hop2_nonempty += 1
+            hop1_ids = set(_extract_clause_ids(rec.get("hop1_search_results")))
+            union_ids = set(_extract_clause_ids(rec.get("search_results_union")))
+            if hop1_ids != union_ids:
+                union_mismatch += 1
+        metrics = goc_base_report.get("metrics", {}) or {}
+        hop1_rate = metrics.get("gold_in_search_topk_rate_hop1")
+        union_rate = metrics.get("gold_in_search_topk_rate_union")
+        rate_ok = (
+            isinstance(hop1_rate, (int, float))
+            and isinstance(union_rate, (int, float))
+            and abs(float(hop1_rate) - float(union_rate)) <= 1e-9
+        )
+        passed = hop2_nonempty == 0 and union_mismatch == 0 and rate_ok
+        details = (
+            f"records={len(records)}, hop2_nonempty={hop2_nonempty}, "
+            f"union_mismatch={union_mismatch}, rate_match={rate_ok}"
+        )
+        _add_check("goc_base_invariants", passed, details)
+
+    # Record-level invariant: gold_in_search_topk => gold_in_search_topk_union
+    violations = 0
+    total_gold = 0
+    for report_obj in method_reports.values():
+        for rec in report_obj.get("records", []) or []:
+            if rec.get("gold_in_search_topk") is True:
+                total_gold += 1
+                if rec.get("gold_in_search_topk_union") is not True:
+                    violations += 1
+    _add_check(
+        "gold_in_search_topk_implies_union",
+        violations == 0,
+        f"violations={violations}, checked={total_gold}",
+    )
+
+    # Selection metrics sanity
+    sel_gap_bad = 0
+    rate_bad = 0
+    eff_bad = 0
+    checked = 0
+    for report_obj in method_reports.values():
+        for rec in report_obj.get("records", []) or []:
+            checked += 1
+            gap = rec.get("selection_gap")
+            feasible = rec.get("feasible_open_rate")
+            realized = rec.get("realized_open_rate")
+            eff = rec.get("selection_efficiency")
+            if not isinstance(gap, (int, float)) or gap < 0:
+                sel_gap_bad += 1
+            if not isinstance(feasible, (int, float)) or feasible < 0 or feasible > 1:
+                rate_bad += 1
+            if not isinstance(realized, (int, float)) or realized < 0 or realized > 1:
+                rate_bad += 1
+            if isinstance(feasible, (int, float)) and feasible == 0:
+                eff_ok = eff is None or (isinstance(eff, float) and math.isnan(eff))
+                if not eff_ok:
+                    eff_bad += 1
+            else:
+                if not isinstance(eff, (int, float)) or (isinstance(eff, float) and math.isnan(eff)):
+                    eff_bad += 1
+    sel_pass = sel_gap_bad == 0 and rate_bad == 0 and eff_bad == 0
+    sel_details = (
+        f"records={checked}, gap_bad={sel_gap_bad}, rate_bad={rate_bad}, eff_bad={eff_bad}"
+    )
+    _add_check("selection_metrics_sanity", sel_pass, sel_details)
+
+    # Judge metrics present
+    if report.get("judge") == "symbolic":
+        missing_record = 0
+        missing_metric = 0
+        for method, report_obj in method_reports.items():
+            metrics = report_obj.get("metrics", {}) or {}
+            if not isinstance(metrics.get("judge_accuracy"), (int, float)):
+                missing_metric += 1
+            for rec in report_obj.get("records", []) or []:
+                if rec.get("judge_decision") is None or rec.get("judge_correct") is None:
+                    missing_record += 1
+        passed = missing_record == 0 and missing_metric == 0
+        details = f"missing_record={missing_record}, missing_metric={missing_metric}"
+        _add_check("judge_metrics_present", passed, details)
+    else:
+        _add_check("judge_metrics_present", True, "judge not symbolic")
+
+    # Acc-no-core and judge-supporting metrics present (summary)
+    missing_acc = 0
+    missing_support = 0
+    acc_details = []
+    support_details = []
+    for method, report_obj in method_reports.items():
+        metrics = report_obj.get("metrics", {}) or {}
+        if "acc_no_core_evidence_rate" not in metrics:
+            missing_acc += 1
+        acc_details.append(f"{method}={metrics.get('acc_no_core_evidence_rate')}")
+        support_keys = [
+            "judge_supporting_count_mean",
+            "judge_used_any_core_rate",
+            "judge_used_any_bridge_rate",
+        ]
+        if any(k not in metrics for k in support_keys):
+            missing_support += 1
+        support_details.append(
+            f"{method}:count_mean={metrics.get('judge_supporting_count_mean')},"
+            f"core_rate={metrics.get('judge_used_any_core_rate')},"
+            f"bridge_rate={metrics.get('judge_used_any_bridge_rate')}"
+        )
+    _add_check(
+        "acc_no_core_evidence_rate_present",
+        missing_acc == 0,
+        "; ".join(acc_details),
+    )
+    _add_check(
+        "judge_supporting_metrics_present",
+        missing_support == 0,
+        "; ".join(support_details),
+    )
+
+    deep_missing = 0
+    open_missing = 0
+    deep_details = []
+    open_count_details = []
+    for method, report_obj in method_reports.items():
+        metrics = report_obj.get("metrics", {}) or {}
+        deep_val = metrics.get("deep_rank_core_rate")
+        if not isinstance(deep_val, (int, float)):
+            deep_missing += 1
+        deep_details.append(f"{method}={deep_val}")
+        bridge_mean = metrics.get("opened_bridge_count_mean")
+        rule_mean = metrics.get("opened_rule_count_mean")
+        if not isinstance(bridge_mean, (int, float)) or not isinstance(rule_mean, (int, float)):
+            open_missing += 1
+        open_count_details.append(
+            f"{method}:bridge_mean={bridge_mean},rule_mean={rule_mean}"
+        )
+    _add_check(
+        "deep_rank_core_rate_present",
+        deep_missing == 0,
+        "; ".join(deep_details),
+    )
+    _add_check(
+        "opened_counts_present",
+        open_missing == 0,
+        "; ".join(open_count_details),
+    )
+
+    if report.get("judge") == "symbolic":
+        ub_details = []
+        for method, report_obj in method_reports.items():
+            metrics = report_obj.get("metrics", {}) or {}
+            ub_details.append(
+                f"{method}={metrics.get('selection_upper_bound_judge_acc')}"
+            )
+        _add_check(
+            "selection_upper_bound_present",
+            True,
+            "; ".join(ub_details),
+        )
+
+    # Threaded v1.2 metrics
+    threaded_mode = report.get("scenario_params", {}).get("scenario_mode") == "threaded_v1_2"
+    if not threaded_mode:
+        for report_obj in method_reports.values():
+            if any(rec.get("scenario_mode") == "threaded_v1_2" for rec in report_obj.get("records", []) or []):
+                threaded_mode = True
+                break
+    if threaded_mode:
+        missing_thread_metrics = 0
+        missing_episode_metrics = 0
+        missing_thread_records = 0
+        for method, report_obj in method_reports.items():
+            metrics = report_obj.get("metrics", {}) or {}
+            if metrics.get("thread_judge_accuracy") is None:
+                missing_thread_metrics += 1
+            required_episode = [
+                "episode_judge_accuracy_e1",
+                "episode_judge_accuracy_e2",
+                "episode_judge_accuracy_e3",
+            ]
+            if any(k not in metrics for k in required_episode):
+                missing_episode_metrics += 1
+            if not report_obj.get("thread_records"):
+                missing_thread_records += 1
+        _add_check(
+            "thread_metrics_present",
+            missing_thread_metrics == 0,
+            f"missing={missing_thread_metrics}",
+        )
+        _add_check(
+            "episode_metrics_present",
+            missing_episode_metrics == 0,
+            f"missing={missing_episode_metrics}",
+        )
+        _add_check(
+            "thread_records_present",
+            missing_thread_records == 0,
+            f"missing={missing_thread_records}",
+        )
+
+    return {"passed": all(c["passed"] for c in checks), "checks": checks}
+
+
+def quickcheck_sweep_summary(
+    rows: List[Dict[str, Any]],
+    *,
+    judge_mode: str = "llm",
+    label: str = "sweep",
+    print_fn: Any = print,
+) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+
+    def _add_check(name: str, passed: bool, details: str) -> None:
+        checks.append({"name": name, "passed": passed, "details": details})
+        if print_fn:
+            status = "PASS" if passed else "FAIL"
+            print_fn(f"[quickcheck:{label}] {name}: {status} ({details})")
+
+    if not rows:
+        _add_check("summary_rows_present", False, "no summary rows")
+        return {"passed": False, "checks": checks}
+    _add_check("summary_rows_present", True, f"rows={len(rows)}")
+
+    required = [
+        "feasible_open_rate",
+        "realized_open_rate",
+        "selection_gap",
+        "selection_efficiency",
+    ]
+    if judge_mode == "symbolic":
+        required.append("judge_accuracy")
+
+    missing = 0
+    for row in rows:
+        for key in required:
+            if key not in row:
+                missing += 1
+                break
+    _add_check("summary_required_keys", missing == 0, f"missing_rows={missing}")
+
+    # Reuse selection sanity checks on aggregated rows.
+    sel_gap_bad = 0
+    rate_bad = 0
+    eff_bad = 0
+    for row in rows:
+        gap = row.get("selection_gap")
+        feasible = row.get("feasible_open_rate")
+        realized = row.get("realized_open_rate")
+        eff = row.get("selection_efficiency")
+        if not isinstance(gap, (int, float)) or gap < 0:
+            sel_gap_bad += 1
+        if not isinstance(feasible, (int, float)) or feasible < 0 or feasible > 1:
+            rate_bad += 1
+        if not isinstance(realized, (int, float)) or realized < 0 or realized > 1:
+            rate_bad += 1
+        if isinstance(feasible, (int, float)) and feasible == 0:
+            eff_ok = eff is None or (isinstance(eff, float) and math.isnan(eff))
+            if not eff_ok:
+                eff_bad += 1
+        else:
+            if not isinstance(eff, (int, float)) or (isinstance(eff, float) and math.isnan(eff)):
+                eff_bad += 1
+    sel_pass = sel_gap_bad == 0 and rate_bad == 0 and eff_bad == 0
+    sel_details = (
+        f"rows={len(rows)}, gap_bad={sel_gap_bad}, rate_bad={rate_bad}, eff_bad={eff_bad}"
+    )
+    _add_check("summary_selection_metrics_sanity", sel_pass, sel_details)
+
+    return {"passed": all(c["passed"] for c in checks), "checks": checks}
 
 
 def _resolve_controller_state_path(base_dir: Path, path_str: str) -> Path:
@@ -182,9 +793,28 @@ def _evaluate_method(
     prompt_tokens_list: List[int] = []
     records: List[Dict[str, Any]] = []
     controller_actions: Dict[str, int] = {}
+    thread_state_by_id: Dict[str, Dict[str, Any]] = {}
+    thread_records: List[Dict[str, Any]] = []
+    episode_judge: Dict[int, List[float]] = {1: [], 2: [], 3: []}
+    episode_commit: Dict[int, List[float]] = {1: [], 2: [], 3: []}
+    episode_cov_core: Dict[int, List[float]] = {1: [], 2: [], 3: []}
 
     for task in tasks:
         scenario_mode = getattr(task, "scenario_mode", getattr(args, "scenario_mode", "v0"))
+        thread_id = getattr(task, "thread_id", None)
+        episode_id = getattr(task, "episode_id", None)
+        episode_kind = getattr(task, "episode_kind", None)
+        thread_state: Dict[str, Any] | None = None
+        if scenario_mode == "threaded_v1_2" and thread_id:
+            thread_state = thread_state_by_id.setdefault(
+                thread_id,
+                {
+                    "commit1": None,
+                    "commit2": None,
+                    "opened_history_ids": [],
+                    "episode_records": {},
+                },
+            )
         search_score_mode = getattr(args, "search_score_mode", "bm25_plus_bridge_bonus")
         bridge_bonus = float(getattr(args, "bridge_bonus", 1.5))
         env = PolicyOpsEnv(
@@ -226,9 +856,69 @@ def _evaluate_method(
                 ) / f"{task.task_id}.jsonl"
                 goc_graph_path = goc_graph_task_path
         agent_query_policy = getattr(args, "agent_query_policy", "single_hop")
-        if method == "topk":
+        task_for_run = task
+        if scenario_mode == "threaded_v1_2" and thread_state and episode_id:
+            task_for_run = copy.deepcopy(task)
+            commit_refs = _format_commit_refs(thread_state.get("commit1"), thread_state.get("commit2"), episode_id)
+            if commit_refs:
+                task_for_run.user_ticket = f"{task_for_run.user_ticket}\n\n{commit_refs}"
+        if scenario_mode == "threaded_v1_2" and episode_id == 3 and thread_state:
+            commit1 = thread_state.get("commit1") or {}
+            commit2 = thread_state.get("commit2") or {}
+            commit_clause_ids = list(
+                dict.fromkeys(
+                    (commit1.get("supporting_clause_ids") or [])
+                    + (commit2.get("supporting_clause_ids") or [])
+                )
+            )
+            commit_facts = {
+                "commit1.fact1": (commit1.get("short_fact") or {}).get("canonical_term"),
+                "commit2.fact2": (commit2.get("short_fact") or {}).get("exception_condition"),
+            }
+            opened_history_ids = thread_state.get("opened_history_ids", [])
+            compose_strategy = "commit_only"
+            context_clause_ids: List[str] = []
+            summary_text = None
+            if method in {"full", "full_history"}:
+                compose_strategy = "full_history"
+                context_clause_ids = list(dict.fromkeys(opened_history_ids))
+            elif method == "similarity_only":
+                compose_strategy = "similarity_only"
+                context_clause_ids = _select_similarity_clause_ids(
+                    task_for_run.user_ticket,
+                    opened_history_ids,
+                    world,
+                    top_k=4,
+                )
+            elif method == "agent_fold":
+                compose_strategy = "agent_fold"
+                clause_objs = [world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)]
+                summary_text = summarize_clause_history(clause_objs)
+            context_clauses = []
+            for cid in context_clause_ids:
+                clause = world.clauses.get(cid)
+                if clause:
+                    context_clauses.append({"clause_id": clause.clause_id, "text": clause.text})
+            prompt = _build_threaded_prompt(
+                task_for_run.user_ticket,
+                commit_facts,
+                commit_clause_ids,
+                clauses=context_clauses,
+                summary_text=summary_text,
+            )
+            raw_output = client.generate(prompt)
+            pred = _parse_prediction(raw_output)
+            opened_ids = []
+            diag = {
+                "compose_strategy": compose_strategy,
+                "commit_clause_ids": commit_clause_ids,
+                "commit_facts": commit_facts,
+                "compose_context_clause_ids": context_clause_ids,
+                "compose_summary_used": bool(summary_text),
+            }
+        elif method == "topk":
             pred, opened_ids, prompt, raw_output, diag = run_topk_rag(
-                task,
+                task_for_run,
                 env,
                 client,
                 primary_top_k=args.primary_search_top_k,
@@ -237,9 +927,9 @@ def _evaluate_method(
                 rewrite_mode=args.query_rewrite_mode,
                 merge_rank_fusion=args.merge_rank_fusion,
             )
-        elif method == "full":
+        elif method in {"full", "full_history"}:
             pred, opened_ids, prompt, raw_output, diag = run_full_history(
-                task,
+                task_for_run,
                 env,
                 client,
                 primary_top_k=args.primary_search_top_k,
@@ -252,7 +942,7 @@ def _evaluate_method(
             if method == "goc_base":
                 agent_query_policy = "single_hop"
             pred, opened_ids, prompt, raw_output, error, controller_action, diag = run_goc_heuristic(
-                task,
+                task_for_run,
                 env,
                 client,
                 controller=controller,
@@ -270,9 +960,32 @@ def _evaluate_method(
                 controller_policy=controller_policy,
                 open_split_mode=getattr(args, "open_split_mode", "all_union_rank"),
                 open_split_hop1=int(getattr(args, "open_split_hop1", 0)),
+                open_policy=getattr(args, "open_policy", "current"),
             )
             if controller_action:
                 controller_actions[controller_action] = controller_actions.get(controller_action, 0) + 1
+        elif method == "similarity_only":
+            pred, opened_ids, prompt, raw_output, diag = run_similarity_only(
+                task_for_run,
+                env,
+                client,
+                primary_top_k=args.primary_search_top_k,
+                use_query_rewrite=args.use_query_rewrite,
+                rewrite_queries_count=args.rewrite_queries,
+                rewrite_mode=args.query_rewrite_mode,
+                merge_rank_fusion=args.merge_rank_fusion,
+            )
+        elif method == "agent_fold":
+            pred, opened_ids, prompt, raw_output, diag = run_agent_fold(
+                task_for_run,
+                env,
+                client,
+                primary_top_k=args.primary_search_top_k,
+                use_query_rewrite=args.use_query_rewrite,
+                rewrite_queries_count=args.rewrite_queries,
+                rewrite_mode=args.query_rewrite_mode,
+                merge_rank_fusion=args.merge_rank_fusion,
+            )
         elif method == "oracle":
             pred, opened_ids, prompt, raw_output, oracle_meta = run_oracle(
                 task,
@@ -294,6 +1007,61 @@ def _evaluate_method(
         else:
             raise ValueError(f"Unknown method: {method}")
 
+        commit_supporting_clause_ids: List[str] | None = None
+        commit_short_fact: Dict[str, Any] | None = None
+        commit_correct: bool | None = None
+        e3_evidence_valid: bool | None = None
+        thread_judge_correct: bool | None = None
+        commit_clause_ids: List[str] | None = None
+        if scenario_mode == "threaded_v1_2" and thread_state and episode_id in {1, 2}:
+            commit_supporting_clause_ids = _extract_commit_supporting(
+                task,
+                opened_ids,
+                world,
+                episode_kind,
+            )
+            commit_short_fact = _extract_commit_short_fact(
+                task,
+                commit_supporting_clause_ids,
+                world,
+                episode_kind,
+            )
+            core_ids = list(
+                getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
+            )
+            commit_correct = bool(
+                commit_supporting_clause_ids
+                and any(cid in commit_supporting_clause_ids for cid in core_ids)
+            )
+            if episode_id == 1:
+                thread_state["commit1"] = {
+                    "supporting_clause_ids": commit_supporting_clause_ids,
+                    "short_fact": commit_short_fact or {},
+                    "commit_correct": commit_correct,
+                }
+            elif episode_id == 2:
+                thread_state["commit2"] = {
+                    "supporting_clause_ids": commit_supporting_clause_ids,
+                    "short_fact": commit_short_fact or {},
+                    "commit_correct": commit_correct,
+                }
+            history_source = opened_ids
+            if isinstance(diag, dict) and diag.get("opened_total_clause_ids"):
+                history_source = list(diag.get("opened_total_clause_ids") or [])
+            opened_history_ids = list(
+                dict.fromkeys(thread_state.get("opened_history_ids", []) + history_source)
+            )
+            thread_state["opened_history_ids"] = opened_history_ids
+        if scenario_mode == "threaded_v1_2" and thread_state and episode_id == 3:
+            commit1 = thread_state.get("commit1") or {}
+            commit2 = thread_state.get("commit2") or {}
+            commit_clause_ids = list(
+                dict.fromkeys(
+                    (commit1.get("supporting_clause_ids") or [])
+                    + (commit2.get("supporting_clause_ids") or [])
+                )
+            )
+            commit_supporting_clause_ids = commit_clause_ids
         primary_results = diag.get("primary_search_results", []) if isinstance(diag, dict) else []
         gold_core_ids = list(
             getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
@@ -318,16 +1086,23 @@ def _evaluate_method(
             save_snapshot=False,
             snapshot_k=args.search_snapshot_k,
         )
-        hop1_results = (
-            diag.get("hop1_search_results")
-            if isinstance(diag, dict) and diag.get("hop1_search_results") is not None
-            else primary_results
-        )
-        hop2_results = (
-            diag.get("hop2_search_results")
-            if isinstance(diag, dict) and diag.get("hop2_search_results") is not None
-            else []
-        )
+        is_two_hop = method == "goc" and agent_query_policy == "two_hop_bridge"
+        if is_two_hop:
+            hop1_results = (
+                diag.get("hop1_search_results")
+                if isinstance(diag, dict) and "hop1_search_results" in diag
+                else []
+            )
+            hop2_results = (
+                diag.get("hop2_search_results")
+                if isinstance(diag, dict) and "hop2_search_results" in diag
+                else []
+            )
+            hop1_results = hop1_results or []
+            hop2_results = hop2_results or []
+        else:
+            hop1_results = primary_results
+            hop2_results = []
         union_results = merge_search_results_union(hop1_results, hop2_results)
         hop1_diag = compute_retrieval_diagnostics(
             opened_ids=opened_ids,
@@ -356,15 +1131,38 @@ def _evaluate_method(
             else args.primary_search_top_k,
             save_snapshot=False,
         )
+        winning_clause_id = (task.gold.gold_evidence or [None])[0]
+        min_gold_core_rank_hop2 = _min_rank(hop2_results, gold_core_ids)
+        min_gold_core_rank_union = _min_rank(union_results, gold_core_ids)
+        min_gold_winning_rank_hop2 = _min_rank(
+            hop2_results,
+            [winning_clause_id] if winning_clause_id else [],
+        )
+        min_gold_winning_rank_union = _min_rank(
+            union_results,
+            [winning_clause_id] if winning_clause_id else [],
+        )
+        deep_rank_core_flag = bool(
+            min_gold_core_rank_union is not None
+            and min_gold_core_rank_union > DEEP_RANK_CORE_THRESHOLD
+        )
 
+        judge_decision = None
+        judge_correct = None
+        judge_supporting_clause_ids: List[str] | None = None
+        judge_supporting_count: int | None = None
         if getattr(args, "judge", "llm") == "symbolic":
-            pred = judge_from_opened_clauses(task, opened_ids, world)
-            prompt = ""
-            raw_output = None
-            normalize_reason = None
-            decision_before_norm = pred.get("decision")
-            decision_after_norm = pred.get("decision")
-        elif method == "engine":
+            if scenario_mode == "threaded_v1_2" and episode_id == 3 and commit_clause_ids is not None:
+                judge_pred = judge_threaded_final(task, commit_clause_ids, world)
+            else:
+                judge_pred = judge_from_opened_clauses(task, opened_ids, world)
+            judge_decision = judge_pred.get("decision")
+            judge_correct = judge_decision == task.gold.decision
+            judge_supporting_clause_ids = list(
+                judge_pred.get("supporting_clause_ids") or []
+            )
+            judge_supporting_count = len(judge_supporting_clause_ids)
+        if method == "engine":
             normalize_reason = None
             decision_before_norm = pred.get("decision")
             decision_after_norm = pred.get("decision")
@@ -376,6 +1174,25 @@ def _evaluate_method(
             mode=args.evidence_padding_mode,
             min_count=args.min_evidence_count,
         )
+        commit1_correct = None
+        commit2_correct = None
+        if scenario_mode == "threaded_v1_2" and thread_state:
+            commit1 = thread_state.get("commit1") or {}
+            commit2 = thread_state.get("commit2") or {}
+            commit1_correct = commit1.get("commit_correct")
+            commit2_correct = commit2.get("commit_correct")
+            if episode_id == 3 and commit_clause_ids is not None:
+                commit_correct = bool(commit1_correct is True and commit2_correct is True)
+                e3_evidence_valid = all(
+                    cid in set(commit_clause_ids) for cid in (evidence_after or [])
+                )
+                thread_judge_correct = bool(
+                    judge_correct
+                    and commit1_correct is True
+                    and commit2_correct is True
+                    and e3_evidence_valid
+                )
+                judge_correct = thread_judge_correct
         task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
         metrics.append(task_metrics)
         tool_calls.append(env.tool_call_count)
@@ -427,8 +1244,22 @@ def _evaluate_method(
             "normalize_reason": normalize_reason,
             "gold_decision": task.gold.decision,
             "decision_correct": pred_decision == task.gold.decision,
+            "judge_decision": judge_decision,
+            "judge_correct": judge_correct,
+            "judge_supporting_clause_ids": judge_supporting_clause_ids,
+            "judge_supporting_count": judge_supporting_count,
             "scenario_mode": scenario_mode,
+            "thread_id": thread_id,
+            "episode_id": episode_id,
+            "episode_kind": episode_kind,
+            "thread_config": getattr(task, "thread_config", None),
             "agent_query_policy": agent_query_policy,
+            "open_policy": getattr(args, "open_policy", "current"),
+            "slot": task.context.get("slot") if isinstance(getattr(task, "context", None), dict) else None,
+            "slot_term": (
+                getattr(task, "canonical_slot_term", None)
+                or (task.context.get("slot") if isinstance(getattr(task, "context", None), dict) else None)
+            ),
             "slot_hint_alias": getattr(task, "slot_hint_alias", None),
             "canonical_slot_term": getattr(task, "canonical_slot_term", None),
             "bridge_clause_id": bridge_clause_id,
@@ -465,9 +1296,38 @@ def _evaluate_method(
             "controller_action_opened_gold_coverage": action_opened_gold_coverage,
             "controller_action_opened_has_winning_clause": action_opened_has_winning,
             "controller_reward_breakdown": reward_breakdown,
+            "commit_supporting_clause_ids": commit_supporting_clause_ids,
+            "commit_short_fact": commit_short_fact,
+            "commit_correct": commit_correct,
+            "commit_clause_ids": commit_clause_ids,
+            "e3_evidence_valid": e3_evidence_valid,
+            "thread_judge_correct": thread_judge_correct,
+            "min_gold_core_rank_hop2": min_gold_core_rank_hop2,
+            "min_gold_core_rank_union": min_gold_core_rank_union,
+            "min_gold_winning_rank_hop2": min_gold_winning_rank_hop2,
+            "min_gold_winning_rank_union": min_gold_winning_rank_union,
+            "deep_rank_core_flag": deep_rank_core_flag,
         }
         if isinstance(diag, dict):
             record.update(diag)
+        if scenario_mode == "threaded_v1_2":
+            distractor_id = getattr(task, "branch_distractor_clause_id", None)
+            record["branch_distractor_opened"] = bool(distractor_id and distractor_id in opened_ids)
+            record["branch_trap"] = bool(
+                episode_id == 2
+                and record.get("branch_distractor_opened")
+                and record.get("commit_correct") is False
+            )
+            record["fold_drift"] = bool(
+                episode_id == 3
+                and record.get("compose_strategy") in {"full_history", "agent_fold"}
+                and record.get("commit_correct") is True
+                and record.get("thread_judge_correct") is False
+            )
+            record["cost_blowup"] = bool(prompt_tokens > COST_BLOWUP_TOKENS)
+        record["hop1_search_results"] = hop1_results
+        record["hop2_search_results"] = hop2_results
+        record["search_results_union"] = union_results
         if method != "goc":
             record.setdefault("hop2_executed", False)
             record.setdefault("hop2_skip_reason", "no_hop2_method")
@@ -539,6 +1399,26 @@ def _evaluate_method(
             if record.get("bridge_opened_gold") is False and bridge_clause_id:
                 record["bridge_opened_gold"] = bridge_clause_id in opened_ids_set
         record.update(retrieval_diag)
+        opened_ids_set = set(record.get("opened_total_clause_ids") or record.get("opened_clause_ids") or [])
+        opened_bridge_count = sum(
+            1 for cid in opened_ids_set if _is_bridge_clause(world.clauses.get(cid))
+        )
+        opened_meta_count = sum(
+            1 for cid in opened_ids_set if _is_meta_clause(world.clauses.get(cid))
+        )
+        opened_rule_count = sum(
+            1 for cid in opened_ids_set if _is_rule_clause(world.clauses.get(cid))
+        )
+        record.setdefault("opened_bridge_count", opened_bridge_count)
+        record.setdefault("opened_meta_count", opened_meta_count)
+        record.setdefault("opened_rule_count", opened_rule_count)
+        record.setdefault("bridge_open_cap_hit", False)
+        record.setdefault("meta_avoided_count", 0)
+        record.setdefault(
+            "hop2_pool_used_count",
+            record.get("open_from_hop2_count", 0),
+        )
+        record.setdefault("fallback_reason", None)
         hit_hop1 = (
             hop1_diag.get("winning_clause_rank") is not None
             and hop1_diag.get("winning_clause_rank") <= (record.get("open_budget") or 0)
@@ -551,6 +1431,14 @@ def _evaluate_method(
             union_diag.get("winning_clause_rank") is not None
             and union_diag.get("winning_clause_rank") <= (record.get("open_budget") or 0)
         )
+        union_ids = {
+            item.get("clause_id") for item in (union_results or []) if item.get("clause_id")
+        }
+        winning_clause = (task.gold.gold_evidence or [None])[0]
+        core_id_set = set(record.get("gold_evidence_core_ids") or [])
+        winning_in_union = bool(
+            (winning_clause and winning_clause in union_ids) or (union_ids & core_id_set)
+        )
         record.update(
             {
                 "gold_in_search_topk_hop1": hop1_diag.get("gold_in_search_topk"),
@@ -560,20 +1448,28 @@ def _evaluate_method(
                 "winning_clause_rank_hop2": hop2_diag.get("winning_clause_rank"),
                 "winning_clause_rank_union": union_diag.get("winning_clause_rank"),
                 "opened_has_winning_clause_union": union_diag.get("opened_has_winning_clause"),
+                "winning_in_union": winning_in_union,
                 "hit_at_open_budget_hop1": hit_hop1,
                 "hit_at_open_budget_hop2": hit_hop2,
                 "hit_at_open_budget_union": hit_union,
             }
         )
-        feasible_open_rate = (
-            1.0 if record.get("hit_at_open_budget_union") else 0.0
+        opened_has_union = bool(record.get("opened_has_winning_clause_union"))
+        record["rank_success"] = bool(hit_union)
+        record["policy_gain_over_rank"] = (1.0 if opened_has_union else 0.0) - (
+            1.0 if hit_union else 0.0
         )
-        realized_open_rate = 1.0 if record.get("opened_has_winning_clause") else 0.0
+        record["rank_gap"] = (1.0 if hit_union else 0.0) - (1.0 if opened_has_union else 0.0)
+        feasible_open_rate = 1.0 if record.get("hit_at_open_budget_union") else 0.0
+        realized_open_rate = (
+            1.0 if record.get("opened_has_winning_clause_union") else 0.0
+        )
         record["feasible_open_rate"] = feasible_open_rate
         record["realized_open_rate"] = realized_open_rate
-        record["selection_gap"] = feasible_open_rate - realized_open_rate
-        denom = feasible_open_rate if feasible_open_rate > 0 else 1e-6
-        record["selection_efficiency"] = realized_open_rate / denom
+        record["selection_gap"] = max(0.0, feasible_open_rate - realized_open_rate)
+        record["selection_efficiency"] = (
+            realized_open_rate / feasible_open_rate if feasible_open_rate > 0 else None
+        )
         record.update(
             {
                 "opened_gold_count_core": retrieval_diag_core.get("opened_gold_count"),
@@ -588,6 +1484,20 @@ def _evaluate_method(
                 "best_non_gold_score_core": retrieval_diag_core.get("best_non_gold_score"),
                 "gold_score_gap_core": retrieval_diag_core.get("gold_score_gap"),
             }
+        )
+        judge_used_any_core = None
+        judge_used_any_bridge = None
+        if isinstance(record.get("judge_supporting_clause_ids"), list):
+            supporting = set(record.get("judge_supporting_clause_ids") or [])
+            core_ids = set(record.get("gold_evidence_core_ids") or [])
+            judge_used_any_core = bool(supporting & core_ids)
+            bridge_id = record.get("bridge_clause_id")
+            judge_used_any_bridge = bool(bridge_id and bridge_id in supporting)
+        record["judge_used_any_core"] = judge_used_any_core
+        record["judge_used_any_bridge"] = judge_used_any_bridge
+        record["acc_no_core_evidence"] = bool(
+            record.get("judge_correct") is True
+            and (record.get("opened_gold_coverage_core") in {0, 0.0})
         )
         if args.evidence_padding_mode in {"schema_only", "global"}:
             record["evidence_before_pad"] = evidence_before
@@ -616,6 +1526,37 @@ def _evaluate_method(
             record["goc_graph_dot_path"] = None
         records.append(record)
 
+        if scenario_mode == "threaded_v1_2" and thread_state and episode_id:
+            thread_state["episode_records"][episode_id] = record
+            if isinstance(record.get("judge_correct"), bool):
+                episode_judge[episode_id].append(1.0 if record.get("judge_correct") else 0.0)
+            if isinstance(record.get("commit_correct"), bool):
+                episode_commit[episode_id].append(1.0 if record.get("commit_correct") else 0.0)
+            if isinstance(record.get("opened_gold_coverage_core"), (int, float)):
+                episode_cov_core[episode_id].append(float(record.get("opened_gold_coverage_core") or 0.0))
+            if episode_id == 3:
+                commit1 = thread_state.get("commit1") or {}
+                commit2 = thread_state.get("commit2") or {}
+                thread_records.append(
+                    {
+                        "thread_id": thread_id,
+                        "method": method,
+                        "thread_judge_correct": record.get("thread_judge_correct"),
+                        "thread_decision_correct": record.get("decision_correct"),
+                        "commit1_correct": commit1.get("commit_correct"),
+                        "commit2_correct": commit2.get("commit_correct"),
+                        "e3_evidence_valid": record.get("e3_evidence_valid"),
+                        "open_calls_total": sum(
+                            int(r.get("open_calls") or 0)
+                            for r in thread_state.get("episode_records", {}).values()
+                        ),
+                        "tool_calls_total": sum(
+                            int(r.get("tool_calls") or 0)
+                            for r in thread_state.get("episode_records", {}).values()
+                        ),
+                    }
+                )
+
         if goc_graph and goc_graph_path:
             rid = run_id or run_dir.name
             log_events = "events" in args.goc_graph_mode
@@ -623,6 +1564,12 @@ def _evaluate_method(
             def _log(event_type: str, payload: Dict[str, Any]) -> None:
                 if not log_events:
                     return
+                if thread_id:
+                    payload.setdefault("thread_id", thread_id)
+                if episode_id:
+                    payload.setdefault("episode_id", episode_id)
+                if episode_kind:
+                    payload.setdefault("episode_kind", episode_kind)
                 append_event(
                     goc_graph_path,
                     build_event(
@@ -647,12 +1594,36 @@ def _evaluate_method(
                         "next",
                     )
                 last_event_node = node_id
-            episode_id = f"episode:{task.task_id}"
+            episode_node_id = f"episode:{task.task_id}"
             ticket_id = f"ticket:{task.task_id}"
-            goc_graph.add_node(episode_id, "episode", step=goc_graph.step)
+            goc_graph.add_node(episode_node_id, "episode", step=goc_graph.step)
             goc_graph.add_node(ticket_id, "ticket", text=task.user_ticket, step=goc_graph.step)
-            _log("INIT", {"episode_id": episode_id, "ticket_id": ticket_id})
+            _log("INIT", {"episode_id": episode_node_id, "ticket_id": ticket_id})
             goc_graph.step += 1
+
+            if scenario_mode == "threaded_v1_2" and episode_id and record.get("commit_supporting_clause_ids"):
+                commit_node_id = f"commit:{thread_id}:C{episode_id}"
+                goc_graph.add_node(
+                    commit_node_id,
+                    "commit_anchor",
+                    thread_id=thread_id,
+                    episode_id=episode_id,
+                    short_fact=record.get("commit_short_fact"),
+                    step=goc_graph.step,
+                )
+                goc_graph.add_edge(
+                    f"commit_from_ticket:{ticket_id}:{commit_node_id}",
+                    ticket_id,
+                    commit_node_id,
+                    "commit_from_ticket",
+                )
+                _log(
+                    "COMMIT_ANCHOR",
+                    {
+                        "commit_id": commit_node_id,
+                        "supporting_clause_ids": record.get("commit_supporting_clause_ids"),
+                    },
+                )
 
             gold_node = f"gold:{task.task_id}"
             goc_graph.add_node(gold_node, "gold", decision=task.gold.decision, step=goc_graph.step)
@@ -1171,9 +2142,16 @@ def _evaluate_method(
         ) / len(records_with_rank)
     else:
         aggregate["decision_accuracy_when_winning_rank_exists"] = 0.0
-    def _mean_metric(key: str) -> float | None:
-        vals = [r.get(key) for r in records if isinstance(r.get(key), (int, float))]
-        return sum(vals) / len(vals) if vals else 0.0
+    def _mean_metric(key: str, default: float | None = 0.0) -> float | None:
+        vals: List[float] = []
+        for rec in records:
+            val = rec.get(key)
+            if isinstance(val, (int, float)):
+                fval = float(val)
+                if math.isnan(fval):
+                    continue
+                vals.append(fval)
+        return sum(vals) / len(vals) if vals else default
     aggregate["gold_in_search_topk_rate_hop1"] = _mean_metric("gold_in_search_topk_hop1")
     aggregate["gold_in_search_topk_rate_hop2"] = _mean_metric("gold_in_search_topk_hop2")
     aggregate["gold_in_search_topk_rate_union"] = _mean_metric("gold_in_search_topk_union")
@@ -1181,13 +2159,69 @@ def _evaluate_method(
     aggregate["winning_clause_rank_mean_hop2"] = _mean_metric("winning_clause_rank_hop2")
     aggregate["winning_clause_rank_mean_union"] = _mean_metric("winning_clause_rank_union")
     aggregate["hit_at_open_budget_union"] = _mean_metric("hit_at_open_budget_union")
+    aggregate["rank_success_rate"] = _mean_metric("rank_success")
+    aggregate["winning_in_union_rate"] = _mean_metric("winning_in_union")
     aggregate["opened_has_winning_clause_rate_union"] = _mean_metric(
         "opened_has_winning_clause_union"
     )
+    aggregate["policy_gain_over_rank"] = _mean_metric("policy_gain_over_rank", default=None)
+    aggregate["rank_gap"] = _mean_metric("rank_gap", default=None)
     aggregate["feasible_open_rate"] = _mean_metric("feasible_open_rate")
     aggregate["realized_open_rate"] = _mean_metric("realized_open_rate")
     aggregate["selection_gap"] = _mean_metric("selection_gap")
-    aggregate["selection_efficiency"] = _mean_metric("selection_efficiency")
+    aggregate["selection_efficiency"] = _mean_metric("selection_efficiency", default=None)
+    aggregate["judge_accuracy"] = _mean_metric("judge_correct", default=None)
+    aggregate["acc_no_core_evidence_rate"] = _mean_metric("acc_no_core_evidence", default=0.0)
+    aggregate["judge_used_any_core_rate"] = _mean_metric("judge_used_any_core", default=None)
+    aggregate["judge_used_any_bridge_rate"] = _mean_metric("judge_used_any_bridge", default=None)
+    aggregate["judge_supporting_count_mean"] = _mean_metric("judge_supporting_count", default=None)
+    aggregate["opened_bridge_count_mean"] = _mean_metric("opened_bridge_count", default=0.0)
+    aggregate["opened_meta_count_mean"] = _mean_metric("opened_meta_count", default=0.0)
+    aggregate["opened_rule_count_mean"] = _mean_metric("opened_rule_count", default=0.0)
+    aggregate["deep_rank_core_rate"] = _mean_metric("deep_rank_core_flag", default=0.0)
+    core_rank_union_vals = [
+        int(r.get("min_gold_core_rank_union"))
+        for r in records
+        if isinstance(r.get("min_gold_core_rank_union"), int)
+    ]
+    core_rank_summary = _rank_summary(core_rank_union_vals)
+    aggregate["min_gold_core_rank_union_mean"] = core_rank_summary.get("mean")
+    aggregate["min_gold_core_rank_union_median"] = core_rank_summary.get("median")
+    aggregate["min_gold_core_rank_union_p90"] = core_rank_summary.get("p90")
+    if thread_records:
+        thread_judge_vals = [
+            1.0 if r.get("thread_judge_correct") else 0.0
+            for r in thread_records
+            if r.get("thread_judge_correct") is not None
+        ]
+        thread_decision_vals = [
+            1.0 if r.get("thread_decision_correct") else 0.0
+            for r in thread_records
+            if r.get("thread_decision_correct") is not None
+        ]
+        aggregate["thread_judge_accuracy"] = (
+            sum(thread_judge_vals) / len(thread_judge_vals) if thread_judge_vals else None
+        )
+        aggregate["thread_decision_accuracy"] = (
+            sum(thread_decision_vals) / len(thread_decision_vals) if thread_decision_vals else None
+        )
+        for ep_id in (1, 2, 3):
+            judge_vals = episode_judge.get(ep_id, [])
+            commit_vals = episode_commit.get(ep_id, [])
+            cov_vals = episode_cov_core.get(ep_id, [])
+            aggregate[f"episode_judge_accuracy_e{ep_id}"] = (
+                sum(judge_vals) / len(judge_vals) if judge_vals else None
+            )
+            aggregate[f"episode_commit_success_e{ep_id}"] = (
+                sum(commit_vals) / len(commit_vals) if commit_vals else None
+            )
+            aggregate[f"episode_opened_gold_coverage_core_mean_e{ep_id}"] = (
+                sum(cov_vals) / len(cov_vals) if cov_vals else None
+            )
+    if getattr(args, "open_policy", "current") == "oracle_open_if_in_union":
+        aggregate["selection_upper_bound_judge_acc"] = aggregate.get("judge_accuracy")
+    else:
+        aggregate["selection_upper_bound_judge_acc"] = None
     aggregate["bridged_ab_slices"] = compute_bridged_ab_slices(records)
     action_reward_mean = {}
     action_counts = {}
@@ -1235,6 +2269,7 @@ def _evaluate_method(
         "tool_calls": sum(tool_calls),
         "open_calls": sum(open_calls),
         "records": records,
+        "thread_records": thread_records,
         "controller_enabled": bool(controller),
         "controller_mode": controller_mode,
         "controller_policy": controller_policy,
@@ -1254,12 +2289,15 @@ def _evaluate_method(
     return report
 
 def cmd_generate(args: argparse.Namespace) -> None:
+    _apply_preset(args)
+    _apply_generation_defaults(args)
     generate_world_and_tasks(
         out_dir=args.out_dir,
         seed=args.seed,
         n_docs=args.n_docs,
         clauses_per_doc=args.clauses_per_doc,
         n_tasks=args.n_tasks,
+        n_threads=getattr(args, "n_threads", None),
         exception_chain_depth=args.exception_chain_depth,
         update_rate=args.update_rate,
         definition_density=args.definition_density,
@@ -1270,6 +2308,15 @@ def cmd_generate(args: argparse.Namespace) -> None:
         alias_density=args.alias_density,
         canonical_density=args.canonical_density,
         bridge_kind=args.bridge_kind,
+        exclusive_core_evidence=getattr(args, "exclusive_core_evidence", False),
+        open_budget_e1=getattr(args, "open_budget_e1", 4),
+        open_budget_e2=getattr(args, "open_budget_e2", 4),
+        open_budget_e3=getattr(args, "open_budget_e3", 0),
+        tool_budget_e1=getattr(args, "tool_budget_e1", 50),
+        tool_budget_e2=getattr(args, "tool_budget_e2", 50),
+        tool_budget_e3=getattr(args, "tool_budget_e3", 0),
+        branch_distractor_rate=getattr(args, "branch_distractor_rate", 0.5),
+        preset_name=getattr(args, "preset", None),
     )
     print("Generated PolicyOps Arena v0 data.")
 
@@ -1281,6 +2328,21 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
     world = load_world(world_dir)
     tasks = load_tasks(tasks_path)
+    if getattr(args, "n_threads", None):
+        thread_ids = [t.thread_id for t in tasks if getattr(t, "thread_id", None)]
+        if thread_ids:
+            unique = sorted(dict.fromkeys(thread_ids))
+            selected = set(unique[: int(args.n_threads)])
+            tasks = [t for t in tasks if t.thread_id in selected]
+    if any(getattr(t, "thread_id", None) for t in tasks):
+        tasks = sorted(
+            tasks,
+            key=lambda t: (
+                t.thread_id or "",
+                t.episode_id or 0,
+                t.task_id,
+            ),
+        )
 
     if args.llm == "dummy" and args.model != "dummy":
         raise RuntimeError(
@@ -1387,6 +2449,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
+    _apply_preset(args)
     base_dir = args.out_dir or _default_base_dir()
     world_dir = Path(base_dir) / "data" / "worlds"
     tasks_path = Path(base_dir) / "data" / "tasks" / "tasks.jsonl"
@@ -1527,6 +2590,37 @@ def cmd_compare(args: argparse.Namespace) -> None:
         ]
         summary[method] = {
             "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
+            "judge_accuracy": method_report["metrics"].get("judge_accuracy"),
+            "acc_no_core_evidence_rate": method_report["metrics"].get("acc_no_core_evidence_rate"),
+            "judge_used_any_core_rate": method_report["metrics"].get("judge_used_any_core_rate"),
+            "judge_used_any_bridge_rate": method_report["metrics"].get("judge_used_any_bridge_rate"),
+            "judge_supporting_count_mean": method_report["metrics"].get(
+                "judge_supporting_count_mean"
+            ),
+            "selection_upper_bound_judge_acc": method_report["metrics"].get(
+                "selection_upper_bound_judge_acc"
+            ),
+            "thread_judge_accuracy": method_report["metrics"].get("thread_judge_accuracy"),
+            "thread_decision_accuracy": method_report["metrics"].get("thread_decision_accuracy"),
+            "episode_judge_accuracy_e1": method_report["metrics"].get("episode_judge_accuracy_e1"),
+            "episode_judge_accuracy_e2": method_report["metrics"].get("episode_judge_accuracy_e2"),
+            "episode_judge_accuracy_e3": method_report["metrics"].get("episode_judge_accuracy_e3"),
+            "episode_commit_success_e1": method_report["metrics"].get("episode_commit_success_e1"),
+            "episode_commit_success_e2": method_report["metrics"].get("episode_commit_success_e2"),
+            "episode_commit_success_e3": method_report["metrics"].get("episode_commit_success_e3"),
+            "deep_rank_core_rate": method_report["metrics"].get("deep_rank_core_rate"),
+            "min_gold_core_rank_union_mean": method_report["metrics"].get(
+                "min_gold_core_rank_union_mean"
+            ),
+            "min_gold_core_rank_union_median": method_report["metrics"].get(
+                "min_gold_core_rank_union_median"
+            ),
+            "min_gold_core_rank_union_p90": method_report["metrics"].get(
+                "min_gold_core_rank_union_p90"
+            ),
+            "opened_bridge_count_mean": method_report["metrics"].get("opened_bridge_count_mean"),
+            "opened_meta_count_mean": method_report["metrics"].get("opened_meta_count_mean"),
+            "opened_rule_count_mean": method_report["metrics"].get("opened_rule_count_mean"),
             "condition_f1": method_report["metrics"].get("condition_f1"),
             "evidence_recall": method_report["metrics"].get("evidence_recall"),
             "critical_evidence_hit": method_report["metrics"].get("critical_evidence_hit"),
@@ -1558,6 +2652,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "gold_score_gap_mean": sum(gold_score_gap_vals) / len(gold_score_gap_vals)
             if gold_score_gap_vals
             else None,
+            "rank_success_rate": method_report["metrics"].get("rank_success_rate"),
+            "winning_in_union_rate": method_report["metrics"].get("winning_in_union_rate"),
+            "policy_gain_over_rank": method_report["metrics"].get("policy_gain_over_rank"),
+            "rank_gap": method_report["metrics"].get("rank_gap"),
+            "feasible_open_rate": method_report["metrics"].get("feasible_open_rate"),
+            "realized_open_rate": method_report["metrics"].get("realized_open_rate"),
+            "selection_gap": method_report["metrics"].get("selection_gap"),
+            "selection_efficiency": method_report["metrics"].get("selection_efficiency"),
         }
         if method == "oracle":
             oracle_cov = [
@@ -1586,15 +2688,22 @@ def cmd_compare(args: argparse.Namespace) -> None:
             1, len(eval_tasks)
         )
     scenario_params = {
+        "preset": getattr(args, "preset", None),
         "scenario_mode": getattr(args, "scenario_mode", "v0"),
         "bridge_bonus": getattr(args, "bridge_bonus", 1.5),
         "bridged_mix_canonical_in_ticket_rate": mix_rate,
         "open_budget": open_budget,
         "open_split_mode": getattr(args, "open_split_mode", "all_union_rank"),
         "open_split_hop1": getattr(args, "open_split_hop1", 0),
+        "open_policy": getattr(args, "open_policy", "current"),
         "hop1_query_mode": getattr(args, "hop1_query_mode", "stripped"),
         "agent_query_policy": getattr(args, "agent_query_policy", "single_hop"),
     }
+    if any(getattr(t, "thread_id", None) for t in eval_tasks):
+        scenario_params["n_threads"] = len({t.thread_id for t in eval_tasks if t.thread_id})
+    if any(getattr(t, "thread_id", None) for t in eval_tasks):
+        scenario_params["n_threads"] = len({t.thread_id for t in eval_tasks if t.thread_id})
+    scenario_params["exclusive_core_evidence"] = world.meta.get("exclusive_core_evidence")
     compare_report = {
         "methods": methods,
         "model": args.model,
@@ -1602,6 +2711,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "run_id": timestamp,
         "git_sha": git_sha,
         "invoked_cmdline": " ".join(sys.argv),
+        "judge": getattr(args, "judge", "llm"),
         "scenario_params": scenario_params,
         "llm_backend": llm_backend,
         "client_class": client_class,
@@ -1628,6 +2738,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     out_path = compare_dir / f"{timestamp}.json"
     save_report(out_path, compare_report)
+    quickcheck_compare_report(compare_report, label=timestamp)
     if args.save_goc_graph or args.save_goc_dot:
         readme_path = compare_run_dir / "README_debug.md"
         readme_path.write_text(
@@ -1819,6 +2930,37 @@ def _run_compare_with_tasks(
         ]
         summary[method] = {
             "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
+            "judge_accuracy": method_report["metrics"].get("judge_accuracy"),
+            "acc_no_core_evidence_rate": method_report["metrics"].get("acc_no_core_evidence_rate"),
+            "judge_used_any_core_rate": method_report["metrics"].get("judge_used_any_core_rate"),
+            "judge_used_any_bridge_rate": method_report["metrics"].get("judge_used_any_bridge_rate"),
+            "judge_supporting_count_mean": method_report["metrics"].get(
+                "judge_supporting_count_mean"
+            ),
+            "selection_upper_bound_judge_acc": method_report["metrics"].get(
+                "selection_upper_bound_judge_acc"
+            ),
+            "thread_judge_accuracy": method_report["metrics"].get("thread_judge_accuracy"),
+            "thread_decision_accuracy": method_report["metrics"].get("thread_decision_accuracy"),
+            "episode_judge_accuracy_e1": method_report["metrics"].get("episode_judge_accuracy_e1"),
+            "episode_judge_accuracy_e2": method_report["metrics"].get("episode_judge_accuracy_e2"),
+            "episode_judge_accuracy_e3": method_report["metrics"].get("episode_judge_accuracy_e3"),
+            "episode_commit_success_e1": method_report["metrics"].get("episode_commit_success_e1"),
+            "episode_commit_success_e2": method_report["metrics"].get("episode_commit_success_e2"),
+            "episode_commit_success_e3": method_report["metrics"].get("episode_commit_success_e3"),
+            "deep_rank_core_rate": method_report["metrics"].get("deep_rank_core_rate"),
+            "min_gold_core_rank_union_mean": method_report["metrics"].get(
+                "min_gold_core_rank_union_mean"
+            ),
+            "min_gold_core_rank_union_median": method_report["metrics"].get(
+                "min_gold_core_rank_union_median"
+            ),
+            "min_gold_core_rank_union_p90": method_report["metrics"].get(
+                "min_gold_core_rank_union_p90"
+            ),
+            "opened_bridge_count_mean": method_report["metrics"].get("opened_bridge_count_mean"),
+            "opened_meta_count_mean": method_report["metrics"].get("opened_meta_count_mean"),
+            "opened_rule_count_mean": method_report["metrics"].get("opened_rule_count_mean"),
             "condition_f1": method_report["metrics"].get("condition_f1"),
             "evidence_recall": method_report["metrics"].get("evidence_recall"),
             "critical_evidence_hit": method_report["metrics"].get("critical_evidence_hit"),
@@ -1864,9 +3006,17 @@ def _run_compare_with_tasks(
             "hit_at_open_budget_union": method_report["metrics"].get(
                 "hit_at_open_budget_union"
             ),
+            "rank_success_rate": method_report["metrics"].get("rank_success_rate"),
+            "winning_in_union_rate": method_report["metrics"].get("winning_in_union_rate"),
+            "policy_gain_over_rank": method_report["metrics"].get("policy_gain_over_rank"),
+            "rank_gap": method_report["metrics"].get("rank_gap"),
             "opened_has_winning_clause_rate_union": method_report["metrics"].get(
                 "opened_has_winning_clause_rate_union"
             ),
+            "feasible_open_rate": method_report["metrics"].get("feasible_open_rate"),
+            "realized_open_rate": method_report["metrics"].get("realized_open_rate"),
+            "selection_gap": method_report["metrics"].get("selection_gap"),
+            "selection_efficiency": method_report["metrics"].get("selection_efficiency"),
         }
         if method == "oracle":
             oracle_cov = [
@@ -1896,15 +3046,18 @@ def _run_compare_with_tasks(
             1, len(eval_tasks)
         )
     scenario_params = {
+        "preset": getattr(args, "preset", None),
         "scenario_mode": getattr(args, "scenario_mode", "v0"),
         "bridge_bonus": getattr(args, "bridge_bonus", 1.5),
         "bridged_mix_canonical_in_ticket_rate": mix_rate,
         "open_budget": open_budget,
         "open_split_mode": getattr(args, "open_split_mode", "all_union_rank"),
         "open_split_hop1": getattr(args, "open_split_hop1", 0),
+        "open_policy": getattr(args, "open_policy", "current"),
         "hop1_query_mode": getattr(args, "hop1_query_mode", "stripped"),
         "agent_query_policy": getattr(args, "agent_query_policy", "single_hop"),
     }
+    scenario_params["exclusive_core_evidence"] = world.meta.get("exclusive_core_evidence")
     compare_report = {
         "methods": methods,
         "model": args.model,
@@ -1912,6 +3065,7 @@ def _run_compare_with_tasks(
         "run_id": run_id,
         "git_sha": git_sha,
         "invoked_cmdline": " ".join(sys.argv),
+        "judge": getattr(args, "judge", "llm"),
         "scenario_params": scenario_params,
         "llm_backend": llm_backend,
         "client_class": client_class,
@@ -1939,6 +3093,8 @@ def _run_compare_with_tasks(
 
 
 def cmd_sweep(args: argparse.Namespace) -> None:
+    _apply_preset(args)
+    _apply_generation_defaults(args)
     base_dir = args.out_dir or _default_base_dir()
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     sweep_dir = Path(base_dir) / "runs" / "sweeps" / timestamp
@@ -1963,6 +3119,8 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                 bridged_mix_canonical_in_ticket_rate=getattr(
                     args, "bridged_mix_canonical_in_ticket_rate", 0.0
                 ),
+                exclusive_core_evidence=getattr(args, "exclusive_core_evidence", False),
+                preset_name=getattr(args, "preset", None),
             )
 
         world = load_world(seed_dir / "data" / "worlds")
@@ -1990,6 +3148,19 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "open_budget": open_budget,
                     "method": method,
                     "decision_accuracy": metrics.get("decision_accuracy"),
+                    "judge_accuracy": metrics.get("judge_accuracy"),
+                    "acc_no_core_evidence_rate": metrics.get("acc_no_core_evidence_rate"),
+                    "judge_used_any_core_rate": metrics.get("judge_used_any_core_rate"),
+                    "judge_used_any_bridge_rate": metrics.get("judge_used_any_bridge_rate"),
+                    "judge_supporting_count_mean": metrics.get("judge_supporting_count_mean"),
+                    "selection_upper_bound_judge_acc": metrics.get("selection_upper_bound_judge_acc"),
+                    "deep_rank_core_rate": metrics.get("deep_rank_core_rate"),
+                    "min_gold_core_rank_union_mean": metrics.get("min_gold_core_rank_union_mean"),
+                    "min_gold_core_rank_union_median": metrics.get("min_gold_core_rank_union_median"),
+                    "min_gold_core_rank_union_p90": metrics.get("min_gold_core_rank_union_p90"),
+                    "opened_bridge_count_mean": metrics.get("opened_bridge_count_mean"),
+                    "opened_meta_count_mean": metrics.get("opened_meta_count_mean"),
+                    "opened_rule_count_mean": metrics.get("opened_rule_count_mean"),
                     "condition_f1": metrics.get("condition_f1"),
                     "evidence_recall": metrics.get("evidence_recall"),
                     "critical_evidence_hit": metrics.get("critical_evidence_hit"),
@@ -2010,9 +3181,15 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "winning_clause_rank_mean_hop2": metrics.get("winning_clause_rank_mean_hop2"),
                     "winning_clause_rank_mean_union": metrics.get("winning_clause_rank_mean_union"),
                     "hit_at_open_budget_union": metrics.get("hit_at_open_budget_union"),
+                    "rank_success_rate": metrics.get("rank_success_rate"),
+                    "winning_in_union_rate": metrics.get("winning_in_union_rate"),
+                    "policy_gain_over_rank": metrics.get("policy_gain_over_rank"),
+                    "rank_gap": metrics.get("rank_gap"),
                     "opened_has_winning_clause_rate_union": metrics.get(
                         "opened_has_winning_clause_rate_union"
                     ),
+                    "feasible_open_rate": metrics.get("feasible_open_rate"),
+                    "realized_open_rate": metrics.get("realized_open_rate"),
                     "selection_gap": metrics.get("selection_gap"),
                     "selection_efficiency": metrics.get("selection_efficiency"),
                 }
@@ -2027,6 +3204,19 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "open_budget",
         "method",
         "decision_accuracy",
+        "judge_accuracy",
+        "acc_no_core_evidence_rate",
+        "judge_used_any_core_rate",
+        "judge_used_any_bridge_rate",
+        "judge_supporting_count_mean",
+        "selection_upper_bound_judge_acc",
+        "deep_rank_core_rate",
+        "min_gold_core_rank_union_mean",
+        "min_gold_core_rank_union_median",
+        "min_gold_core_rank_union_p90",
+        "opened_bridge_count_mean",
+        "opened_meta_count_mean",
+        "opened_rule_count_mean",
         "condition_f1",
         "evidence_recall",
         "critical_evidence_hit",
@@ -2047,7 +3237,13 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "winning_clause_rank_mean_hop2",
         "winning_clause_rank_mean_union",
         "hit_at_open_budget_union",
+        "rank_success_rate",
+        "winning_in_union_rate",
+        "policy_gain_over_rank",
+        "rank_gap",
         "opened_has_winning_clause_rate_union",
+        "feasible_open_rate",
+        "realized_open_rate",
         "selection_gap",
         "selection_efficiency",
     ]
@@ -2057,17 +3253,53 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         for row in summary_rows:
             writer.writerow(row)
 
+    quickcheck_sweep_summary(summary_rows, judge_mode=getattr(args, "judge", "llm"), label=timestamp)
+
     print("Sweep complete.")
     print(f"Summary saved to {summary_csv_path}")
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     mode = getattr(args, "mode", "failure_slice")
+    report_path = Path(args.report) if getattr(args, "report", "") else None
+    if mode in {"failure_slice", "bridged_ab", "selection_triage", "slot_breakdown"} and not report_path:
+        raise ValueError("--report is required for this analyze mode")
     if mode == "bridged_ab":
-        output_path = analyze_bridged_ab(Path(args.report), method=args.method)
+        output_path = analyze_bridged_ab(report_path, method=args.method)
         print(f"Bridged A×B report saved to {output_path}")
+    elif mode == "selection_triage":
+        csv_path, md_path = analyze_selection_triage(
+            report_path,
+            method=args.method,
+            max_per_bucket=int(getattr(args, "max_per_bucket", 20)),
+        )
+        print(f"Selection triage CSV saved to {csv_path}")
+        print(f"Pattern summary saved to {md_path}")
+    elif mode == "slot_breakdown":
+        csv_path, md_path = analyze_slot_breakdown(report_path, method=args.method)
+        print(f"Slot breakdown CSV saved to {csv_path}")
+        print(f"Slot breakdown MD saved to {md_path}")
+    elif mode == "analysis_bundle":
+        run_dir = Path(getattr(args, "run_dir", ""))
+        if not run_dir:
+            raise ValueError("--run_dir is required for analysis_bundle mode")
+        outputs = analyze_bundle(run_dir)
+        print(f"Analysis bundle saved to {outputs['analysis_bundle_zip']}")
+        print(f"Share bundle saved to {outputs['share_bundle_zip']}")
+    elif mode == "split_sweep_ab":
+        sweep_dir = Path(getattr(args, "sweep_dir", "")) if getattr(args, "sweep_dir", "") else None
+        if not sweep_dir:
+            raise ValueError("--sweep_dir is required for split_sweep_ab mode")
+        out_path = analyze_split_sweep_ab(
+            sweep_dir,
+            results_md=Path(getattr(args, "results_md", ""))
+            if getattr(args, "results_md", "")
+            else None,
+            method=args.method,
+        )
+        print(f"Split sweep A3×B2 summary saved to {out_path}")
     else:
-        output_path = analyze_failure_slice(Path(args.report), top_k=args.k)
+        output_path = analyze_failure_slice(report_path, top_k=args.k)
         print(f"Failure slice report saved to {output_path}")
 
 
@@ -2145,25 +3377,39 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     gen = sub.add_parser("generate", help="Generate synthetic world and tasks")
+    gen.add_argument("--preset", choices=list(PRESET_CONFIGS.keys()), default=None)
     gen.add_argument("--seed", type=int, default=0)
-    gen.add_argument("--n_docs", type=int, default=30)
-    gen.add_argument("--clauses_per_doc", type=int, default=5)
+    gen.add_argument("--n_docs", type=int, default=None)
+    gen.add_argument("--clauses_per_doc", type=int, default=None)
     gen.add_argument("--n_tasks", type=int, default=200)
     gen.add_argument("--exception_chain_depth", type=int, default=2)
     gen.add_argument("--update_rate", type=float, default=0.3)
     gen.add_argument("--definition_density", type=float, default=0.4)
     gen.add_argument("--distractor_strength", type=float, default=0.3)
-    gen.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1"], default="v0")
+    gen.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
     gen.add_argument("--bridge_prob", type=float, default=0.8)
     gen.add_argument("--bridged_mix_canonical_in_ticket_rate", type=float, default=0.0)
-    gen.add_argument("--alias_density", type=float, default=0.9)
-    gen.add_argument("--canonical_density", type=float, default=0.95)
+    gen.add_argument("--alias_density", type=float, default=None)
+    gen.add_argument("--canonical_density", type=float, default=None)
     gen.add_argument("--bridge_kind", choices=["definition", "glossary"], default="definition")
+    gen.add_argument("--exclusive_core_evidence", action="store_true", default=False)
+    gen.add_argument("--n_threads", type=int, default=None)
+    gen.add_argument("--open_budget_e1", type=int, default=4)
+    gen.add_argument("--open_budget_e2", type=int, default=4)
+    gen.add_argument("--open_budget_e3", type=int, default=0)
+    gen.add_argument("--tool_budget_e1", type=int, default=50)
+    gen.add_argument("--tool_budget_e2", type=int, default=50)
+    gen.add_argument("--tool_budget_e3", type=int, default=0)
+    gen.add_argument("--branch_distractor_rate", type=float, default=0.5)
     gen.add_argument("--out_dir", type=Path, default=None)
     gen.set_defaults(func=cmd_generate)
 
     ev = sub.add_parser("eval", help="Evaluate baselines")
-    ev.add_argument("--method", choices=["topk", "full", "goc", "oracle", "engine"], required=True)
+    ev.add_argument(
+        "--method",
+        choices=["topk", "full", "full_history", "goc", "goc_base", "oracle", "engine", "similarity_only", "agent_fold"],
+        required=True,
+    )
     ev.add_argument("--model", type=str, default="gpt-4.1-mini")
     ev.add_argument("--llm", choices=["dummy", "openai"], default="openai")
     ev.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
@@ -2188,7 +3434,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--goc_graph_dir", type=str, default="")
     ev.add_argument("--goc_graph_schema", choices=["v0", "v1"], default="v0")
     ev.add_argument("--goc_graph_sample_rate", type=float, default=1.0)
-    ev.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1"], default="v0")
+    ev.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
     ev.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     ev.add_argument(
         "--search_score_mode",
@@ -2199,6 +3445,18 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
     ev.add_argument("--open_split_mode", choices=["all_union_rank", "split_hop1_hop2"], default="all_union_rank")
     ev.add_argument("--open_split_hop1", type=int, default=0)
+    ev.add_argument(
+        "--open_policy",
+        choices=[
+            "current",
+            "oracle_open_if_in_union",
+            "soft_core_rerank",
+            "hop2_priority",
+            "bridge_one_only",
+            "core_first_heuristic",
+        ],
+        default="current",
+    )
     ev.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     ev.add_argument("--use_query_rewrite", action="store_true", default=True)
     ev.add_argument("--no_query_rewrite", action="store_false", dest="use_query_rewrite")
@@ -2228,6 +3486,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
     cmp.add_argument("--dotenv", type=str, default=".env")
     cmp.add_argument("--out_dir", type=Path, default=None)
+    cmp.add_argument("--preset", choices=list(PRESET_CONFIGS.keys()), default=None)
     cmp.add_argument(
         "--evidence_padding_mode",
         choices=["none", "schema_only", "global"],
@@ -2247,7 +3506,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--goc_graph_dir", type=str, default="")
     cmp.add_argument("--goc_graph_schema", choices=["v0", "v1"], default="v0")
     cmp.add_argument("--goc_graph_sample_rate", type=float, default=1.0)
-    cmp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1"], default="v0")
+    cmp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
     cmp.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     cmp.add_argument(
         "--search_score_mode",
@@ -2258,6 +3517,18 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
     cmp.add_argument("--open_split_mode", choices=["all_union_rank", "split_hop1_hop2"], default="all_union_rank")
     cmp.add_argument("--open_split_hop1", type=int, default=0)
+    cmp.add_argument(
+        "--open_policy",
+        choices=[
+            "current",
+            "oracle_open_if_in_union",
+            "soft_core_rerank",
+            "hop2_priority",
+            "bridge_one_only",
+            "core_first_heuristic",
+        ],
+        default="current",
+    )
     cmp.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     cmp.add_argument("--use_query_rewrite", action="store_true", default=True)
     cmp.add_argument("--no_query_rewrite", action="store_false", dest="use_query_rewrite")
@@ -2280,22 +3551,25 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--split_seed", type=int, default=0)
     cmp.add_argument("--debug_n", type=int, default=0)
     cmp.add_argument("--debug_task_ids", type=str, default="")
+    cmp.add_argument("--n_threads", type=int, default=None)
     cmp.set_defaults(func=cmd_compare)
 
     swp = sub.add_parser("sweep", help="Run multi-seed/open_budget sweeps")
+    swp.add_argument("--preset", choices=list(PRESET_CONFIGS.keys()), default=None)
     swp.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     swp.add_argument("--open_budgets", nargs="+", type=int, default=[3, 5, 8])
-    swp.add_argument("--n_docs", type=int, default=30)
+    swp.add_argument("--n_docs", type=int, default=None)
     swp.add_argument("--n_tasks", type=int, default=200)
     swp.add_argument("--methods", nargs="+", default=["topk", "full", "goc", "oracle", "engine"])
     swp.add_argument("--model", type=str, default="gpt-4.1-mini")
     swp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
     swp.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
-    swp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1"], default="v0")
+    swp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
     swp.add_argument("--bridge_prob", type=float, default=0.8)
-    swp.add_argument("--alias_density", type=float, default=0.9)
-    swp.add_argument("--canonical_density", type=float, default=0.95)
+    swp.add_argument("--alias_density", type=float, default=None)
+    swp.add_argument("--canonical_density", type=float, default=None)
     swp.add_argument("--bridge_kind", choices=["definition", "glossary"], default="definition")
+    swp.add_argument("--exclusive_core_evidence", action="store_true", default=False)
     swp.add_argument("--bridged_mix_canonical_in_ticket_rate", type=float, default=0.0)
     swp.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     swp.add_argument(
@@ -2307,6 +3581,18 @@ def build_parser() -> argparse.ArgumentParser:
     swp.add_argument("--hop1_query_mode", choices=["raw", "stripped", "llm_keywords"], default="stripped")
     swp.add_argument("--open_split_mode", choices=["all_union_rank", "split_hop1_hop2"], default="all_union_rank")
     swp.add_argument("--open_split_hop1", type=int, default=0)
+    swp.add_argument(
+        "--open_policy",
+        choices=[
+            "current",
+            "oracle_open_if_in_union",
+            "soft_core_rerank",
+            "hop2_priority",
+            "bridge_one_only",
+            "core_first_heuristic",
+        ],
+        default="current",
+    )
     swp.add_argument("--bridge_reward_bonus", type=float, default=0.0)
     swp.add_argument("--dotenv", type=str, default=".env")
     swp.add_argument("--out_dir", type=Path, default=None)
@@ -2352,10 +3638,18 @@ def build_parser() -> argparse.ArgumentParser:
     swp.set_defaults(func=cmd_sweep)
 
     ana = sub.add_parser("analyze", help="Analyze compare report failure slices")
-    ana.add_argument("--report", type=str, required=True)
+    ana.add_argument("--report", type=str, default="")
     ana.add_argument("--k", type=int, default=20)
-    ana.add_argument("--mode", choices=["failure_slice", "bridged_ab"], default="failure_slice")
+    ana.add_argument(
+        "--mode",
+        choices=["failure_slice", "bridged_ab", "selection_triage", "slot_breakdown", "analysis_bundle", "split_sweep_ab"],
+        default="failure_slice",
+    )
     ana.add_argument("--method", type=str, default="goc")
+    ana.add_argument("--max_per_bucket", type=int, default=20)
+    ana.add_argument("--run_dir", type=str, default="")
+    ana.add_argument("--sweep_dir", type=str, default="")
+    ana.add_argument("--results_md", type=str, default="")
     ana.set_defaults(func=cmd_analyze)
 
     abl = sub.add_parser("ablate_controller", help="Compare controller off vs rerank on")
