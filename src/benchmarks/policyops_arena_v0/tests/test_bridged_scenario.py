@@ -275,7 +275,8 @@ def test_bridged_mix_canonical_ticket_rate(tmp_path: Path) -> None:
         debug_task_ids="",
     )
     cmd_compare(compare_args)
-    report = json.loads(list((tmp_path / "runs" / "compare").glob("*.json"))[-1].read_text())
+    compare_files = sorted((tmp_path / "runs" / "compare").glob("*.json"))
+    report = json.loads(compare_files[-1].read_text())
     goc_metrics = report.get("method_reports", {}).get("goc", {}).get("metrics", {})
     bridged_ab = goc_metrics.get("bridged_ab_slices", {})
     a_cells = bridged_ab.get("cells", {}).get("A0_no_bridge_needed", {})
@@ -339,7 +340,8 @@ def test_open_split_mode_hop2(tmp_path: Path) -> None:
         open_split_hop1=0,
     )
     cmd_compare(base_args)
-    report = json.loads(list((tmp_path / "runs" / "compare").glob("*.json"))[-1].read_text())
+    compare_files = sorted((tmp_path / "runs" / "compare").glob("*.json"))
+    report = json.loads(compare_files[-1].read_text())
     goc_records = report.get("method_reports", {}).get("goc", {}).get("records", [])
     assert any(
         r.get("hop2_executed") and (r.get("open_from_hop2_count") or 0) > 0 for r in goc_records
@@ -348,7 +350,8 @@ def test_open_split_mode_hop2(tmp_path: Path) -> None:
     args_hop1 = argparse.Namespace(**vars(base_args))
     args_hop1.open_split_hop1 = 5
     cmd_compare(args_hop1)
-    report2 = json.loads(list((tmp_path / "runs" / "compare").glob("*.json"))[-1].read_text())
+    compare_files = sorted((tmp_path / "runs" / "compare").glob("*.json"))
+    report2 = json.loads(compare_files[-1].read_text())
     goc_records2 = report2.get("method_reports", {}).get("goc", {}).get("records", [])
     assert all(
         (r.get("open_from_hop2_count") or 0) == 0 for r in goc_records2 if r.get("hop2_executed")

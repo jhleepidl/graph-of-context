@@ -130,6 +130,26 @@ def triage_compare(
             lambda r: r.get("acc_no_core_evidence") is True,
             "judge_correct=True and opened_gold_coverage_core==0",
         ),
+        "CONTEXT_TRUNC_FAIL": (
+            lambda r: r.get("scenario_mode") == "threaded_v1_3_fu"
+            and r.get("episode_id") == 3
+            and r.get("e3_truncation_loss_estimate") is True,
+            "threaded_v1_3_fu E3 truncated and critical core dropped",
+        ),
+        "FOLD_UNFOLD_FAIL": (
+            lambda r: r.get("scenario_mode") == "threaded_v1_3_fu"
+            and r.get("episode_id") == 3
+            and r.get("method") == "goc"
+            and r.get("e3_prompt_includes_critical_core") is False,
+            "threaded_v1_3_fu goc failed to unfold critical core clause",
+        ),
+        "COMPOSE_FAIL": (
+            lambda r: r.get("scenario_mode") == "threaded_v1_3_fu"
+            and r.get("episode_id") == 3
+            and r.get("e3_prompt_includes_critical_core") is True
+            and r.get("judge_correct") is False,
+            "threaded_v1_3_fu E3 failed despite critical core in prompt",
+        ),
         "F_evidence_padding_artifact": (
             lambda r: (
                 not r.get("evidence_before_pad")

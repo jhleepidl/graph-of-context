@@ -7,6 +7,7 @@ import json
 import math
 import random
 import hashlib
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,8 @@ from .baselines import (
     LLMClient,
     OpenAIClient,
     _ensure_min_evidence,
+    _build_prompt,
+    _enrich_search_results,
     run_engine_oracle,
     run_full_history,
     run_goc_heuristic,
@@ -62,6 +65,10 @@ CALIB_PRESET_N10 = "bridged_v1_1_calib_n10_exclcore"
 CALIBRATED_PRESET = "bridged_v1_1_calibrated"
 THREADED_PRESET_N8 = "threaded_v1_2_calib_n8_exclcore"
 THREADED_PRESET_N10 = "threaded_v1_2_calib_n10_exclcore"
+THREADED_FU_PRESET_N8 = "threaded_v1_3_fu_calib_n8"
+THREADED_FU_PRESET_N10 = "threaded_v1_3_fu_calib_n10"
+THREADED_FU_DECOY_JITTER_PRESET_N10 = "threaded_v1_3_fu_decoy_calib_jitter_n10"
+THREADED_FU_DECOY_DEPTHJITTER_MODE = "threaded_v1_3_fu_decoy_depthjitter"
 PRESET_CONFIGS = {
     CALIB_PRESET_N8: {
         "scenario_mode": "bridged_v1_1",
@@ -118,6 +125,55 @@ PRESET_CONFIGS = {
         "tool_budget_e2": 50,
         "tool_budget_e3": 0,
     },
+    THREADED_FU_PRESET_N8: {
+        "scenario_mode": "threaded_v1_3_fu",
+        "n_docs": 8,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+        "n_threads": 100,
+        "open_budget_e1": 4,
+        "open_budget_e2": 4,
+        "open_budget_e3": 0,
+        "tool_budget_e1": 50,
+        "tool_budget_e2": 50,
+        "tool_budget_e3": 0,
+    },
+    THREADED_FU_PRESET_N10: {
+        "scenario_mode": "threaded_v1_3_fu",
+        "n_docs": 10,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+        "n_threads": 100,
+        "open_budget_e1": 4,
+        "open_budget_e2": 4,
+        "open_budget_e3": 0,
+        "tool_budget_e1": 50,
+        "tool_budget_e2": 50,
+        "tool_budget_e3": 0,
+    },
+    THREADED_FU_DECOY_JITTER_PRESET_N10: {
+        "scenario_mode": "threaded_v1_3_fu_decoy",
+        "n_docs": 10,
+        "clauses_per_doc": 5,
+        "alias_density": 0.9,
+        "canonical_density": 0.95,
+        "exclusive_core_evidence": True,
+        "n_threads": 100,
+        "open_budget_e1": 4,
+        "open_budget_e2": 4,
+        "open_budget_e3": 0,
+        "tool_budget_e1": 50,
+        "tool_budget_e2": 50,
+        "tool_budget_e3": 0,
+        "e3_clause_jitter_max_chars_critical": 200,
+        "e3_clause_jitter_max_chars_noncritical": 400,
+        "e3_clause_jitter_max_chars_decoy": 400,
+        "e3_clause_jitter_scope": "decoy_plus_noncritical",
+    },
 }
 DEFAULT_GENERATION = {
     "n_docs": 30,
@@ -127,6 +183,22 @@ DEFAULT_GENERATION = {
 }
 DEEP_RANK_CORE_THRESHOLD = 10
 COST_BLOWUP_TOKENS = 2000
+THREADED_FU_RECOMMENDED_BUDGET = 1350
+SCENARIO_MODE_ALIASES = {
+    THREADED_FU_DECOY_DEPTHJITTER_MODE: "threaded_v1_3_fu_decoy",
+}
+
+
+def _canonical_scenario_mode(mode: Any) -> Any:
+    if not isinstance(mode, str):
+        return mode
+    return SCENARIO_MODE_ALIASES.get(mode, mode)
+
+
+def _normalize_scenario_mode_arg(args: argparse.Namespace) -> None:
+    if not hasattr(args, "scenario_mode"):
+        return
+    args.scenario_mode = _canonical_scenario_mode(getattr(args, "scenario_mode", None))
 
 
 def _default_base_dir() -> Path:
@@ -243,6 +315,18 @@ def _extract_commit_short_fact(
 ) -> Dict[str, Any]:
     if not supporting_ids:
         return {}
+    if getattr(task, "scenario_mode", "") in {"threaded_v1_3_fu", "threaded_v1_3_fu_decoy"}:
+        if episode_kind == "e1_retrieve_rule":
+            bridge_id = getattr(task, "bridge_clause_id", None)
+            canonical_term = None
+            if bridge_id and bridge_id in supporting_ids:
+                clause = world.clauses.get(bridge_id)
+                if clause and clause.canonical_terms:
+                    canonical_term = clause.canonical_terms[0]
+            return {"canonical_term": canonical_term} if canonical_term else {}
+        if episode_kind == "e2_exception_update":
+            return {"exception_exists": True}
+        return {}
     if episode_kind == "e1_retrieve_rule":
         bridge_id = getattr(task, "bridge_clause_id", None)
         canonical_term = None
@@ -317,6 +401,173 @@ def _build_threaded_prompt(
     return header + "\n".join(body)
 
 
+def _apply_context_budget(
+    summary_text: str | None,
+    clause_ids: List[str],
+    world: Any,
+    budget_chars: int,
+) -> tuple[str | None, List[Dict[str, str]], int, bool, int, int, int]:
+    used = 0
+    summary = summary_text
+    available_rendered: List[tuple[str, str]] = []
+    for cid in clause_ids:
+        clause = world.clauses.get(cid) if world else None
+        if not clause:
+            continue
+        prefix = f"[{cid}] "
+        available_rendered.append((cid, f"{prefix}{clause.text}"))
+
+    total_before = len(summary_text or "") + sum(len(text) for _, text in available_rendered)
+    after_chars = 0
+    dropped_clause_count = 0
+    content_dropped = False
+    if summary:
+        if len(summary) > budget_chars:
+            # Summary itself can be truncated by budget.
+            summary = summary[:budget_chars]
+            used = len(summary)
+            after_chars = used
+            dropped_clause_count = len(available_rendered)
+            content_dropped = True
+            truncated = bool(total_before > budget_chars and content_dropped and after_chars <= budget_chars)
+            return summary, [], used, truncated, total_before, after_chars, dropped_clause_count
+        used += len(summary)
+    clauses: List[Dict[str, str]] = []
+    fully_included = 0
+    for cid, rendered in available_rendered:
+        prefix = f"[{cid}] "
+        clause = world.clauses.get(cid) if world else None
+        if not clause:
+            continue
+        if used + len(rendered) > budget_chars:
+            remaining = budget_chars - used - len(prefix)
+            if remaining > 0 and not clauses:
+                trimmed_text = clause.text[:remaining]
+                clauses.append({"clause_id": cid, "text": trimmed_text})
+                used += len(prefix) + len(trimmed_text)
+                content_dropped = True
+            content_dropped = True
+            break
+        clauses.append({"clause_id": cid, "text": clause.text})
+        used += len(rendered)
+        fully_included += 1
+    dropped_clause_count = max(0, len(available_rendered) - fully_included)
+    after_chars = len(summary or "") + sum(len(f"[{c['clause_id']}] ") + len(c["text"]) for c in clauses)
+    if after_chars < total_before:
+        content_dropped = True
+    truncated = bool(total_before > budget_chars and content_dropped and after_chars <= budget_chars)
+    return summary, clauses, used, truncated, total_before, after_chars, dropped_clause_count
+
+
+def _inject_litm_filler_clause_ids(
+    opened_history_ids: List[str],
+    filler_clause_ids: List[str],
+    *,
+    position: str = "between",
+    critical0_id: str | None = None,
+    critical1_id: str | None = None,
+) -> List[str]:
+    base = list(dict.fromkeys(opened_history_ids))
+    fillers = [cid for cid in filler_clause_ids if cid and cid not in base]
+    if not fillers:
+        return base
+    pos = str(position or "between")
+    if pos == "pre":
+        return fillers + base
+    if pos == "post":
+        return base + fillers
+    insert_idx = len(base) // 2
+    if critical1_id and critical1_id in base:
+        insert_idx = base.index(critical1_id)
+    elif critical0_id and critical0_id in base:
+        insert_idx = base.index(critical0_id) + 1
+    return base[:insert_idx] + fillers + base[insert_idx:]
+
+
+def _select_goc_unfold_clause_ids(
+    opened_history_ids: List[str],
+    commit_clause_ids: List[str],
+    critical_clause_ids: List[str],
+    ticket: str,
+    world: Any,
+) -> tuple[List[str], Dict[str, List[str]]]:
+    ticket_tokens = set(_tokenize(ticket))
+    scored: List[tuple[str, float]] = []
+    reasons: Dict[str, List[str]] = {}
+    for cid in opened_history_ids:
+        clause = world.clauses.get(cid) if world else None
+        if not clause:
+            continue
+        score = 0.0
+        cid_reasons: List[str] = []
+        if cid in commit_clause_ids:
+            score += 10.0
+            cid_reasons.append("commit_anchor")
+        kind = getattr(clause, "kind", None)
+        if kind in {"rule", "exception", "update", "procedure"}:
+            score += 3.0
+            cid_reasons.append("core_kind")
+        elif kind in {"priority"}:
+            score -= 1.0
+            cid_reasons.append("meta")
+        elif kind in {"definition", "glossary"}:
+            score -= 0.5
+            cid_reasons.append("definition")
+        tokens = set(_tokenize(clause.text))
+        if ticket_tokens & tokens:
+            score += 2.0
+            cid_reasons.append("ticket_match")
+        scored.append((cid, score))
+        reasons[cid] = cid_reasons
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    ordered = [cid for cid, _ in scored]
+    # Ensure commit anchors are first in stable order.
+    critical_first = [cid for cid in critical_clause_ids if cid in ordered]
+    commit_first = [cid for cid in commit_clause_ids if cid in ordered and cid not in critical_first]
+    remaining = [cid for cid in ordered if cid not in critical_first and cid not in commit_first]
+    return critical_first + commit_first + remaining, reasons
+
+
+def _run_shared_topk(
+    task: Any,
+    env: PolicyOpsEnv,
+    client: LLMClient,
+    *,
+    primary_top_k: int = 20,
+) -> tuple[Dict[str, Any], List[str], str, str | None, Dict[str, Any]]:
+    results = env.search(task.user_ticket, top_k=primary_top_k)
+    opened: List[Dict[str, Any]] = []
+    opened_ids: List[str] = []
+    for item in results:
+        if len(opened_ids) >= env.open_budget:
+            break
+        clause_id = item.get("clause_id")
+        if not clause_id:
+            continue
+        try:
+            clause = env.open(clause_id)
+        except RuntimeError as exc:
+            if "budget" in str(exc):
+                break
+            continue
+        except Exception:
+            continue
+        opened.append(clause)
+        opened_ids.append(clause_id)
+    prompt = _build_prompt(task.user_ticket, opened)
+    raw_output = client.generate(prompt)
+    prediction = _parse_prediction(raw_output)
+    diag = {
+        "primary_search_results": _enrich_search_results(env, results),
+        "primary_search_top_k": primary_top_k,
+        "primary_search_query": task.user_ticket,
+        "rewrite_used": False,
+        "rewrite_queries": [],
+        "opened_total_clause_ids": list(opened_ids),
+    }
+    return prediction, opened_ids, prompt, raw_output, diag
+
+
 def _is_bridge_clause(clause: Any) -> bool:
     if not clause:
         return False
@@ -347,7 +598,9 @@ def _apply_preset(args: argparse.Namespace) -> None:
     if not config:
         return
     if hasattr(args, "scenario_mode") and config.get("scenario_mode"):
-        args.scenario_mode = config["scenario_mode"]
+        current_mode = getattr(args, "scenario_mode", None)
+        if current_mode in {None, "", "v0"} or current_mode == config["scenario_mode"]:
+            args.scenario_mode = config["scenario_mode"]
     for key in (
         "n_docs",
         "clauses_per_doc",
@@ -362,10 +615,32 @@ def _apply_preset(args: argparse.Namespace) -> None:
         "tool_budget_e2",
         "tool_budget_e3",
         "branch_distractor_rate",
+        "e3_clause_jitter_max_chars",
+        "e3_clause_jitter_max_chars_critical",
+        "e3_clause_jitter_max_chars_noncritical",
+        "e3_clause_jitter_max_chars_decoy",
+        "e3_clause_jitter_scope",
+        "e3_litm_filler_count_min",
+        "e3_litm_filler_count_max",
+        "e3_litm_filler_len_jitter_max",
     ):
         if hasattr(args, key) and config.get(key) is not None:
             current = getattr(args, key)
-            if current is None or isinstance(current, bool):
+            should_apply = current is None or isinstance(current, bool)
+            if key == "e3_clause_jitter_max_chars":
+                should_apply = current in {None, 0}
+            if key == "e3_clause_jitter_scope":
+                should_apply = current in {None, "", "decoy_only"}
+            if key in {
+                "e3_clause_jitter_max_chars_critical",
+                "e3_clause_jitter_max_chars_noncritical",
+                "e3_clause_jitter_max_chars_decoy",
+                "e3_litm_filler_count_min",
+                "e3_litm_filler_count_max",
+                "e3_litm_filler_len_jitter_max",
+            }:
+                should_apply = current in {None, 0}
+            if should_apply:
                 setattr(args, key, config[key])
 
 
@@ -373,6 +648,17 @@ def _apply_generation_defaults(args: argparse.Namespace) -> None:
     for key, value in DEFAULT_GENERATION.items():
         if hasattr(args, key) and getattr(args, key) is None:
             setattr(args, key, value)
+
+
+def _apply_threaded_budget_default(args: argparse.Namespace) -> None:
+    scenario_mode = getattr(args, "scenario_mode", "")
+    if not (isinstance(scenario_mode, str) and scenario_mode.startswith("threaded_v1_3_fu")):
+        return
+    if getattr(args, "thread_context_budget_sweep", ""):
+        return
+    current = getattr(args, "thread_context_budget_chars", None)
+    if current is None or current == 8000:
+        setattr(args, "thread_context_budget_chars", THREADED_FU_RECOMMENDED_BUDGET)
 
 
 def quickcheck_compare_report(
@@ -469,7 +755,7 @@ def quickcheck_compare_report(
     _add_check("selection_metrics_sanity", sel_pass, sel_details)
 
     # Judge metrics present
-    if report.get("judge") == "symbolic":
+    if report.get("judge") in {"symbolic", "symbolic_packed", "symbolic_packed_allcritical"}:
         missing_record = 0
         missing_metric = 0
         for method, report_obj in method_reports.items():
@@ -499,13 +785,15 @@ def quickcheck_compare_report(
             "judge_supporting_count_mean",
             "judge_used_any_core_rate",
             "judge_used_any_bridge_rate",
+            "judge_used_any_critical_core_rate",
         ]
         if any(k not in metrics for k in support_keys):
             missing_support += 1
         support_details.append(
             f"{method}:count_mean={metrics.get('judge_supporting_count_mean')},"
             f"core_rate={metrics.get('judge_used_any_core_rate')},"
-            f"bridge_rate={metrics.get('judge_used_any_bridge_rate')}"
+            f"bridge_rate={metrics.get('judge_used_any_bridge_rate')},"
+            f"critical_rate={metrics.get('judge_used_any_critical_core_rate')}"
         )
     _add_check(
         "acc_no_core_evidence_rate_present",
@@ -559,11 +847,18 @@ def quickcheck_compare_report(
             "; ".join(ub_details),
         )
 
-    # Threaded v1.2 metrics
-    threaded_mode = report.get("scenario_params", {}).get("scenario_mode") == "threaded_v1_2"
+    # Threaded metrics (v1.2 / v1.3)
+    scenario_mode_param = report.get("scenario_params", {}).get("scenario_mode")
+    threaded_mode = isinstance(scenario_mode_param, str) and scenario_mode_param.startswith(
+        "threaded_v1_"
+    )
     if not threaded_mode:
         for report_obj in method_reports.values():
-            if any(rec.get("scenario_mode") == "threaded_v1_2" for rec in report_obj.get("records", []) or []):
+            if any(
+                isinstance(rec.get("scenario_mode"), str)
+                and rec.get("scenario_mode").startswith("threaded_v1_")
+                for rec in report_obj.get("records", []) or []
+            ):
                 threaded_mode = True
                 break
     if threaded_mode:
@@ -597,6 +892,188 @@ def quickcheck_compare_report(
             "thread_records_present",
             missing_thread_records == 0,
             f"missing={missing_thread_records}",
+        )
+
+    # Threaded v1.3 FU context budget fields
+    threaded_fu = isinstance(scenario_mode_param, str) and scenario_mode_param.startswith(
+        "threaded_v1_3_fu"
+    )
+    if not threaded_fu:
+        for report_obj in method_reports.values():
+            if any(
+                isinstance(rec.get("scenario_mode"), str)
+                and rec.get("scenario_mode").startswith("threaded_v1_3_fu")
+                for rec in report_obj.get("records", []) or []
+            ):
+                threaded_fu = True
+                break
+    if threaded_fu:
+        missing_metric = 0
+        missing_record = 0
+        for method, report_obj in method_reports.items():
+            metrics = report_obj.get("metrics", {}) or {}
+            if "e3_packed_all_critical_rate" not in metrics:
+                missing_metric += 1
+            for rec in report_obj.get("records", []) or []:
+                if rec.get("episode_id") != 3:
+                    continue
+                for key in [
+                    "e3_context_budget_chars",
+                    "e3_context_chars_used",
+                    "e3_context_clause_count",
+                    "e3_packed_clause_count",
+                    "e3_context_token_est",
+                    "e3_packed_token_est",
+                    "e3_context_truncated",
+                    "e3_packed_total_chars_before",
+                    "e3_packed_total_chars_after",
+                    "e3_packed_truncated",
+                    "e3_packed_dropped_clause_count",
+                    "e3_packed_clause_lens",
+                    "e3_packed_clause_is_critical",
+                    "e3_packed_all_critical",
+                    "e3_packed_any_critical",
+                    "e3_litm_filler_count",
+                    "e3_litm_filler_position",
+                ]:
+                    if key not in rec:
+                        missing_record += 1
+                        break
+        _add_check(
+            "threaded_fu_context_present",
+            missing_metric == 0 and missing_record == 0,
+            f"missing_metric={missing_metric}, missing_record={missing_record}",
+        )
+        truncation_bad = 0
+        dropped_bad = 0
+        checked_records = 0
+        for report_obj in method_reports.values():
+            for rec in report_obj.get("records", []) or []:
+                if rec.get("episode_id") != 3:
+                    continue
+                before = rec.get("e3_packed_total_chars_before")
+                truncated = rec.get("e3_packed_truncated")
+                dropped = rec.get("e3_packed_dropped_clause_count")
+                if not isinstance(before, (int, float)) or not isinstance(truncated, bool):
+                    continue
+                checked_records += 1
+                if before <= (rec.get("e3_context_budget_chars") or 0) and truncated:
+                    truncation_bad += 1
+                if truncated is False and isinstance(dropped, (int, float)) and int(dropped) != 0:
+                    dropped_bad += 1
+        _add_check(
+            "e3_truncation_metric_sanity",
+            truncation_bad == 0 and dropped_bad == 0,
+            f"checked={checked_records}, truncation_bad={truncation_bad}, dropped_bad={dropped_bad}",
+        )
+        jitter_max = report.get("scenario_params", {}).get("e3_clause_jitter_max_chars")
+        jitter_critical = report.get("scenario_params", {}).get(
+            "e3_clause_jitter_max_chars_critical"
+        )
+        jitter_noncritical = report.get("scenario_params", {}).get(
+            "e3_clause_jitter_max_chars_noncritical"
+        )
+        jitter_decoy = report.get("scenario_params", {}).get(
+            "e3_clause_jitter_max_chars_decoy"
+        )
+        jitter_scope = report.get("scenario_params", {}).get("e3_clause_jitter_scope")
+        litm_filler_min = report.get("scenario_params", {}).get("e3_litm_filler_count_min")
+        litm_filler_max = report.get("scenario_params", {}).get("e3_litm_filler_count_max")
+        litm_filler_len_jitter = report.get("scenario_params", {}).get(
+            "e3_litm_filler_len_jitter_max"
+        )
+        jitter_ok = (
+            isinstance(jitter_max, int)
+            and isinstance(jitter_critical, int)
+            and isinstance(jitter_noncritical, int)
+            and isinstance(jitter_decoy, int)
+            and jitter_scope in {
+            "decoy_only",
+            "decoy_plus_noncritical",
+            "all",
+            }
+        )
+        _add_check(
+            "jitter_params_present",
+            jitter_ok,
+            (
+                f"e3_clause_jitter_max_chars={jitter_max}, "
+                f"e3_clause_jitter_max_chars_critical={jitter_critical}, "
+                f"e3_clause_jitter_max_chars_noncritical={jitter_noncritical}, "
+                f"e3_clause_jitter_max_chars_decoy={jitter_decoy}, "
+                f"e3_clause_jitter_scope={jitter_scope}"
+            ),
+        )
+        litm_ok = (
+            isinstance(litm_filler_min, int)
+            and isinstance(litm_filler_max, int)
+            and isinstance(litm_filler_len_jitter, int)
+            and litm_filler_min >= 0
+            and litm_filler_max >= litm_filler_min
+        )
+        _add_check(
+            "litm_filler_params_present",
+            litm_ok,
+            (
+                f"e3_litm_filler_count_min={litm_filler_min}, "
+                f"e3_litm_filler_count_max={litm_filler_max}, "
+                f"e3_litm_filler_len_jitter_max={litm_filler_len_jitter}"
+            ),
+        )
+        if litm_ok and litm_filler_max > litm_filler_min:
+            filler_vals: List[int] = []
+            for report_obj in method_reports.values():
+                for rec in report_obj.get("records", []) or []:
+                    if rec.get("episode_id") != 3:
+                        continue
+                    val = rec.get("e3_litm_filler_count")
+                    if isinstance(val, int):
+                        filler_vals.append(val)
+            unique_vals = sorted(set(filler_vals))
+            in_range = all(litm_filler_min <= v <= litm_filler_max for v in unique_vals)
+            diverse = len(unique_vals) >= 3
+            _add_check(
+                "litm_filler_distribution",
+                in_range and diverse,
+                f"n_unique={len(unique_vals)}, unique_values={unique_vals[:12]}",
+            )
+
+    if isinstance(scenario_mode_param, str) and scenario_mode_param.startswith(
+        "threaded_v1_3_fu_decoy"
+    ):
+        requested = report.get("scenario_params", {}).get("n_threads_requested")
+        final = report.get("scenario_params", {}).get("n_threads_generated_final")
+        if isinstance(requested, int) and isinstance(final, int):
+            _add_check(
+                "thread_count_exact_generation",
+                requested == final,
+                f"requested={requested}, final={final}",
+            )
+
+    # Shared open policy sanity (threaded)
+    if report.get("scenario_params", {}).get("thread_open_policy") == "shared_topk":
+        mismatches = 0
+        total = 0
+        ref_by_key: Dict[tuple[str, int], List[str]] = {}
+        for report_obj in method_reports.values():
+            for rec in report_obj.get("records", []) or []:
+                if rec.get("episode_id") not in {1, 2}:
+                    continue
+                thread_id = rec.get("thread_id")
+                if not thread_id:
+                    continue
+                key = (thread_id, int(rec.get("episode_id")))
+                opened = sorted(rec.get("opened_clause_ids") or [])
+                if key not in ref_by_key:
+                    ref_by_key[key] = opened
+                else:
+                    total += 1
+                    if opened != ref_by_key[key]:
+                        mismatches += 1
+        _add_check(
+            "shared_open_policy_consistency",
+            mismatches == 0,
+            f"checked={total}, mismatches={mismatches}",
         )
 
     return {"passed": all(c["passed"] for c in checks), "checks": checks}
@@ -801,11 +1278,12 @@ def _evaluate_method(
 
     for task in tasks:
         scenario_mode = getattr(task, "scenario_mode", getattr(args, "scenario_mode", "v0"))
+        threaded_mode = scenario_mode in {"threaded_v1_2", "threaded_v1_3_fu", "threaded_v1_3_fu_decoy"}
         thread_id = getattr(task, "thread_id", None)
         episode_id = getattr(task, "episode_id", None)
         episode_kind = getattr(task, "episode_kind", None)
         thread_state: Dict[str, Any] | None = None
-        if scenario_mode == "threaded_v1_2" and thread_id:
+        if threaded_mode and thread_id:
             thread_state = thread_state_by_id.setdefault(
                 thread_id,
                 {
@@ -856,13 +1334,73 @@ def _evaluate_method(
                 ) / f"{task.task_id}.jsonl"
                 goc_graph_path = goc_graph_task_path
         agent_query_policy = getattr(args, "agent_query_policy", "single_hop")
+        shared_open_policy = getattr(args, "thread_open_policy", "current")
         task_for_run = task
-        if scenario_mode == "threaded_v1_2" and thread_state and episode_id:
+        e3_context_budget_chars: int | None = None
+        e3_context_chars_used: int | None = None
+        e3_context_clause_count: int | None = None
+        e3_packed_clause_count: int | None = None
+        e3_context_token_est: int | None = None
+        e3_packed_token_est: int | None = None
+        e3_context_truncated: bool | None = None
+        e3_context_clause_ids: List[str] = []
+        e3_packed_total_chars_before: int | None = None
+        e3_packed_total_chars_after: int | None = None
+        e3_packed_truncated: bool | None = None
+        e3_packed_dropped_clause_count: int | None = None
+        e3_packed_clause_ids: List[str] = []
+        e3_packed_clause_lens: List[int] = []
+        e3_packed_clause_is_critical: List[bool] = []
+        e3_packed_contains_critical: bool | None = None
+        e3_packed_contains_critical0: bool | None = None
+        e3_packed_contains_critical1: bool | None = None
+        e3_packed_critical_count: int | None = None
+        e3_packed_all_critical: bool | None = None
+        e3_packed_any_critical: bool | None = None
+        e3_decoy_clause_count: int | None = None
+        e3_litm_filler_count: int | None = None
+        e3_litm_filler_position: str | None = None
+        e3_litm_filler_clause_ids: List[str] = []
+        e3_prompt_includes_required_core: bool | None = None
+        e3_prompt_includes_critical_core: bool | None = None
+        e3_truncation_loss_estimate: bool | None = None
+        goc_folded_episode_count: int | None = None
+        goc_unfolded_clause_count: int | None = None
+        goc_unfolded_critical_clause_count: int | None = None
+        goc_unfold_selected_clause_ids: List[str] = []
+        goc_unfold_reason: str | None = None
+        if threaded_mode and thread_state and episode_id:
             task_for_run = copy.deepcopy(task)
-            commit_refs = _format_commit_refs(thread_state.get("commit1"), thread_state.get("commit2"), episode_id)
+            commit_refs = _format_commit_refs(
+                (thread_state.get("commit1") or {}).get("short_fact"),
+                (thread_state.get("commit2") or {}).get("short_fact"),
+                episode_id,
+            )
             if commit_refs:
                 task_for_run.user_ticket = f"{task_for_run.user_ticket}\n\n{commit_refs}"
-        if scenario_mode == "threaded_v1_2" and episode_id == 3 and thread_state:
+        if threaded_mode and episode_id in {1, 2} and shared_open_policy == "shared_topk":
+            pred, opened_ids, prompt, raw_output, diag = _run_shared_topk(
+                task_for_run,
+                env,
+                client,
+                primary_top_k=args.primary_search_top_k,
+            )
+            opened_doc_ids_shared = []
+            for cid in opened_ids:
+                clause = world.clauses.get(cid)
+                if clause:
+                    opened_doc_ids_shared.append(clause.doc_id)
+            diag["shared_open_policy_applied"] = True
+            diag["opened_clause_ids_shared"] = list(opened_ids)
+            diag["opened_doc_ids_shared"] = opened_doc_ids_shared
+            diag["hop1_search_results"] = list(diag.get("primary_search_results") or [])
+            diag["hop2_search_results"] = []
+            diag.setdefault("hop2_executed", False)
+            diag.setdefault("hop2_skip_reason", "shared_open_policy")
+            diag.setdefault("hop2_query", "")
+            diag.setdefault("hop2_candidate_query", "")
+            diag.setdefault("hop2_query_contains_canonical", False)
+        elif threaded_mode and episode_id == 3 and thread_state:
             commit1 = thread_state.get("commit1") or {}
             commit2 = thread_state.get("commit2") or {}
             commit_clause_ids = list(
@@ -871,14 +1409,40 @@ def _evaluate_method(
                     + (commit2.get("supporting_clause_ids") or [])
                 )
             )
-            commit_facts = {
-                "commit1.fact1": (commit1.get("short_fact") or {}).get("canonical_term"),
-                "commit2.fact2": (commit2.get("short_fact") or {}).get("exception_condition"),
-            }
-            opened_history_ids = thread_state.get("opened_history_ids", [])
+            commit_facts: Dict[str, Any] = {}
+            if scenario_mode == "threaded_v1_2":
+                commit_facts = {
+                    "commit1.fact1": (commit1.get("short_fact") or {}).get("canonical_term"),
+                    "commit2.fact2": (commit2.get("short_fact") or {}).get("exception_condition"),
+                }
+            else:
+                if commit1.get("short_fact") is not None:
+                    commit_facts["commit1.fact1"] = commit1.get("short_fact")
+                if commit2.get("short_fact") is not None:
+                    commit_facts["commit2.fact2"] = commit2.get("short_fact")
+            opened_history_ids = list(dict.fromkeys(thread_state.get("opened_history_ids", [])))
+            thread_cfg = dict(getattr(task, "thread_config", None) or {})
+            e3_litm_filler_clause_ids = list(
+                dict.fromkeys(thread_cfg.get("e3_litm_filler_clause_ids") or [])
+            )
+            e3_litm_filler_position = str(
+                thread_cfg.get("e3_litm_filler_position") or "between"
+            )
+            if thread_cfg.get("e3_litm_filler_count") is not None:
+                e3_litm_filler_count = int(thread_cfg.get("e3_litm_filler_count") or 0)
+            else:
+                e3_litm_filler_count = len(e3_litm_filler_clause_ids)
+            opened_history_ids = _inject_litm_filler_clause_ids(
+                opened_history_ids,
+                e3_litm_filler_clause_ids,
+                position=e3_litm_filler_position,
+                critical0_id=getattr(task, "critical_clause_id_e1", None),
+                critical1_id=getattr(task, "critical_clause_id_e2", None),
+            )
             compose_strategy = "commit_only"
             context_clause_ids: List[str] = []
             summary_text = None
+            reason_map: Dict[str, List[str]] = {}
             if method in {"full", "full_history"}:
                 compose_strategy = "full_history"
                 context_clause_ids = list(dict.fromkeys(opened_history_ids))
@@ -888,17 +1452,177 @@ def _evaluate_method(
                     task_for_run.user_ticket,
                     opened_history_ids,
                     world,
-                    top_k=4,
+                    top_k=max(1, len(opened_history_ids)),
                 )
             elif method == "agent_fold":
                 compose_strategy = "agent_fold"
                 clause_objs = [world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)]
-                summary_text = summarize_clause_history(clause_objs)
-            context_clauses = []
-            for cid in context_clause_ids:
-                clause = world.clauses.get(cid)
-                if clause:
-                    context_clauses.append({"clause_id": clause.clause_id, "text": clause.text})
+                summary_text = summarize_clause_history(clause_objs, max_items=6)
+                context_clause_ids = _select_similarity_clause_ids(
+                    task_for_run.user_ticket,
+                    opened_history_ids,
+                    world,
+                    top_k=max(1, min(6, len(opened_history_ids))),
+                )
+            elif method == "goc":
+                compose_strategy = "goc_fold_unfold"
+                clause_objs = [world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)]
+                summary_text = summarize_clause_history(clause_objs, max_items=6)
+                critical_clause_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
+                context_clause_ids, reason_map = _select_goc_unfold_clause_ids(
+                    opened_history_ids,
+                    commit_clause_ids,
+                    critical_clause_ids,
+                    task_for_run.user_ticket,
+                    world,
+                )
+                goc_folded_episode_count = 2
+            context_budget = int(getattr(args, "thread_context_budget_chars", 8000))
+            e3_context_budget_chars = context_budget
+            (
+                summary_text,
+                context_clauses,
+                used_chars,
+                truncated,
+                total_before_chars,
+                total_after_chars,
+                dropped_clause_count,
+            ) = _apply_context_budget(
+                summary_text,
+                context_clause_ids,
+                world,
+                context_budget,
+            )
+            e3_context_chars_used = used_chars
+            e3_context_clause_ids = [c["clause_id"] for c in context_clauses]
+            e3_context_clause_count = len(context_clauses)
+            e3_packed_clause_count = e3_context_clause_count
+            e3_packed_total_chars_before = total_before_chars
+            e3_packed_total_chars_after = total_after_chars
+            e3_context_token_est = int(math.ceil(max(0, e3_context_chars_used) / 4.0))
+            e3_packed_token_est = int(math.ceil(max(0, e3_packed_total_chars_after) / 4.0))
+            e3_packed_truncated = truncated
+            e3_packed_dropped_clause_count = dropped_clause_count
+            e3_context_truncated = e3_packed_truncated
+            e3_packed_clause_ids = list(e3_context_clause_ids)
+            e3_packed_clause_lens = [len(c.get("text", "")) for c in context_clauses]
+            e3_decoy_clause_count = 0
+            for cid in e3_context_clause_ids:
+                clause = world.clauses.get(cid) if world else None
+                if clause and str(clause.doc_id).startswith("DECOY"):
+                    e3_decoy_clause_count += 1
+            if method == "goc":
+                goc_unfolded_clause_count = len(context_clauses)
+                goc_unfold_selected_clause_ids = list(e3_context_clause_ids[:10])
+                reasons: List[str] = []
+                for cid in e3_context_clause_ids:
+                    reasons.extend(reason_map.get(cid, []))
+                if reasons:
+                    goc_unfold_reason = "|".join(sorted(set(reasons)))
+            if scenario_mode in {"threaded_v1_3_fu", "threaded_v1_3_fu_decoy"}:
+                required_core_ids = list(
+                    getattr(task.gold, "gold_evidence_core", None)
+                    or task.gold.gold_evidence
+                    or []
+                )
+                if required_core_ids:
+                    e3_prompt_includes_required_core = any(
+                        cid in e3_packed_clause_ids for cid in required_core_ids
+                    )
+                critical_core_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
+                if critical_core_ids:
+                    critical0_id = critical_core_ids[0] if len(critical_core_ids) > 0 else None
+                    critical1_id = critical_core_ids[1] if len(critical_core_ids) > 1 else None
+                    e3_packed_clause_is_critical = [
+                        cid in set(critical_core_ids) for cid in e3_packed_clause_ids
+                    ]
+                    e3_prompt_includes_critical_core = all(
+                        cid in e3_packed_clause_ids for cid in critical_core_ids
+                    )
+                    e3_packed_critical_count = sum(
+                        1 for cid in critical_core_ids if cid in e3_packed_clause_ids
+                    )
+                    e3_packed_contains_critical = e3_packed_critical_count > 0
+                    e3_packed_any_critical = e3_packed_contains_critical
+                    e3_packed_all_critical = e3_packed_critical_count == len(critical_core_ids)
+                    e3_packed_contains_critical0 = (
+                        critical0_id in e3_packed_clause_ids if critical0_id else None
+                    )
+                    e3_packed_contains_critical1 = (
+                        critical1_id in e3_packed_clause_ids if critical1_id else None
+                    )
+                else:
+                    e3_packed_clause_is_critical = [False] * len(e3_packed_clause_ids)
+                if critical_core_ids and method == "goc":
+                    goc_unfolded_critical_clause_count = sum(
+                        1 for cid in critical_core_ids if cid in e3_packed_clause_ids
+                    )
+                if critical_core_ids:
+                    critical_in_history = all(
+                        cid in opened_history_ids for cid in critical_core_ids
+                    )
+                    if e3_context_truncated is not None:
+                        e3_truncation_loss_estimate = bool(
+                            critical_in_history
+                            and e3_context_truncated
+                            and not e3_prompt_includes_critical_core
+                        )
+            if goc_graph and method == "goc" and scenario_mode in {"threaded_v1_3_fu", "threaded_v1_3_fu_decoy"}:
+                rid = run_id or run_dir.name
+                fold_node_id = f"fold:{task.task_id}:{goc_graph.step}"
+                goc_graph.add_node(
+                    fold_node_id,
+                    "fold",
+                    thread_id=thread_id,
+                    episode_id=episode_id,
+                    folded_episode_count=goc_folded_episode_count,
+                    step=goc_graph.step,
+                )
+                if goc_graph_path:
+                    append_event(
+                        goc_graph_path,
+                        build_event(
+                            rid,
+                            task.task_id,
+                            method,
+                            goc_graph.step,
+                            "FOLD",
+                            {
+                                "thread_id": thread_id,
+                                "episode_id": episode_id,
+                                "folded_episode_count": goc_folded_episode_count,
+                            },
+                        ),
+                    )
+                goc_graph.step += 1
+                unfold_node_id = f"unfold:{task.task_id}:{goc_graph.step}"
+                goc_graph.add_node(
+                    unfold_node_id,
+                    "unfold",
+                    thread_id=thread_id,
+                    episode_id=episode_id,
+                    clause_ids=e3_context_clause_ids,
+                    reason=goc_unfold_reason,
+                    step=goc_graph.step,
+                )
+                if goc_graph_path:
+                    append_event(
+                        goc_graph_path,
+                        build_event(
+                            rid,
+                            task.task_id,
+                            method,
+                            goc_graph.step,
+                            "UNFOLD",
+                            {
+                                "thread_id": thread_id,
+                                "episode_id": episode_id,
+                                "clause_ids": e3_context_clause_ids,
+                                "reason": goc_unfold_reason,
+                            },
+                        ),
+                    )
+                goc_graph.step += 1
             prompt = _build_threaded_prompt(
                 task_for_run.user_ticket,
                 commit_facts,
@@ -915,6 +1639,28 @@ def _evaluate_method(
                 "commit_facts": commit_facts,
                 "compose_context_clause_ids": context_clause_ids,
                 "compose_summary_used": bool(summary_text),
+                "e3_context_budget_chars": e3_context_budget_chars,
+                "e3_context_chars_used": e3_context_chars_used,
+                "e3_context_clause_count": e3_context_clause_count,
+                "e3_packed_clause_count": e3_packed_clause_count,
+                "e3_context_token_est": e3_context_token_est,
+                "e3_packed_token_est": e3_packed_token_est,
+                "e3_context_truncated": e3_context_truncated,
+                "e3_context_clause_ids": e3_context_clause_ids,
+                "e3_packed_clause_lens": e3_packed_clause_lens,
+                "e3_packed_clause_is_critical": e3_packed_clause_is_critical,
+                "e3_packed_total_chars_before": e3_packed_total_chars_before,
+                "e3_packed_total_chars_after": e3_packed_total_chars_after,
+                "e3_packed_truncated": e3_packed_truncated,
+                "e3_packed_dropped_clause_count": e3_packed_dropped_clause_count,
+                "e3_prompt_includes_required_core": e3_prompt_includes_required_core,
+                "e3_prompt_includes_critical_core": e3_prompt_includes_critical_core,
+                "e3_truncation_loss_estimate": e3_truncation_loss_estimate,
+                "goc_folded_episode_count": goc_folded_episode_count,
+                "goc_unfolded_clause_count": goc_unfolded_clause_count,
+                "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
+                "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
+                "goc_unfold_reason": goc_unfold_reason,
             }
         elif method == "topk":
             pred, opened_ids, prompt, raw_output, diag = run_topk_rag(
@@ -1013,7 +1759,7 @@ def _evaluate_method(
         e3_evidence_valid: bool | None = None
         thread_judge_correct: bool | None = None
         commit_clause_ids: List[str] | None = None
-        if scenario_mode == "threaded_v1_2" and thread_state and episode_id in {1, 2}:
+        if threaded_mode and thread_state and episode_id in {1, 2}:
             commit_supporting_clause_ids = _extract_commit_supporting(
                 task,
                 opened_ids,
@@ -1052,7 +1798,7 @@ def _evaluate_method(
                 dict.fromkeys(thread_state.get("opened_history_ids", []) + history_source)
             )
             thread_state["opened_history_ids"] = opened_history_ids
-        if scenario_mode == "threaded_v1_2" and thread_state and episode_id == 3:
+        if threaded_mode and thread_state and episode_id == 3:
             commit1 = thread_state.get("commit1") or {}
             commit2 = thread_state.get("commit2") or {}
             commit_clause_ids = list(
@@ -1149,10 +1895,14 @@ def _evaluate_method(
 
         judge_decision = None
         judge_correct = None
+        judge_correct_packed_allcritical: bool | None = None
         judge_supporting_clause_ids: List[str] | None = None
         judge_supporting_count: int | None = None
-        if getattr(args, "judge", "llm") == "symbolic":
-            if scenario_mode == "threaded_v1_2" and episode_id == 3 and commit_clause_ids is not None:
+        judge_mode = getattr(args, "judge", "llm")
+        if judge_mode in {"symbolic", "symbolic_packed", "symbolic_packed_allcritical"}:
+            if judge_mode in {"symbolic_packed", "symbolic_packed_allcritical"} and threaded_mode and episode_id == 3:
+                judge_pred = judge_from_opened_clauses(task, e3_packed_clause_ids, world)
+            elif judge_mode == "symbolic" and threaded_mode and episode_id == 3 and commit_clause_ids is not None:
                 judge_pred = judge_threaded_final(task, commit_clause_ids, world)
             else:
                 judge_pred = judge_from_opened_clauses(task, opened_ids, world)
@@ -1176,7 +1926,7 @@ def _evaluate_method(
         )
         commit1_correct = None
         commit2_correct = None
-        if scenario_mode == "threaded_v1_2" and thread_state:
+        if threaded_mode and thread_state:
             commit1 = thread_state.get("commit1") or {}
             commit2 = thread_state.get("commit2") or {}
             commit1_correct = commit1.get("commit_correct")
@@ -1193,6 +1943,33 @@ def _evaluate_method(
                     and e3_evidence_valid
                 )
                 judge_correct = thread_judge_correct
+                if isinstance(judge_correct, bool):
+                    judge_correct_packed_allcritical = bool(
+                        judge_correct and e3_packed_all_critical is True
+                    )
+                if judge_mode == "symbolic_packed_allcritical":
+                    judge_correct = judge_correct_packed_allcritical
+        elif threaded_mode and episode_id == 3 and isinstance(judge_correct, bool):
+            judge_correct_packed_allcritical = bool(
+                judge_correct and e3_packed_all_critical is True
+            )
+        if threaded_mode and episode_id == 3:
+            if e3_context_chars_used is None:
+                e3_context_chars_used = 0
+            if e3_packed_total_chars_before is None:
+                e3_packed_total_chars_before = 0
+            if e3_packed_total_chars_after is None:
+                e3_packed_total_chars_after = 0
+            if e3_packed_truncated is None:
+                e3_packed_truncated = False
+            if e3_packed_dropped_clause_count is None:
+                e3_packed_dropped_clause_count = 0
+            if e3_packed_clause_count is None:
+                e3_packed_clause_count = len(e3_packed_clause_ids or [])
+            if e3_context_token_est is None:
+                e3_context_token_est = int(math.ceil(max(0, e3_context_chars_used) / 4.0))
+            if e3_packed_token_est is None:
+                e3_packed_token_est = int(math.ceil(max(0, e3_packed_total_chars_after) / 4.0))
         task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
         metrics.append(task_metrics)
         tool_calls.append(env.tool_call_count)
@@ -1230,10 +2007,18 @@ def _evaluate_method(
                 "r_open_penalty": r_open_penalty,
                 "r_total": action_reward,
             }
+        opened_decoy_clause_count = 0
+        if opened_ids:
+            for cid in opened_ids:
+                clause = world.clauses.get(cid)
+                if clause and str(clause.doc_id).startswith("DECOY"):
+                    opened_decoy_clause_count += 1
         record: Dict[str, Any] = {
             "task_id": task.task_id,
             "method": method,
             "opened_clause_ids": opened_ids,
+            "opened_decoy_clause_count": opened_decoy_clause_count,
+            "opened_decoy_present": opened_decoy_clause_count > 0,
             "tool_calls": env.tool_call_count,
             "open_calls": env.open_count,
             "open_budget": env.open_budget,
@@ -1246,6 +2031,7 @@ def _evaluate_method(
             "decision_correct": pred_decision == task.gold.decision,
             "judge_decision": judge_decision,
             "judge_correct": judge_correct,
+            "judge_correct_packed_allcritical": judge_correct_packed_allcritical,
             "judge_supporting_clause_ids": judge_supporting_clause_ids,
             "judge_supporting_count": judge_supporting_count,
             "scenario_mode": scenario_mode,
@@ -1302,6 +2088,42 @@ def _evaluate_method(
             "commit_clause_ids": commit_clause_ids,
             "e3_evidence_valid": e3_evidence_valid,
             "thread_judge_correct": thread_judge_correct,
+            "critical_clause_id_e1": getattr(task, "critical_clause_id_e1", None),
+            "critical_clause_id_e2": getattr(task, "critical_clause_id_e2", None),
+            "critical_core_clause_ids": list(getattr(task, "critical_core_clause_ids", None) or []),
+            "e3_context_budget_chars": e3_context_budget_chars,
+            "e3_context_chars_used": e3_context_chars_used,
+            "e3_context_clause_count": e3_context_clause_count,
+            "e3_packed_clause_count": e3_packed_clause_count,
+            "e3_context_token_est": e3_context_token_est,
+            "e3_packed_token_est": e3_packed_token_est,
+            "e3_context_truncated": e3_context_truncated,
+            "e3_context_clause_ids": e3_context_clause_ids,
+            "e3_packed_clause_lens": list(e3_packed_clause_lens),
+            "e3_packed_clause_is_critical": list(e3_packed_clause_is_critical),
+            "e3_packed_total_chars_before": e3_packed_total_chars_before,
+            "e3_packed_total_chars_after": e3_packed_total_chars_after,
+            "e3_packed_truncated": e3_packed_truncated,
+            "e3_packed_dropped_clause_count": e3_packed_dropped_clause_count,
+            "e3_decoy_clause_count": e3_decoy_clause_count,
+            "e3_prompt_includes_required_core": e3_prompt_includes_required_core,
+            "e3_prompt_includes_critical_core": e3_prompt_includes_critical_core,
+            "e3_truncation_loss_estimate": e3_truncation_loss_estimate,
+            "e3_packed_clause_ids": list(e3_packed_clause_ids),
+            "e3_packed_contains_critical": e3_packed_contains_critical,
+            "e3_packed_contains_critical0": e3_packed_contains_critical0,
+            "e3_packed_contains_critical1": e3_packed_contains_critical1,
+            "e3_packed_critical_count": e3_packed_critical_count,
+            "e3_packed_any_critical": e3_packed_any_critical,
+            "e3_packed_all_critical": e3_packed_all_critical,
+            "e3_litm_filler_count": e3_litm_filler_count,
+            "e3_litm_filler_position": e3_litm_filler_position,
+            "e3_litm_filler_clause_ids": list(e3_litm_filler_clause_ids),
+            "goc_folded_episode_count": goc_folded_episode_count,
+            "goc_unfolded_clause_count": goc_unfolded_clause_count,
+            "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
+            "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
+            "goc_unfold_reason": goc_unfold_reason,
             "min_gold_core_rank_hop2": min_gold_core_rank_hop2,
             "min_gold_core_rank_union": min_gold_core_rank_union,
             "min_gold_winning_rank_hop2": min_gold_winning_rank_hop2,
@@ -1310,7 +2132,10 @@ def _evaluate_method(
         }
         if isinstance(diag, dict):
             record.update(diag)
-        if scenario_mode == "threaded_v1_2":
+        record.setdefault("shared_open_policy_applied", False)
+        record.setdefault("opened_clause_ids_shared", [])
+        record.setdefault("opened_doc_ids_shared", [])
+        if threaded_mode:
             distractor_id = getattr(task, "branch_distractor_clause_id", None)
             record["branch_distractor_opened"] = bool(distractor_id and distractor_id in opened_ids)
             record["branch_trap"] = bool(
@@ -1487,14 +2312,19 @@ def _evaluate_method(
         )
         judge_used_any_core = None
         judge_used_any_bridge = None
+        judge_used_any_critical_core = None
         if isinstance(record.get("judge_supporting_clause_ids"), list):
             supporting = set(record.get("judge_supporting_clause_ids") or [])
             core_ids = set(record.get("gold_evidence_core_ids") or [])
             judge_used_any_core = bool(supporting & core_ids)
             bridge_id = record.get("bridge_clause_id")
             judge_used_any_bridge = bool(bridge_id and bridge_id in supporting)
+            critical_ids = set(record.get("critical_core_clause_ids") or [])
+            if critical_ids:
+                judge_used_any_critical_core = bool(supporting & critical_ids)
         record["judge_used_any_core"] = judge_used_any_core
         record["judge_used_any_bridge"] = judge_used_any_bridge
+        record["judge_used_any_critical_core"] = judge_used_any_critical_core
         record["acc_no_core_evidence"] = bool(
             record.get("judge_correct") is True
             and (record.get("opened_gold_coverage_core") in {0, 0.0})
@@ -1526,7 +2356,7 @@ def _evaluate_method(
             record["goc_graph_dot_path"] = None
         records.append(record)
 
-        if scenario_mode == "threaded_v1_2" and thread_state and episode_id:
+        if threaded_mode and thread_state and episode_id:
             thread_state["episode_records"][episode_id] = record
             if isinstance(record.get("judge_correct"), bool):
                 episode_judge[episode_id].append(1.0 if record.get("judge_correct") else 0.0)
@@ -1601,7 +2431,7 @@ def _evaluate_method(
             _log("INIT", {"episode_id": episode_node_id, "ticket_id": ticket_id})
             goc_graph.step += 1
 
-            if scenario_mode == "threaded_v1_2" and episode_id and record.get("commit_supporting_clause_ids"):
+            if threaded_mode and episode_id and record.get("commit_supporting_clause_ids"):
                 commit_node_id = f"commit:{thread_id}:C{episode_id}"
                 goc_graph.add_node(
                     commit_node_id,
@@ -2152,6 +2982,17 @@ def _evaluate_method(
                     continue
                 vals.append(fval)
         return sum(vals) / len(vals) if vals else default
+    e3_records = [r for r in records if r.get("episode_id") == 3]
+    def _mean_metric_e3(key: str, default: float | None = None) -> float | None:
+        vals: List[float] = []
+        for rec in e3_records:
+            val = rec.get(key)
+            if isinstance(val, (int, float)):
+                fval = float(val)
+                if math.isnan(fval):
+                    continue
+                vals.append(fval)
+        return sum(vals) / len(vals) if vals else default
     aggregate["gold_in_search_topk_rate_hop1"] = _mean_metric("gold_in_search_topk_hop1")
     aggregate["gold_in_search_topk_rate_hop2"] = _mean_metric("gold_in_search_topk_hop2")
     aggregate["gold_in_search_topk_rate_union"] = _mean_metric("gold_in_search_topk_union")
@@ -2171,14 +3012,144 @@ def _evaluate_method(
     aggregate["selection_gap"] = _mean_metric("selection_gap")
     aggregate["selection_efficiency"] = _mean_metric("selection_efficiency", default=None)
     aggregate["judge_accuracy"] = _mean_metric("judge_correct", default=None)
+    aggregate["judge_accuracy_packed"] = (
+        aggregate.get("judge_accuracy")
+        if getattr(args, "judge", "llm") == "symbolic_packed"
+        else None
+    )
     aggregate["acc_no_core_evidence_rate"] = _mean_metric("acc_no_core_evidence", default=0.0)
     aggregate["judge_used_any_core_rate"] = _mean_metric("judge_used_any_core", default=None)
     aggregate["judge_used_any_bridge_rate"] = _mean_metric("judge_used_any_bridge", default=None)
+    aggregate["judge_used_any_critical_core_rate"] = _mean_metric(
+        "judge_used_any_critical_core",
+        default=None,
+    )
     aggregate["judge_supporting_count_mean"] = _mean_metric("judge_supporting_count", default=None)
     aggregate["opened_bridge_count_mean"] = _mean_metric("opened_bridge_count", default=0.0)
     aggregate["opened_meta_count_mean"] = _mean_metric("opened_meta_count", default=0.0)
     aggregate["opened_rule_count_mean"] = _mean_metric("opened_rule_count", default=0.0)
     aggregate["deep_rank_core_rate"] = _mean_metric("deep_rank_core_flag", default=0.0)
+    aggregate["e3_prompt_includes_required_core_rate"] = _mean_metric(
+        "e3_prompt_includes_required_core",
+        default=None,
+    )
+    aggregate["e3_prompt_includes_critical_core_rate"] = _mean_metric(
+        "e3_prompt_includes_critical_core",
+        default=None,
+    )
+    aggregate["e3_packed_contains_critical_rate"] = _mean_metric(
+        "e3_packed_contains_critical",
+        default=None,
+    )
+    aggregate["e3_packed_contains_critical0_rate"] = _mean_metric(
+        "e3_packed_contains_critical0",
+        default=None,
+    )
+    aggregate["e3_packed_contains_critical1_rate"] = _mean_metric(
+        "e3_packed_contains_critical1",
+        default=None,
+    )
+    aggregate["e3_packed_any_critical_rate"] = _mean_metric(
+        "e3_packed_any_critical",
+        default=None,
+    )
+    aggregate["e3_packed_all_critical_rate"] = _mean_metric(
+        "e3_packed_all_critical",
+        default=None,
+    )
+    aggregate["e3_context_truncated_rate"] = _mean_metric("e3_packed_truncated", default=None)
+    if aggregate["e3_context_truncated_rate"] is None:
+        aggregate["e3_context_truncated_rate"] = _mean_metric("e3_context_truncated", default=None)
+    aggregate["e3_context_chars_used_mean"] = _mean_metric("e3_context_chars_used", default=None)
+    aggregate["e3_context_token_est_mean"] = _mean_metric("e3_context_token_est", default=None)
+    aggregate["e3_packed_token_est_mean"] = _mean_metric("e3_packed_token_est", default=None)
+    aggregate["e3_context_clause_count_mean"] = _mean_metric("e3_context_clause_count", default=None)
+    aggregate["e3_packed_clause_count_mean"] = _mean_metric("e3_packed_clause_count", default=None)
+    aggregate["e3_packed_total_chars_before_mean"] = _mean_metric(
+        "e3_packed_total_chars_before",
+        default=None,
+    )
+    aggregate["e3_packed_total_chars_after_mean"] = _mean_metric(
+        "e3_packed_total_chars_after",
+        default=None,
+    )
+    aggregate["e3_packed_dropped_clause_count_mean"] = _mean_metric(
+        "e3_packed_dropped_clause_count",
+        default=None,
+    )
+    aggregate["e3_decoy_clause_count_mean"] = _mean_metric(
+        "e3_decoy_clause_count",
+        default=None,
+    )
+    aggregate["e3_litm_filler_count_mean"] = _mean_metric(
+        "e3_litm_filler_count",
+        default=None,
+    )
+    e3_chars_total = sum(
+        int(rec.get("e3_context_chars_used") or 0)
+        for rec in e3_records
+        if isinstance(rec.get("e3_context_chars_used"), (int, float))
+    )
+    e3_tokens_total = sum(
+        int(rec.get("e3_context_token_est") or 0)
+        for rec in e3_records
+        if isinstance(rec.get("e3_context_token_est"), (int, float))
+    )
+    aggregate["e3_context_chars_used_total"] = float(e3_chars_total)
+    aggregate["e3_context_token_est_total"] = float(e3_tokens_total)
+    packed_all_correct_count = sum(
+        1
+        for rec in e3_records
+        if rec.get("e3_packed_all_critical") is True
+        or rec.get("judge_correct_packed_allcritical") is True
+    )
+    aggregate["e3_packed_all_critical_correct_count"] = float(packed_all_correct_count)
+    denom_correct = max(packed_all_correct_count, 1)
+    aggregate["cost_per_correct_chars"] = (
+        float(e3_chars_total) / float(denom_correct)
+        if e3_records
+        else None
+    )
+    aggregate["cost_per_correct_token_est"] = (
+        float(e3_tokens_total) / float(denom_correct)
+        if e3_records
+        else None
+    )
+    all_critical_rate = aggregate.get("e3_packed_all_critical_rate")
+    token_mean = aggregate.get("e3_context_token_est_mean")
+    if isinstance(all_critical_rate, (int, float)):
+        denom_token_mean = float(token_mean) if isinstance(token_mean, (int, float)) else 0.0
+        aggregate["acc_per_1k_tokens"] = 1000.0 * float(all_critical_rate) / max(denom_token_mean, 1e-9)
+    else:
+        aggregate["acc_per_1k_tokens"] = None
+    aggregate["e3_truncation_loss_estimate_rate"] = _mean_metric(
+        "e3_truncation_loss_estimate",
+        default=None,
+    )
+    aggregate["e3_packed_critical_count_mean"] = _mean_metric(
+        "e3_packed_critical_count",
+        default=None,
+    )
+    aggregate["opened_decoy_clause_count_mean"] = _mean_metric(
+        "opened_decoy_clause_count",
+        default=None,
+    )
+    aggregate["goc_unfolded_clause_count_mean"] = _mean_metric(
+        "goc_unfolded_clause_count",
+        default=None,
+    )
+    aggregate["goc_unfolded_critical_clause_count_mean"] = _mean_metric(
+        "goc_unfolded_critical_clause_count",
+        default=None,
+    )
+    aggregate["goc_folded_episode_count_mean"] = _mean_metric(
+        "goc_folded_episode_count",
+        default=None,
+    )
+    aggregate["judge_accuracy_packed_allcritical"] = _mean_metric(
+        "judge_correct_packed_allcritical",
+        default=None,
+    )
     core_rank_union_vals = [
         int(r.get("min_gold_core_rank_union"))
         for r in records
@@ -2217,6 +3188,24 @@ def _evaluate_method(
             )
             aggregate[f"episode_opened_gold_coverage_core_mean_e{ep_id}"] = (
                 sum(cov_vals) / len(cov_vals) if cov_vals else None
+            )
+        if getattr(args, "judge", "llm") in {"symbolic_packed", "symbolic_packed_allcritical"}:
+            aggregate["e3_judge_accuracy_packed"] = aggregate.get("episode_judge_accuracy_e3")
+        else:
+            aggregate["e3_judge_accuracy_packed"] = None
+        if getattr(args, "judge", "llm") == "symbolic_packed_allcritical":
+            aggregate["e3_judge_accuracy_packed_allcritical"] = aggregate.get("episode_judge_accuracy_e3")
+        else:
+            e3_allcritical_vals = [
+                1.0 if rec.get("judge_correct_packed_allcritical") else 0.0
+                for rec in records
+                if rec.get("episode_id") == 3
+                and rec.get("judge_correct_packed_allcritical") is not None
+            ]
+            aggregate["e3_judge_accuracy_packed_allcritical"] = (
+                sum(e3_allcritical_vals) / len(e3_allcritical_vals)
+                if e3_allcritical_vals
+                else None
             )
     if getattr(args, "open_policy", "current") == "oracle_open_if_in_union":
         aggregate["selection_upper_bound_judge_acc"] = aggregate.get("judge_accuracy")
@@ -2289,6 +3278,7 @@ def _evaluate_method(
     return report
 
 def cmd_generate(args: argparse.Namespace) -> None:
+    _normalize_scenario_mode_arg(args)
     _apply_preset(args)
     _apply_generation_defaults(args)
     generate_world_and_tasks(
@@ -2316,12 +3306,29 @@ def cmd_generate(args: argparse.Namespace) -> None:
         tool_budget_e2=getattr(args, "tool_budget_e2", 50),
         tool_budget_e3=getattr(args, "tool_budget_e3", 0),
         branch_distractor_rate=getattr(args, "branch_distractor_rate", 0.5),
+        e3_clause_jitter_max_chars_critical=int(
+            getattr(args, "e3_clause_jitter_max_chars_critical", 0) or 0
+        ),
+        e3_clause_jitter_max_chars_noncritical=int(
+            getattr(args, "e3_clause_jitter_max_chars_noncritical", 0) or 0
+        ),
+        e3_clause_jitter_max_chars_decoy=int(
+            getattr(args, "e3_clause_jitter_max_chars_decoy", 0) or 0
+        ),
+        e3_litm_filler_count_min=int(getattr(args, "e3_litm_filler_count_min", 0) or 0),
+        e3_litm_filler_count_max=int(getattr(args, "e3_litm_filler_count_max", 0) or 0),
+        e3_litm_filler_len_jitter_max=int(
+            getattr(args, "e3_litm_filler_len_jitter_max", 0) or 0
+        ),
+        e3_clause_jitter_max_chars=int(getattr(args, "e3_clause_jitter_max_chars", 0) or 0),
+        e3_clause_jitter_scope=str(getattr(args, "e3_clause_jitter_scope", "decoy_only") or "decoy_only"),
         preset_name=getattr(args, "preset", None),
     )
     print("Generated PolicyOps Arena v0 data.")
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
+    _normalize_scenario_mode_arg(args)
     base_dir = args.out_dir or _default_base_dir()
     world_dir = Path(base_dir) / "data" / "worlds"
     tasks_path = Path(base_dir) / "data" / "tasks" / "tasks.jsonl"
@@ -2449,7 +3456,110 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
+    _normalize_scenario_mode_arg(args)
+    if getattr(args, "thread_context_budget_sweep", ""):
+        sweep_values = [
+            int(v.strip())
+            for v in str(args.thread_context_budget_sweep).split(",")
+            if v.strip()
+        ]
+        if not sweep_values:
+            raise ValueError("thread_context_budget_sweep provided but no budgets parsed")
+        base_dir = args.out_dir or _default_base_dir()
+        compare_dir = Path(base_dir) / "runs" / "compare"
+        sweep_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        sweep_dir = Path(base_dir) / "runs" / "context_budget_sweep" / sweep_stamp
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        summary_rows: List[Dict[str, Any]] = []
+        for budget in sweep_values:
+            sweep_args = argparse.Namespace(**vars(args))
+            sweep_args.thread_context_budget_sweep = ""
+            sweep_args.thread_context_budget_chars = budget
+            before = set(compare_dir.glob("*.json")) if compare_dir.exists() else set()
+            cmd_compare(sweep_args)
+            after = set(compare_dir.glob("*.json")) if compare_dir.exists() else set()
+            new_files = sorted(list(after - before), key=lambda p: p.stat().st_mtime)
+            report_path = new_files[-1] if new_files else None
+            if report_path is None:
+                continue
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            for method, report_obj in payload.get("method_reports", {}).items():
+                metrics = report_obj.get("metrics", {}) or {}
+                summary_rows.append(
+                    {
+                        "budget": budget,
+                        "method": method,
+                        "e3_context_truncated_rate": metrics.get("e3_context_truncated_rate"),
+                        "e3_packed_all_critical_rate": metrics.get(
+                            "e3_packed_all_critical_rate"
+                        ),
+                        "e3_packed_any_critical_rate": metrics.get(
+                            "e3_packed_any_critical_rate"
+                        ),
+                        "e3_packed_critical_count_mean": metrics.get(
+                            "e3_packed_critical_count_mean"
+                        ),
+                        "e3_decoy_clause_count_mean": metrics.get(
+                            "e3_decoy_clause_count_mean"
+                        ),
+                        "e3_context_clause_count_mean": metrics.get(
+                            "e3_context_clause_count_mean"
+                        ),
+                        "e3_context_chars_used_mean": metrics.get(
+                            "e3_context_chars_used_mean"
+                        ),
+                        "goc_unfolded_clause_count_mean": metrics.get(
+                            "goc_unfolded_clause_count_mean"
+                        ),
+                        "goc_unfolded_critical_clause_count_mean": metrics.get(
+                            "goc_unfolded_critical_clause_count_mean"
+                        ),
+                        "goc_folded_episode_count_mean": metrics.get(
+                            "goc_folded_episode_count_mean"
+                        ),
+                    }
+                )
+        if summary_rows:
+            csv_path = sweep_dir / "results_context_budget_sweep.csv"
+            md_path = sweep_dir / "results_context_budget_sweep.md"
+            fieldnames = [
+                "budget",
+                "method",
+                "e3_context_truncated_rate",
+                "e3_packed_all_critical_rate",
+                "e3_packed_any_critical_rate",
+                "e3_packed_critical_count_mean",
+                "e3_decoy_clause_count_mean",
+                "e3_context_clause_count_mean",
+                "e3_context_chars_used_mean",
+                "goc_unfolded_clause_count_mean",
+                "goc_unfolded_critical_clause_count_mean",
+                "goc_folded_episode_count_mean",
+            ]
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in summary_rows:
+                    writer.writerow({k: row.get(k) for k in fieldnames})
+            lines = []
+            lines.append("# Context Budget Sweep Summary")
+            lines.append("")
+            lines.append("|" + "|".join(fieldnames) + "|")
+            lines.append("|" + "|".join(["---"] * len(fieldnames)) + "|")
+            for row in summary_rows:
+                lines.append(
+                    "|"
+                    + "|".join(
+                        f"{row.get(k):.4f}" if isinstance(row.get(k), (int, float)) else str(row.get(k))
+                        for k in fieldnames
+                    )
+                    + "|"
+                )
+            md_path.write_text("\n".join(lines), encoding="utf-8")
+            print(f"Context budget sweep summary saved to {csv_path}")
+        return
     _apply_preset(args)
+    _apply_threaded_budget_default(args)
     base_dir = args.out_dir or _default_base_dir()
     world_dir = Path(base_dir) / "data" / "worlds"
     tasks_path = Path(base_dir) / "data" / "tasks" / "tasks.jsonl"
@@ -2591,9 +3701,16 @@ def cmd_compare(args: argparse.Namespace) -> None:
         summary[method] = {
             "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
             "judge_accuracy": method_report["metrics"].get("judge_accuracy"),
+            "judge_accuracy_packed": method_report["metrics"].get("judge_accuracy_packed"),
+            "judge_accuracy_packed_allcritical": method_report["metrics"].get(
+                "judge_accuracy_packed_allcritical"
+            ),
             "acc_no_core_evidence_rate": method_report["metrics"].get("acc_no_core_evidence_rate"),
             "judge_used_any_core_rate": method_report["metrics"].get("judge_used_any_core_rate"),
             "judge_used_any_bridge_rate": method_report["metrics"].get("judge_used_any_bridge_rate"),
+            "judge_used_any_critical_core_rate": method_report["metrics"].get(
+                "judge_used_any_critical_core_rate"
+            ),
             "judge_supporting_count_mean": method_report["metrics"].get(
                 "judge_supporting_count_mean"
             ),
@@ -2660,6 +3777,41 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "realized_open_rate": method_report["metrics"].get("realized_open_rate"),
             "selection_gap": method_report["metrics"].get("selection_gap"),
             "selection_efficiency": method_report["metrics"].get("selection_efficiency"),
+            "e3_judge_accuracy_packed": method_report["metrics"].get("e3_judge_accuracy_packed"),
+            "e3_judge_accuracy_packed_allcritical": method_report["metrics"].get(
+                "e3_judge_accuracy_packed_allcritical"
+            ),
+            "e3_packed_total_chars_before_mean": method_report["metrics"].get(
+                "e3_packed_total_chars_before_mean"
+            ),
+            "e3_packed_total_chars_after_mean": method_report["metrics"].get(
+                "e3_packed_total_chars_after_mean"
+            ),
+            "e3_context_chars_used_mean": method_report["metrics"].get(
+                "e3_context_chars_used_mean"
+            ),
+            "e3_context_token_est_mean": method_report["metrics"].get(
+                "e3_context_token_est_mean"
+            ),
+            "e3_packed_token_est_mean": method_report["metrics"].get(
+                "e3_packed_token_est_mean"
+            ),
+            "e3_context_chars_used_total": method_report["metrics"].get(
+                "e3_context_chars_used_total"
+            ),
+            "e3_context_token_est_total": method_report["metrics"].get(
+                "e3_context_token_est_total"
+            ),
+            "e3_packed_dropped_clause_count_mean": method_report["metrics"].get(
+                "e3_packed_dropped_clause_count_mean"
+            ),
+            "cost_per_correct_chars": method_report["metrics"].get(
+                "cost_per_correct_chars"
+            ),
+            "cost_per_correct_token_est": method_report["metrics"].get(
+                "cost_per_correct_token_est"
+            ),
+            "acc_per_1k_tokens": method_report["metrics"].get("acc_per_1k_tokens"),
         }
         if method == "oracle":
             oracle_cov = [
@@ -2690,6 +3842,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     scenario_params = {
         "preset": getattr(args, "preset", None),
         "scenario_mode": getattr(args, "scenario_mode", "v0"),
+        "seed": getattr(args, "seed", None),
         "bridge_bonus": getattr(args, "bridge_bonus", 1.5),
         "bridged_mix_canonical_in_ticket_rate": mix_rate,
         "open_budget": open_budget,
@@ -2698,11 +3851,23 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "open_policy": getattr(args, "open_policy", "current"),
         "hop1_query_mode": getattr(args, "hop1_query_mode", "stripped"),
         "agent_query_policy": getattr(args, "agent_query_policy", "single_hop"),
+        "thread_context_budget_chars": getattr(args, "thread_context_budget_chars", None),
+        "thread_open_policy": getattr(args, "thread_open_policy", None),
+        "thread_context_budget_sweep": getattr(args, "thread_context_budget_sweep", None),
+        "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
+        "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
+        "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
+        "e3_clause_jitter_max_chars_decoy": world.meta.get("e3_clause_jitter_max_chars_decoy"),
+        "e3_clause_jitter_scope": world.meta.get("e3_clause_jitter_scope"),
+        "e3_litm_filler_count_min": world.meta.get("e3_litm_filler_count_min"),
+        "e3_litm_filler_count_max": world.meta.get("e3_litm_filler_count_max"),
+        "e3_litm_filler_len_jitter_max": world.meta.get("e3_litm_filler_len_jitter_max"),
     }
     if any(getattr(t, "thread_id", None) for t in eval_tasks):
         scenario_params["n_threads"] = len({t.thread_id for t in eval_tasks if t.thread_id})
-    if any(getattr(t, "thread_id", None) for t in eval_tasks):
-        scenario_params["n_threads"] = len({t.thread_id for t in eval_tasks if t.thread_id})
+        scenario_params["n_threads_requested"] = world.meta.get("n_threads_requested")
+        scenario_params["n_threads_generated_raw"] = world.meta.get("n_threads_generated_raw")
+        scenario_params["n_threads_generated_final"] = world.meta.get("n_threads_generated_final")
     scenario_params["exclusive_core_evidence"] = world.meta.get("exclusive_core_evidence")
     compare_report = {
         "methods": methods,
@@ -2931,9 +4096,13 @@ def _run_compare_with_tasks(
         summary[method] = {
             "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
             "judge_accuracy": method_report["metrics"].get("judge_accuracy"),
+            "judge_accuracy_packed": method_report["metrics"].get("judge_accuracy_packed"),
             "acc_no_core_evidence_rate": method_report["metrics"].get("acc_no_core_evidence_rate"),
             "judge_used_any_core_rate": method_report["metrics"].get("judge_used_any_core_rate"),
             "judge_used_any_bridge_rate": method_report["metrics"].get("judge_used_any_bridge_rate"),
+            "judge_used_any_critical_core_rate": method_report["metrics"].get(
+                "judge_used_any_critical_core_rate"
+            ),
             "judge_supporting_count_mean": method_report["metrics"].get(
                 "judge_supporting_count_mean"
             ),
@@ -3056,6 +4225,17 @@ def _run_compare_with_tasks(
         "open_policy": getattr(args, "open_policy", "current"),
         "hop1_query_mode": getattr(args, "hop1_query_mode", "stripped"),
         "agent_query_policy": getattr(args, "agent_query_policy", "single_hop"),
+        "thread_context_budget_chars": getattr(args, "thread_context_budget_chars", None),
+        "thread_open_policy": getattr(args, "thread_open_policy", None),
+        "thread_context_budget_sweep": getattr(args, "thread_context_budget_sweep", None),
+        "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
+        "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
+        "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
+        "e3_clause_jitter_max_chars_decoy": world.meta.get("e3_clause_jitter_max_chars_decoy"),
+        "e3_clause_jitter_scope": world.meta.get("e3_clause_jitter_scope"),
+        "e3_litm_filler_count_min": world.meta.get("e3_litm_filler_count_min"),
+        "e3_litm_filler_count_max": world.meta.get("e3_litm_filler_count_max"),
+        "e3_litm_filler_len_jitter_max": world.meta.get("e3_litm_filler_len_jitter_max"),
     }
     scenario_params["exclusive_core_evidence"] = world.meta.get("exclusive_core_evidence")
     compare_report = {
@@ -3093,6 +4273,7 @@ def _run_compare_with_tasks(
 
 
 def cmd_sweep(args: argparse.Namespace) -> None:
+    _normalize_scenario_mode_arg(args)
     _apply_preset(args)
     _apply_generation_defaults(args)
     base_dir = args.out_dir or _default_base_dir()
@@ -3120,6 +4301,26 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     args, "bridged_mix_canonical_in_ticket_rate", 0.0
                 ),
                 exclusive_core_evidence=getattr(args, "exclusive_core_evidence", False),
+                e3_clause_jitter_max_chars_critical=int(
+                    getattr(args, "e3_clause_jitter_max_chars_critical", 0) or 0
+                ),
+                e3_clause_jitter_max_chars_noncritical=int(
+                    getattr(args, "e3_clause_jitter_max_chars_noncritical", 0) or 0
+                ),
+                e3_clause_jitter_max_chars_decoy=int(
+                    getattr(args, "e3_clause_jitter_max_chars_decoy", 0) or 0
+                ),
+                e3_litm_filler_count_min=int(
+                    getattr(args, "e3_litm_filler_count_min", 0) or 0
+                ),
+                e3_litm_filler_count_max=int(
+                    getattr(args, "e3_litm_filler_count_max", 0) or 0
+                ),
+                e3_litm_filler_len_jitter_max=int(
+                    getattr(args, "e3_litm_filler_len_jitter_max", 0) or 0
+                ),
+                e3_clause_jitter_max_chars=int(getattr(args, "e3_clause_jitter_max_chars", 0) or 0),
+                e3_clause_jitter_scope=str(getattr(args, "e3_clause_jitter_scope", "decoy_only") or "decoy_only"),
                 preset_name=getattr(args, "preset", None),
             )
 
@@ -3152,6 +4353,9 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "acc_no_core_evidence_rate": metrics.get("acc_no_core_evidence_rate"),
                     "judge_used_any_core_rate": metrics.get("judge_used_any_core_rate"),
                     "judge_used_any_bridge_rate": metrics.get("judge_used_any_bridge_rate"),
+                    "judge_used_any_critical_core_rate": metrics.get(
+                        "judge_used_any_critical_core_rate"
+                    ),
                     "judge_supporting_count_mean": metrics.get("judge_supporting_count_mean"),
                     "selection_upper_bound_judge_acc": metrics.get("selection_upper_bound_judge_acc"),
                     "deep_rank_core_rate": metrics.get("deep_rank_core_rate"),
@@ -3208,6 +4412,7 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "acc_no_core_evidence_rate",
         "judge_used_any_core_rate",
         "judge_used_any_bridge_rate",
+        "judge_used_any_critical_core_rate",
         "judge_supporting_count_mean",
         "selection_upper_bound_judge_acc",
         "deep_rank_core_rate",
@@ -3386,7 +4591,18 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--update_rate", type=float, default=0.3)
     gen.add_argument("--definition_density", type=float, default=0.4)
     gen.add_argument("--distractor_strength", type=float, default=0.3)
-    gen.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
+    gen.add_argument(
+        "--scenario_mode",
+        choices=[
+            "v0",
+            "bridged_v1_1",
+            "threaded_v1_2",
+            "threaded_v1_3_fu",
+            "threaded_v1_3_fu_decoy",
+            THREADED_FU_DECOY_DEPTHJITTER_MODE,
+        ],
+        default="v0",
+    )
     gen.add_argument("--bridge_prob", type=float, default=0.8)
     gen.add_argument("--bridged_mix_canonical_in_ticket_rate", type=float, default=0.0)
     gen.add_argument("--alias_density", type=float, default=None)
@@ -3401,6 +4617,18 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--tool_budget_e2", type=int, default=50)
     gen.add_argument("--tool_budget_e3", type=int, default=0)
     gen.add_argument("--branch_distractor_rate", type=float, default=0.5)
+    gen.add_argument("--e3_clause_jitter_max_chars", type=int, default=0)
+    gen.add_argument("--e3_clause_jitter_max_chars_critical", type=int, default=0)
+    gen.add_argument("--e3_clause_jitter_max_chars_noncritical", type=int, default=0)
+    gen.add_argument("--e3_clause_jitter_max_chars_decoy", type=int, default=0)
+    gen.add_argument("--e3_litm_filler_count_min", type=int, default=0)
+    gen.add_argument("--e3_litm_filler_count_max", type=int, default=0)
+    gen.add_argument("--e3_litm_filler_len_jitter_max", type=int, default=0)
+    gen.add_argument(
+        "--e3_clause_jitter_scope",
+        choices=["decoy_only", "decoy_plus_noncritical", "all"],
+        default="decoy_only",
+    )
     gen.add_argument("--out_dir", type=Path, default=None)
     gen.set_defaults(func=cmd_generate)
 
@@ -3412,7 +4640,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--model", type=str, default="gpt-4.1-mini")
     ev.add_argument("--llm", choices=["dummy", "openai"], default="openai")
-    ev.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
+    ev.add_argument(
+        "--judge",
+        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        default="llm",
+    )
     ev.add_argument("--dotenv", type=str, default=".env")
     ev.add_argument("--out_dir", type=Path, default=None)
     ev.add_argument(
@@ -3434,7 +4666,20 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--goc_graph_dir", type=str, default="")
     ev.add_argument("--goc_graph_schema", choices=["v0", "v1"], default="v0")
     ev.add_argument("--goc_graph_sample_rate", type=float, default=1.0)
-    ev.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
+    ev.add_argument(
+        "--scenario_mode",
+        choices=[
+            "v0",
+            "bridged_v1_1",
+            "threaded_v1_2",
+            "threaded_v1_3_fu",
+            "threaded_v1_3_fu_decoy",
+            THREADED_FU_DECOY_DEPTHJITTER_MODE,
+        ],
+        default="v0",
+    )
+    ev.add_argument("--thread_context_budget_chars", type=int, default=8000)
+    ev.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     ev.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     ev.add_argument(
         "--search_score_mode",
@@ -3483,10 +4728,15 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--methods", nargs="+", default=["topk", "full", "goc", "oracle", "engine"])
     cmp.add_argument("--model", type=str, default="gpt-4.1-mini")
     cmp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
-    cmp.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
+    cmp.add_argument(
+        "--judge",
+        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        default="llm",
+    )
     cmp.add_argument("--dotenv", type=str, default=".env")
     cmp.add_argument("--out_dir", type=Path, default=None)
     cmp.add_argument("--preset", choices=list(PRESET_CONFIGS.keys()), default=None)
+    cmp.add_argument("--seed", type=int, default=0)
     cmp.add_argument(
         "--evidence_padding_mode",
         choices=["none", "schema_only", "global"],
@@ -3506,7 +4756,21 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--goc_graph_dir", type=str, default="")
     cmp.add_argument("--goc_graph_schema", choices=["v0", "v1"], default="v0")
     cmp.add_argument("--goc_graph_sample_rate", type=float, default=1.0)
-    cmp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
+    cmp.add_argument(
+        "--scenario_mode",
+        choices=[
+            "v0",
+            "bridged_v1_1",
+            "threaded_v1_2",
+            "threaded_v1_3_fu",
+            "threaded_v1_3_fu_decoy",
+            THREADED_FU_DECOY_DEPTHJITTER_MODE,
+        ],
+        default="v0",
+    )
+    cmp.add_argument("--thread_context_budget_chars", type=int, default=8000)
+    cmp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
+    cmp.add_argument("--thread_context_budget_sweep", type=str, default="")
     cmp.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     cmp.add_argument(
         "--search_score_mode",
@@ -3563,8 +4827,37 @@ def build_parser() -> argparse.ArgumentParser:
     swp.add_argument("--methods", nargs="+", default=["topk", "full", "goc", "oracle", "engine"])
     swp.add_argument("--model", type=str, default="gpt-4.1-mini")
     swp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
-    swp.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
-    swp.add_argument("--scenario_mode", choices=["v0", "bridged_v1_1", "threaded_v1_2"], default="v0")
+    swp.add_argument(
+        "--judge",
+        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        default="llm",
+    )
+    swp.add_argument(
+        "--scenario_mode",
+        choices=[
+            "v0",
+            "bridged_v1_1",
+            "threaded_v1_2",
+            "threaded_v1_3_fu",
+            "threaded_v1_3_fu_decoy",
+            THREADED_FU_DECOY_DEPTHJITTER_MODE,
+        ],
+        default="v0",
+    )
+    swp.add_argument("--thread_context_budget_chars", type=int, default=8000)
+    swp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
+    swp.add_argument("--e3_clause_jitter_max_chars", type=int, default=0)
+    swp.add_argument("--e3_clause_jitter_max_chars_critical", type=int, default=0)
+    swp.add_argument("--e3_clause_jitter_max_chars_noncritical", type=int, default=0)
+    swp.add_argument("--e3_clause_jitter_max_chars_decoy", type=int, default=0)
+    swp.add_argument("--e3_litm_filler_count_min", type=int, default=0)
+    swp.add_argument("--e3_litm_filler_count_max", type=int, default=0)
+    swp.add_argument("--e3_litm_filler_len_jitter_max", type=int, default=0)
+    swp.add_argument(
+        "--e3_clause_jitter_scope",
+        choices=["decoy_only", "decoy_plus_noncritical", "all"],
+        default="decoy_only",
+    )
     swp.add_argument("--bridge_prob", type=float, default=0.8)
     swp.add_argument("--alias_density", type=float, default=None)
     swp.add_argument("--canonical_density", type=float, default=None)
@@ -3656,7 +4949,11 @@ def build_parser() -> argparse.ArgumentParser:
     abl.add_argument("--methods", nargs="+", default=["goc"])
     abl.add_argument("--model", type=str, default="gpt-4.1-mini")
     abl.add_argument("--llm", choices=["dummy", "openai"], default="openai")
-    abl.add_argument("--judge", choices=["llm", "symbolic"], default="llm")
+    abl.add_argument(
+        "--judge",
+        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        default="llm",
+    )
     abl.add_argument("--dotenv", type=str, default=".env")
     abl.add_argument("--out_dir", type=Path, default=None)
     abl.add_argument(

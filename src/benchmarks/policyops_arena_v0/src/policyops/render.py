@@ -9,6 +9,11 @@ SLOT_LABELS = {
     "retain_logs_90d": "retaining logs for 90 days",
 }
 
+RETENTION_BUCKET_TEXT = {
+    "le_30": "Retention days <= 30.",
+    "gt_30": "Retention days > 30.",
+}
+
 
 def _format_scope(applies_if: Dict[str, List[str]]) -> List[str]:
     parts: List[str] = []
@@ -22,6 +27,12 @@ def _format_scope(applies_if: Dict[str, List[str]]) -> List[str]:
         parts.append(f"Data types: {', '.join(applies_if['data_type'])}.")
     if applies_if.get("purpose"):
         parts.append(f"Purposes: {', '.join(applies_if['purpose'])}.")
+    if applies_if.get("retention_bucket"):
+        retention_parts = [
+            RETENTION_BUCKET_TEXT.get(bucket, f"Retention bucket: {bucket}.")
+            for bucket in applies_if["retention_bucket"]
+        ]
+        parts.append(" ".join(retention_parts))
     return parts
 
 

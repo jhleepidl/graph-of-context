@@ -93,6 +93,10 @@ PYTHONPATH=src:../.. python -m policyops.run analyze --report runs/compare/<late
 - `--open_policy hop2_priority` is analysis-only (bridge once, then hop2-only opens).
 - `--open_policy bridge_one_only` is analysis-only (bridge cap + meta-avoidance for cost-control diagnostics).
 - Selection metrics: prefer `rank_success_rate`, `winning_in_union_rate`, and `policy_gain_over_rank` (selection_gap/feasible/realized are deprecated for reporting).
+- Decoy FU calibration preset:
+  - `--preset threaded_v1_3_fu_decoy_calib_jitter_n10`
+  - Enables length jitter (`e3_clause_jitter_max_chars=400`, `e3_clause_jitter_scope=decoy_plus_noncritical`) to smooth sharp budget thresholds.
+  - Purpose is calibration only: make the budget curve interpretable, not to tune benchmark score.
 
 ## Research Validity Runs (Bridged v1.1)
 These commands are for **measurement validation only** (not performance tuning).
@@ -194,4 +198,86 @@ PYTHONPATH=src:../.. python -m policyops.run compare \
   --llm dummy --model dummy \
   --methods goc full_history similarity_only agent_fold \
   --save_goc_graph --save_goc_dot
+```
+
+## Threaded v1.3 FU (Fold/Unfold under context budget)
+These commands are for **forced fold/unfold** under a shared E3 context budget.
+They are **not executed here**; copy/paste to run locally.
+Recommended threaded_v1_3_fu budget for calibration is **1350 chars** (cost-control regime, not score tuning).
+
+```bash
+# 0) tests
+python -m pytest -q src/benchmarks/policyops_arena_v0/tests
+
+# 1) generate (smoke)
+cd src/benchmarks/policyops_arena_v0
+PYTHONPATH=src:../.. python -m policyops.run generate \
+  --seed 0 --n_threads 50 \
+  --scenario_mode threaded_v1_3_fu \
+  --preset threaded_v1_3_fu_calib_n10
+
+# Optional: decoy jitter calibration preset (smooths step-like budget transitions)
+PYTHONPATH=src:../.. python -m policyops.run generate \
+  --seed 0 --n_threads 50 \
+  --scenario_mode threaded_v1_3_fu_decoy \
+  --preset threaded_v1_3_fu_decoy_calib_jitter_n10
+
+# 2) compare (symbolic_packed judge, recommended budget=1350)
+PYTHONPATH=src:../.. python -m policyops.run compare \
+  --scenario_mode threaded_v1_3_fu \
+  --preset threaded_v1_3_fu_calib_n10 \
+  --seed 0 --n_threads 50 \
+  --judge symbolic_packed \
+  --llm dummy --model dummy \
+  --methods goc full_history similarity_only agent_fold \
+  --thread_open_policy shared_topk \
+  --thread_context_budget_chars 1350 \
+  --save_goc_graph --save_goc_dot
+
+# 3) context budget sweep (fairness mode)
+PYTHONPATH=src:../.. python -m policyops.run compare \
+  --scenario_mode threaded_v1_3_fu \
+  --preset threaded_v1_3_fu_calib_n10 \
+  --seed 0 --n_threads 50 \
+  --judge symbolic \
+  --llm dummy --model dummy \
+  --methods goc full_history similarity_only agent_fold \
+  --thread_open_policy shared_topk \
+  --thread_context_budget_sweep "800,1000,1200,1500" \
+  --save_goc_graph --save_goc_dot
+```
+
+### Operating Point (Fixed Dataset Reuse, budget=2000)
+Use this when you want compare-seed noise only (same dataset), not dataset-seed variability.
+
+```bash
+cd src/benchmarks/policyops_arena_v0
+
+# 0) tests
+python -m pytest -q src/benchmarks/policyops_arena_v0/tests
+
+# 1) prepare a source dataset once
+SRC_DATASET="runs/threaded_v1_3_fu_decoy_depthjitter_20260207_202557"
+OUT_DIR="runs/threaded_v1_3_fu_operating_point_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$OUT_DIR"
+cp -r "$SRC_DATASET/data" "$OUT_DIR/data"
+
+# 2) run compare with fixed budget and shared_topk fairness (same data reused)
+for SEED in 0 1 2 3 4; do
+  PYTHONPATH=src:../.. python -m policyops.run compare \
+    --scenario_mode threaded_v1_3_fu_decoy_depthjitter \
+    --preset threaded_v1_3_fu_calib_n10 \
+    --seed $SEED --n_threads 200 \
+    --judge symbolic_packed \
+    --llm dummy --model dummy \
+    --methods goc full_history similarity_only agent_fold \
+    --thread_context_budget_chars 2000 \
+    --thread_open_policy shared_topk \
+    --out_dir "$OUT_DIR"
+done
+
+# 3) rebuild analysis bundle
+PYTHONPATH=src:../.. python -m policyops.run analyze \
+  --mode analysis_bundle \
+  --run_dir "$OUT_DIR"
 ```

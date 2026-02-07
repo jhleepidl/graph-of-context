@@ -82,6 +82,9 @@ if USE_PYDANTIC:
         episode_kind: Optional[str] = None
         thread_config: Optional[Dict[str, Any]] = None
         branch_distractor_clause_id: Optional[str] = None
+        critical_clause_id_e1: Optional[str] = None
+        critical_clause_id_e2: Optional[str] = None
+        critical_core_clause_ids: List[str] = Field(default_factory=list)
 
 
     class World(_BaseModel):
@@ -161,6 +164,9 @@ else:
         episode_kind: Optional[str] = None
         thread_config: Optional[Dict[str, Any]] = None
         branch_distractor_clause_id: Optional[str] = None
+        critical_clause_id_e1: Optional[str] = None
+        critical_clause_id_e2: Optional[str] = None
+        critical_core_clause_ids: List[str] = field(default_factory=list)
 
         def to_dict(self) -> Dict[str, Any]:
             return asdict(self)
