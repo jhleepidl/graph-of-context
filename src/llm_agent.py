@@ -14,6 +14,7 @@ from .tools import ToolBox
 from .memory import MemoryManagerBase
 from .utils import approx_token_count
 from .bandit_controller import BanditUnfoldController
+from .unfold_trigger import UnfoldTrigger
 
 def _extract_first_json_object(text: str) -> Optional[str]:
     """Extract the first syntactically balanced JSON object from text.
@@ -169,6 +170,16 @@ class ToolLoopConfig:
     stage_aware_unfold_on_commit: bool = True
     stage_commit_unfold_k: int = 6
 
+    # Query-vs-context unfolding trigger (GoC only): if many query terms are
+    # missing from ACTIVE_CONTEXT, unfold before the next LLM call.
+    enable_unfold_trigger: bool = False
+    unfold_trigger_missing_terms_threshold: int = 3
+    unfold_trigger_min_token_len: int = 4
+    unfold_trigger_max_keywords: int = 48
+    unfold_trigger_k: int = 6
+    unfold_trigger_log_missing_limit: int = 12
+    unfold_trigger_always_on_required_keys: bool = True
+
     # Option-B: agentic memory controller (fold/unfold)
     enable_agentic_unfold: bool = False
     controller_max_candidates: int = 24
@@ -232,6 +243,8 @@ class ToolLoopConfig:
     log_dir: Optional[str] = None         # if set, write per-task JSONL trace logs
     log_messages: bool = True             # include sent messages (truncated) in logs
     log_message_chars: int = 6000         # per-message char cap when log_messages=True
+    save_goc_internal_graph: bool = False
+    goc_internal_graph_dir: Optional[str] = None
 
     # Prompt context bounding:
     # The memory manager already enforces budget_active (approx tokens). This optional
@@ -268,6 +281,12 @@ class ToolLoopLLMAgent:
         self.tools = tools
         self.mem = mem
         self.cfg = cfg or ToolLoopConfig()
+        self.unfold_trigger = UnfoldTrigger(
+            missing_terms_threshold=int(getattr(self.cfg, "unfold_trigger_missing_terms_threshold", 3) or 3),
+            min_token_len=int(getattr(self.cfg, "unfold_trigger_min_token_len", 4) or 4),
+            max_keywords=int(getattr(self.cfg, "unfold_trigger_max_keywords", 48) or 48),
+            always_trigger_on_required_keys=bool(getattr(self.cfg, "unfold_trigger_always_on_required_keys", True)),
+        )
 
         self.usage_accum: Dict[str, int] = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
         self.counters: Counter = Counter()
@@ -336,6 +355,8 @@ class ToolLoopLLMAgent:
 
         self._trace_fp = None
         self._trace_path: Optional[Path] = None
+        self._internal_graph_fp = None
+        self._internal_graph_path: Optional[Path] = None
 
     def _open_trace(self, run_tag: str, method: str, task_id: str):
         if not self.cfg.log_dir:
@@ -366,6 +387,54 @@ class ToolLoopLLMAgent:
             return
         self._trace_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
         self._trace_fp.flush()
+
+    def _open_internal_graph_log(self, *, task_id: str):
+        if not bool(getattr(self.cfg, "save_goc_internal_graph", False)):
+            return
+        if not getattr(self.cfg, "goc_internal_graph_dir", None):
+            return
+        snap_fn = getattr(self.mem, "snapshot", None)
+        if not callable(snap_fn):
+            return
+        out_dir = Path(str(self.cfg.goc_internal_graph_dir))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._internal_graph_path = out_dir / f"{task_id}.jsonl"
+        self._internal_graph_fp = open(self._internal_graph_path, "a", encoding="utf-8")
+
+    def _close_internal_graph_log(self):
+        if self._internal_graph_fp:
+            try:
+                self._internal_graph_fp.close()
+            finally:
+                self._internal_graph_fp = None
+
+    def _write_internal_graph_snapshot(
+        self,
+        *,
+        task_id: str,
+        method: str,
+        run_tag: str,
+        step: int,
+        snapshot_kind: str,
+    ):
+        if not self._internal_graph_fp:
+            return
+        snap_fn = getattr(self.mem, "snapshot", None)
+        if not callable(snap_fn):
+            return
+        try:
+            payload = snap_fn()
+            if not isinstance(payload, dict):
+                return
+            payload["snapshot_kind"] = str(snapshot_kind)
+            payload["step"] = int(step)
+            payload["task_id"] = task_id
+            payload["method"] = method
+            payload["run_tag"] = run_tag
+            self._internal_graph_fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._internal_graph_fp.flush()
+        except Exception:
+            pass
 
     # --- GoC annotation helpers (research) ---
     def _maybe_apply_goc_annotations(
@@ -2354,12 +2423,14 @@ class ToolLoopLLMAgent:
         self._last_finish_block_reason = None
 
         self._open_trace(run_tag=run_tag, method=method, task_id=task_id)
+        self._open_internal_graph_log(task_id=task_id)
 
         system = self._build_system_prompt()
         base_messages: List[Dict[str, str]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": current_user_prompt},
         ]
+        last_step_snapshot = 0
 
         def _inject_next_user_turn(reason: str, step_for_trace: int):
             nonlocal current_user_prompt
@@ -2419,6 +2490,14 @@ class ToolLoopLLMAgent:
 
         try:
             for step in range(self.cfg.max_steps):
+                last_step_snapshot = int(step) + 1
+                self._write_internal_graph_snapshot(
+                    task_id=task_id,
+                    method=method,
+                    run_tag=run_tag,
+                    step=last_step_snapshot,
+                    snapshot_kind="step",
+                )
                 remaining = self.cfg.max_steps - step
                 if (not self._deadline_nudged) and remaining <= self.cfg.deadline_finish_nudge_steps:
                     self._deadline_nudged = True
@@ -2575,8 +2654,60 @@ class ToolLoopLLMAgent:
                             self.counters["forced_unfold_calls"] += 1
                 except Exception:
                     self.counters["forced_unfold_errors"] += 1
-                # Stateless prompting: we DO NOT accumulate prior ACTIVE_CONTEXT in messages.
+
+                # Query-vs-context trigger: right before prompt construction, unfold if the
+                # current instruction appears under-covered in ACTIVE_CONTEXT.
                 ctx = self.mem.get_active_text()
+                if (
+                    bool(getattr(self.cfg, "enable_unfold_trigger", False))
+                    and str(method or "").lower().startswith("goc")
+                    and hasattr(self.mem, "unfold")
+                ):
+                    query_for_trigger = str((current_user_prompt or user_question or "")).strip()
+                    if query_for_trigger:
+                        self.counters["unfold_trigger_checks"] += 1
+                        should = False
+                        trigger_reason = "covered"
+                        missing_terms: List[str] = []
+                        try:
+                            should, trigger_reason, missing_terms = self.unfold_trigger.should_unfold(query_for_trigger, ctx)
+                        except Exception:
+                            trigger_reason = "error"
+                            self.counters["unfold_trigger_errors"] += 1
+
+                        activated_ids: List[str] = []
+                        kk = int(getattr(self.cfg, "unfold_trigger_k", 0) or getattr(self.mem, "unfold_k", 6) or 6)
+                        if should:
+                            activated_ids = self._run_unfold(
+                                query_for_trigger,
+                                k=kk,
+                                reason=f"unfold_trigger:{trigger_reason}",
+                                step=step,
+                                task_id=task_id,
+                                method=method,
+                                run_tag=run_tag,
+                            )
+                            self.counters["unfold_trigger_calls"] += 1
+                            ctx = self.mem.get_active_text()
+
+                        log_limit = int(getattr(self.cfg, "unfold_trigger_log_missing_limit", 12) or 12)
+                        miss_head = list(missing_terms[: max(0, log_limit)])
+                        self._trace({
+                            "type": "unfold_trigger",
+                            "task_id": task_id,
+                            "method": method,
+                            "run_tag": run_tag,
+                            "step": step,
+                            "query": query_for_trigger[:400],
+                            "triggered": bool(should),
+                            "reason": str(trigger_reason),
+                            "missing_terms_count": int(len(missing_terms)),
+                            "missing_terms": miss_head,
+                            "missing_terms_truncated": bool(len(missing_terms) > len(miss_head)),
+                            "k": int(kk),
+                            "activated_count": int(len(activated_ids)),
+                            "activated": (activated_ids or [])[:20],
+                        })
 
                 # Candidate commit injection for MERGE/FINAL (fair across methods).
                 try:
@@ -4540,6 +4671,14 @@ class ToolLoopLLMAgent:
                 print(f"[{run_tag}][{method}][{task_id}] NO_FINISH steps={result['steps']} tok={result['usage'].get('total_tokens')} tools={result['tool_stats']['tool_calls_total']} elapsed={elapsed:.1f}s")
             return result
         finally:
+            self._write_internal_graph_snapshot(
+                task_id=task_id,
+                method=method,
+                run_tag=run_tag,
+                step=int(last_step_snapshot),
+                snapshot_kind="final",
+            )
+            self._close_internal_graph_log()
             self._close_trace()
 
 

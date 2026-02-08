@@ -71,6 +71,7 @@ def run_llm(
     # Debug
     verbose_steps: bool = False,
     log_dir: Optional[str] = None,
+    save_goc_internal_graph: bool = False,
 
     # Parallelization
     # - parallel_tasks: run tasks concurrently (thread pool).
@@ -276,6 +277,9 @@ def run_llm(
     # --- Resume support ---
     out_path = Path(out_results_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_graph_dir = out_path.parent / "graphs_internal"
+    if bool(save_goc_internal_graph):
+        internal_graph_dir.mkdir(parents=True, exist_ok=True)
     done_keys = set()  # (method, task_id)
     if resume and out_path.exists():
         try:
@@ -318,6 +322,8 @@ def run_llm(
                 log_dir=log_dir,
                 log_messages=bool(trace_messages),
                 log_message_chars=int(trace_message_chars or 0),
+                save_goc_internal_graph=bool(save_goc_internal_graph),
+                goc_internal_graph_dir=str(internal_graph_dir) if bool(save_goc_internal_graph) else None,
                 prompt_context_chars=prompt_context_chars,
                 log_context_chars=log_context_chars,
                 log_output_chars=int(trace_output_chars or 0),
@@ -401,6 +407,11 @@ def run_llm(
             controller_llm=controller_llm,
             bandit_controller=bandit_ctl,
         )
+        internal_graph_path = (
+            str(internal_graph_dir / f"{t.id}.jsonl")
+            if bool(save_goc_internal_graph)
+            else None
+        )
         try:
             out = agent.run(
                 t.question,
@@ -432,6 +443,7 @@ def run_llm(
                 "explanation": expl,
                 "run_tag": run_tag,
                 "retriever_kind": retriever_kind,
+                "goc_internal_graph_jsonl_path": internal_graph_path,
             }
         except Exception as e:
             return {
@@ -453,6 +465,7 @@ def run_llm(
                 "explanation": "",
                 "run_tag": run_tag,
                 "retriever_kind": retriever_kind,
+                "goc_internal_graph_jsonl_path": internal_graph_path,
                 "error": str(e),
             }
 

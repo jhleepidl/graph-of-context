@@ -677,6 +677,10 @@ def run_goc_heuristic(
     open_split_mode: str = "all_union_rank",
     open_split_hop1: int = 0,
     open_policy: str = "current",
+    save_internal_graph: bool = False,
+    internal_budget_active: int = 1200,
+    internal_budget_unfold: int = 650,
+    internal_unfold_k: int = 8,
 ) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
     errors: List[str] = []
     fallback_prediction = {
@@ -715,6 +719,116 @@ def run_goc_heuristic(
     meta_avoided_count = 0
     fallback_reason: str | None = None
     hop2_pool_used_count = 0
+    goc_internal_snapshots: List[Dict[str, Any]] = []
+    goc_internal_mem = None
+
+    if save_internal_graph:
+        try:
+            from src.memory import GoCMemory  # type: ignore
+        except Exception:
+            GoCMemory = None  # type: ignore
+        if GoCMemory is not None:
+            try:
+                goc_internal_mem = GoCMemory(
+                    budget_active=int(internal_budget_active),
+                    budget_unfold=int(internal_budget_unfold),
+                    unfold_k=int(internal_unfold_k),
+                )
+            except Exception:
+                goc_internal_mem = None
+
+    def _append_internal_snapshot(kind: str) -> None:
+        if goc_internal_mem is None:
+            return
+        try:
+            snap = goc_internal_mem.snapshot()  # type: ignore[attr-defined]
+            if not isinstance(snap, dict):
+                return
+            snap["snapshot_kind"] = str(kind)
+            snap["snapshot_idx"] = int(len(goc_internal_snapshots) + 1)
+            goc_internal_snapshots.append(snap)
+        except Exception:
+            pass
+
+    def _record_internal_tool(
+        tool_name: str,
+        args_obj: Dict[str, Any],
+        observation: str,
+        *,
+        docids: Optional[List[str]] = None,
+        storage_text: Optional[str] = None,
+    ) -> None:
+        if goc_internal_mem is None:
+            return
+        try:
+            goc_internal_mem.record_tool(  # type: ignore[attr-defined]
+                tool_name=str(tool_name),
+                args=dict(args_obj or {}),
+                observation=str(observation or ""),
+                docids=[str(d) for d in (docids or []) if d],
+                storage_text=storage_text,
+            )
+            _append_internal_snapshot("step")
+        except Exception:
+            pass
+
+    if goc_internal_mem is not None:
+        _orig_search = env.search
+        _orig_open = env.open
+
+        def _search_wrapped(
+            query: str,
+            filters: Optional[Dict[str, Any]] = None,
+            top_k: int = 10,
+        ) -> List[Dict[str, Any]]:
+            results = _orig_search(query=query, filters=filters, top_k=top_k)
+            try:
+                lines: List[str] = []
+                q_docids: List[str] = []
+                for item in results[:20]:
+                    cid = item.get("clause_id")
+                    if cid:
+                        q_docids.append(str(cid))
+                    score = item.get("score")
+                    snippet = str(item.get("snippet") or "").replace("\n", " ").strip()
+                    if len(snippet) > 220:
+                        snippet = snippet[:220] + "..."
+                    lines.append(f"clause_id={cid} | score={score} | {snippet}")
+                _record_internal_tool(
+                    "search",
+                    {"query": query, "filters": filters or {}, "top_k": int(top_k)},
+                    "\n".join(lines) if lines else "[]",
+                    docids=q_docids,
+                )
+            except Exception:
+                pass
+            return results
+
+        def _open_wrapped(clause_id: str) -> Dict[str, Any]:
+            opened = _orig_open(clause_id=clause_id)
+            try:
+                clause_obj = env.world.clauses.get(clause_id)
+                doc_ref = str(getattr(clause_obj, "doc_id", "") or "")
+                obs_lines = [f"CLAUSE_ID: {clause_id}"]
+                if doc_ref:
+                    obs_lines.append(f"DOC_ID: {doc_ref}")
+                obs_lines.append(f"TEXT: {str(opened.get('text') or '')[:800]}")
+                docids = [str(clause_id)]
+                if doc_ref:
+                    docids.append(doc_ref)
+                _record_internal_tool(
+                    "open_page",
+                    {"clause_id": clause_id},
+                    "\n".join(obs_lines),
+                    docids=docids,
+                    storage_text=str(opened.get("text") or ""),
+                )
+            except Exception:
+                pass
+            return opened
+
+        env.search = _search_wrapped  # type: ignore[assignment]
+        env.open = _open_wrapped  # type: ignore[assignment]
 
     def _strip_ticket(text: str) -> str:
         lowered = text.lower()
@@ -1297,4 +1411,7 @@ def run_goc_heuristic(
     if rerank_scores is not None:
         diag["rerank_used"] = True
         diag["rerank_top_score"] = max(rerank_scores.values()) if rerank_scores else None
+    if save_internal_graph:
+        _append_internal_snapshot("final")
+        diag["goc_internal_snapshots"] = list(goc_internal_snapshots)
     return prediction, opened_ids, prompt, raw_output, error, controller_action, diag

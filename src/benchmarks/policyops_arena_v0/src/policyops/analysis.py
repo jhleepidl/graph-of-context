@@ -226,6 +226,16 @@ def summarize_context_budget_sweep(
                 )
                 if metrics.get("goc_folded_episode_count_mean") is not None
                 else _mean_from_records("goc_folded_episode_count"),
+                "closure_recall_core_mean": metrics.get(
+                    "closure_recall_core_mean"
+                )
+                if metrics.get("closure_recall_core_mean") is not None
+                else _mean_from_records("closure_recall_core"),
+                "wrong_branch_recall_rate_mean": metrics.get(
+                    "wrong_branch_recall_rate_mean"
+                )
+                if metrics.get("wrong_branch_recall_rate_mean") is not None
+                else _mean_from_records("wrong_branch_recall_rate"),
                 "judge_accuracy": metrics.get("judge_accuracy"),
                 "_sort_key": sort_key,
                 "_run_id": payload.get("run_id") or path.stem,
@@ -371,6 +381,8 @@ def summarize_context_budget_sweep(
         "goc_unfolded_clause_count_mean",
         "goc_unfolded_critical_clause_count_mean",
         "goc_folded_episode_count_mean",
+        "closure_recall_core_mean",
+        "wrong_branch_recall_rate_mean",
         "full_episode_supporting_count_mean",
         "judge_accuracy",
     ]

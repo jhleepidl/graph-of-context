@@ -29,6 +29,7 @@ def main():
 
     ap.add_argument("--verbose_steps", action="store_true")
     ap.add_argument("--log_dir", type=str, default=None)
+    ap.add_argument("--save_goc_internal_graph", action="store_true")
 
     ap.add_argument("--prompt_context_chars", type=int, default=0)
     ap.add_argument("--log_context_chars", type=int, default=2500)
@@ -65,6 +66,7 @@ def main():
         faiss_dim=args.faiss_dim,
         verbose_steps=args.verbose_steps,
         log_dir=args.log_dir,
+        save_goc_internal_graph=bool(args.save_goc_internal_graph),
     )
     print("Done:", res)
 

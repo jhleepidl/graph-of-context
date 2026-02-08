@@ -178,6 +178,7 @@ def main():
     ap.add_argument("--trace_output_chars", type=int, default=4000, help="Char cap for raw model outputs stored in traces (llm_attempts).")
     ap.add_argument("--prompt_context_chars", type=int, default=0, help="Optional char-level truncation for ACTIVE_CONTEXT in the LLM prompt (0 = no extra truncation).")
     ap.add_argument("--log_context_chars", type=int, default=2500, help="Char-level tail truncation for traces/logs (does not affect prompt when prompt_context_chars==0).")
+    ap.add_argument("--save_goc_internal_graph", action="store_true", help="Write step/final GoC internal snapshots to <out_dir>/graphs_internal/<task_id>.jsonl.")
 
     # output
     ap.add_argument(
@@ -340,6 +341,7 @@ def main():
             faiss_dim=args.faiss_dim,
             verbose_steps=args.verbose_steps,
             log_dir=log_dir,
+            save_goc_internal_graph=bool(args.save_goc_internal_graph),
             trace_messages=args.trace_messages,
             trace_message_chars=args.trace_message_chars,
             trace_output_chars=args.trace_output_chars,

@@ -563,6 +563,16 @@ class GoCMemory(MemoryManagerBase):
     fold_mincut_lambda_max: float = 1e6
     fold_mincut_iters: int = 22
 
+    # Optional utility-aware soft-anchor protection (disabled by default for
+    # backward compatibility).
+    # When enabled, fold candidate selection avoids nodes whose keep_score is
+    # above `fold_keep_score_threshold`.
+    fold_soft_anchor: bool = False
+    # "Very recent" window used by keep_score feature extraction.
+    fold_keep_recent_steps: int = 8
+    # Nodes with keep_score >= threshold are treated as soft-protected.
+    fold_keep_score_threshold: float = 0.8
+
     # Folding policy selector.
     # - "budget": token-weighted min-cut folding driven by budget_active (default).
     # - "pef_url": Page-Episode Folding (PEF) for BrowserGym/WebArena: fold primarily on URL changes.
@@ -652,6 +662,67 @@ class GoCMemory(MemoryManagerBase):
         # DEF(doc) state
         self._dfs_last_docid = None
         self._dfs_episode_start_pos = 0
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a JSON-serializable snapshot of the GoC internal graph state."""
+        etypes = ("depends", "depends_llm", "doc_ref", "seq")
+
+        snap_nodes: Dict[str, Dict[str, Any]] = {}
+        ordered_nodes = sorted(
+            self.nodes.items(),
+            key=lambda kv: (int(kv[1].step_idx), str(kv[0])),
+        )
+        for nid, n in ordered_nodes:
+            text = n.text or ""
+            entry: Dict[str, Any] = {
+                "kind": str(n.kind),
+                "thread": str(n.thread),
+                "step_idx": int(n.step_idx),
+                "token_len": int(n.token_len),
+                "docids": list(n.docids or []),
+                "ttl": int(n.ttl) if n.ttl is not None else None,
+                "text_preview": text[:200],
+                "has_storage_text": bool(n.storage_text),
+            }
+
+            if n.children:
+                entry["children"] = list(n.children)
+            if n.parent:
+                entry["parent"] = str(n.parent)
+
+            proxy_depth = int(self._node_proxy_depth(nid))
+            if proxy_depth <= 0 and (
+                text.startswith("[DOC_EPISODE_PROXY")
+                or text.startswith("[EPISODE_PROXY")
+                or text.startswith("[BRANCH_PROXY")
+                or bool(n.children)
+            ):
+                proxy_depth = 1
+            if proxy_depth > 0:
+                entry["proxy_depth"] = int(proxy_depth)
+
+            snap_nodes[str(nid)] = entry
+
+        snap_edges: Dict[str, Dict[str, List[str]]] = {}
+        for et in etypes:
+            out_map = self.edges_out.get(et, {})
+            adj: Dict[str, List[str]] = {}
+            for u in sorted(out_map.keys()):
+                vs = sorted(v for v in out_map.get(u, set()) if v in self.nodes)
+                if vs:
+                    adj[str(u)] = [str(v) for v in vs]
+            snap_edges[str(et)] = adj
+
+        return {
+            "global_step": int(self._global_step),
+            "budget_active": int(self.budget_active),
+            "budget_unfold": int(self.budget_unfold),
+            "active_tokens": int(self.active_tokens()),
+            "active": [str(nid) for nid in self.active if nid in self.nodes],
+            "storage": [str(nid) for nid in self.storage if nid in self.nodes],
+            "nodes": snap_nodes,
+            "edges": snap_edges,
+        }
 
     # ---- graph helpers ----
     def _add_edge(self, etype: str, u: str, v: str):
@@ -1226,6 +1297,10 @@ class GoCMemory(MemoryManagerBase):
         chunk = [nid for nid in chunk if nid in self.nodes and (not self._is_anchor_node(nid))]
         if not chunk:
             return
+        active_before_set = set(self.active)
+        chunk_set = set(chunk)
+        cut_edges_count = self._count_cut_edges(chunk_set=chunk_set, active_set=active_before_set)
+        chunk_tokens = int(sum(int(self.nodes[n].token_len) for n in chunk if n in self.nodes))
         # Create proxy
         if docid:
             proxy_id = self._dfs_create_episode_proxy_node(chunk, docid)
@@ -1246,11 +1321,16 @@ class GoCMemory(MemoryManagerBase):
             "type": "fold",
             "mem": "GoC",
             "policy": str(self.fold_policy),
+            "fold_policy": str(self.fold_policy),
+            "fold_method": "dfs_episode_proxy" if docid else "dfs_proxy",
             "reason": reason,
             "docid": docid or "",
             "global_step": int(self._global_step),
             "chunk_size": int(len(chunk)),
-            "chunk_tokens": int(sum(int(self.nodes[n].token_len) for n in chunk if n in self.nodes)),
+            "chunk_tokens": int(chunk_tokens),
+            "removed_token_est": int(chunk_tokens),
+            "chosen_chunk": list(chunk),
+            "cut_edges_count": int(cut_edges_count),
             "active_tokens_before": int(before),
             "active_tokens_after": int(after),
             "proxy_id": proxy_id,
@@ -1627,6 +1707,87 @@ class GoCMemory(MemoryManagerBase):
             out |= set(self.edges_in.get(et, {}).get(nid, set()))
         return out & active_set
 
+    def _count_cut_edges(self, *, chunk_set: Set[str], active_set: Set[str]) -> int:
+        """Count unique ACTIVE boundary pairs cut by separating chunk_set."""
+        boundary_pairs: Set[frozenset] = set()
+        for et in ("depends", "depends_llm", "doc_ref", "seq"):
+            out_map = self.edges_out.get(et, {})
+            in_map = self.edges_in.get(et, {})
+            for u in chunk_set:
+                neigh = (set(out_map.get(u, set())) | set(in_map.get(u, set()))) & active_set
+                for v in neigh:
+                    if v in chunk_set or v == u:
+                        continue
+                    pair = frozenset((u, v))
+                    if len(pair) == 2:
+                        boundary_pairs.add(pair)
+        return int(len(boundary_pairs))
+
+    def _compute_keep_scores(self, candidates: List[str], *, active_set: Set[str]) -> Dict[str, float]:
+        """Compute per-node keep_score used by soft-anchor folding.
+
+        Feature design (simple, deterministic):
+        - summary node => high keep score
+        - TITLE:* doc_ref key => medium
+        - referenced by depends/depends_llm from recent nodes => medium
+        - very recent nodes (global step window) => medium
+        - otherwise low base score
+        """
+        scores: Dict[str, float] = {}
+        if not candidates:
+            return scores
+
+        now_step = int(self._global_step)
+        recent_steps = max(0, int(getattr(self, "fold_keep_recent_steps", 0) or 0))
+
+        recent_sources: Set[str] = set()
+        if recent_steps > 0:
+            for nid, n in self.nodes.items():
+                try:
+                    age = now_step - int(n.step_idx)
+                except Exception:
+                    continue
+                if age <= recent_steps:
+                    recent_sources.add(nid)
+
+        dep_in = self.edges_in.get("depends", {})
+        dep_llm_in = self.edges_in.get("depends_llm", {})
+
+        for nid in candidates:
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+
+            score = 0.10  # low baseline
+
+            # kind == summary => high.
+            if str(n.kind) == "summary":
+                score += 0.90
+
+            # TITLE:* key => medium.
+            if any(str(d).startswith("TITLE:") for d in (n.docids or [])):
+                score += 0.35
+
+            # Very recent node => medium.
+            if recent_steps > 0:
+                try:
+                    if (now_step - int(n.step_idx)) <= recent_steps:
+                        score += 0.35
+                except Exception:
+                    pass
+
+            # Referenced by recent depends/depends_llm source => medium.
+            if recent_sources:
+                parents = set(dep_in.get(nid, set())) | set(dep_llm_in.get(nid, set()))
+                if parents & recent_sources:
+                    score += 0.35
+
+            # Keep score in a stable bounded range.
+            score = max(0.0, min(1.0, float(score)))
+            scores[nid] = score
+
+        return scores
+
     # ---- token-weighted min-cut folding ----
     def _cut_edge_weight(self, u: str, v: str) -> float:
         """Undirected edge weight between two nodes, aggregating edge types.
@@ -1822,10 +1983,11 @@ class GoCMemory(MemoryManagerBase):
 
         return list(best[0])
 
-    def _prune_oldest_non_summary_to_storage(self):
+    def _prune_oldest_non_summary_to_storage(self, *, protected: Optional[Set[str]] = None):
         """As a last resort, prune the oldest node while preserving anchors."""
         if len(self.active) <= 1:
             return
+        protected_set: Set[str] = set(protected or set())
         # protect the most recent node
         prefix = self.active[:-1]
 
@@ -1833,7 +1995,7 @@ class GoCMemory(MemoryManagerBase):
         idx = None
         for i, nid in enumerate(prefix):
             n = self.nodes.get(nid)
-            if not n or self._is_anchor_node(nid):
+            if (nid in protected_set) or (not n) or self._is_anchor_node(nid):
                 continue
             if n.kind != "summary":
                 idx = i
@@ -1842,11 +2004,20 @@ class GoCMemory(MemoryManagerBase):
         # 2) Else prune the oldest non-anchor summary.
         if idx is None:
             for i, nid in enumerate(prefix):
+                if (nid in protected_set):
+                    continue
                 if nid in self.nodes and (not self._is_anchor_node(nid)):
                     idx = i
                     break
 
-        # 3) If everything is an anchor, prune the oldest anchor as a last-last resort.
+        # 3) If everything is anchor/protected, prune the oldest non-protected node.
+        if idx is None:
+            for i, nid in enumerate(prefix):
+                if nid not in protected_set:
+                    idx = i
+                    break
+
+        # 4) Last-last resort: prune the oldest node.
         if idx is None:
             idx = 0
         nid = self.active.pop(idx)
@@ -1884,15 +2055,40 @@ class GoCMemory(MemoryManagerBase):
             max_chunk = int(self.fold_max_chunk or 10)
 
             # Candidate window: oldest nodes only (avoid folding the latest context).
+            active_set = set(self.active)
             window = [nid for nid in prefix if nid in self.nodes][: max(1, int(self.fold_window_max))]
             candidates = [nid for nid in window if not self._is_anchor_node(nid)]
+            soft_anchor_enabled = bool(getattr(self, "fold_soft_anchor", False))
+            keep_score_threshold = float(getattr(self, "fold_keep_score_threshold", 0.0) or 0.0)
+            keep_scores: Dict[str, float] = {}
+            protected_high_keep: Set[str] = set()
+            if soft_anchor_enabled and candidates:
+                keep_scores = self._compute_keep_scores(candidates, active_set=active_set)
+                protected_high_keep = {
+                    nid
+                    for nid in candidates
+                    if float(keep_scores.get(nid, 0.0)) >= keep_score_threshold
+                }
+                candidates = [nid for nid in candidates if nid not in protected_high_keep]
 
             if not candidates:
-                # Nothing foldable in the window; prune (will preserve anchors if possible).
-                self._prune_oldest_non_summary_to_storage()
+                # Nothing foldable in the window; prune (preserving protected nodes when possible).
+                if soft_anchor_enabled and protected_high_keep:
+                    try:
+                        self._emit_event({
+                            "type": "fold_soft_anchor_skip",
+                            "mem": "GoC",
+                            "global_step": int(self._global_step),
+                            "protected_high_keep_count": int(len(protected_high_keep)),
+                            "fold_keep_score_threshold": float(keep_score_threshold),
+                            "fold_policy": str(self.fold_policy),
+                            "fold_method": str(self.fold_method),
+                        })
+                    except Exception:
+                        pass
+                self._prune_oldest_non_summary_to_storage(protected=protected_high_keep if soft_anchor_enabled else None)
                 continue
 
-            active_set = set(self.active)
             seed = candidates[0]
 
             # Select chunk: token-weighted min-cut (default) or greedy fallback.
@@ -1982,11 +2178,10 @@ class GoCMemory(MemoryManagerBase):
             if chunk:
                 before = self.active_tokens()
                 # ----- trace fold decision (optional) -----
+                boundary_pairs: Set[frozenset] = set()
+                internal_pairs: Set[frozenset] = set()
                 try:
                     chunk_set = set(chunk)
-                    outside_set = set(self.active) - chunk_set
-                    boundary_pairs: Set[frozenset] = set()
-                    internal_pairs: Set[frozenset] = set()
                     for et in ("depends", "depends_llm", "doc_ref", "seq"):
                         out_map = self.edges_out.get(et, {})
                         in_map = self.edges_in.get(et, {})
@@ -2006,7 +2201,10 @@ class GoCMemory(MemoryManagerBase):
                                     internal_pairs.add(pair)
                                 else:
                                     boundary_pairs.add(pair)
-
+                except Exception:
+                    pass
+                proxy_id = self._create_proxy_node(chunk)
+                try:
                     self._emit_event({
                         "type": "fold",
                         "mem": "GoC",
@@ -2014,15 +2212,40 @@ class GoCMemory(MemoryManagerBase):
                         "budget_active": int(self.budget_active),
                         "overflow_tokens": int(overflow),
                         "target_remove_tokens": int(target_remove),
-                        "chunk_size": len(chunk),
+                        "chunk_size": int(len(chunk)),
                         "chunk_tokens": int(removed),
-                        "cut_edges": len(boundary_pairs),
-                        "internal_edges": len(internal_pairs),
+                        "removed_token_est": int(removed),
+                        "cut_edges": int(len(boundary_pairs)),
+                        "cut_edges_count": int(len(boundary_pairs)),
+                        "internal_edges": int(len(internal_pairs)),
                         "chunk_node_ids": chunk[:50],
+                        "chosen_chunk": list(chunk),
+                        "proxy_id": proxy_id,
+                        "fold_policy": str(self.fold_policy),
+                        "fold_method": str(self.fold_method),
+                        "fold_soft_anchor": bool(soft_anchor_enabled),
+                        "fold_keep_score_threshold": float(keep_score_threshold),
+                        "high_keep_candidates_count": int(len(protected_high_keep)),
+                        "high_keep_protected_count": int(len(protected_high_keep)),
+                        "high_keep_folded_count": int(
+                            sum(
+                                1
+                                for nid in chunk
+                                if float(keep_scores.get(nid, 0.0)) >= keep_score_threshold
+                            )
+                        ),
+                        "protected_high_keep_ids": list(sorted(protected_high_keep))[:30],
+                        "chunk_keep_score_avg": (
+                            float(
+                                sum(float(keep_scores.get(nid, 0.0)) for nid in chunk)
+                                / max(1, len(chunk))
+                            )
+                            if keep_scores
+                            else 0.0
+                        ),
                     })
                 except Exception:
                     pass
-                proxy_id = self._create_proxy_node(chunk)
                 # Remove folded nodes from active and keep proxy active
                 self._replace_prefix_with_proxy(chunk, proxy_id)
                 # Move children to storage (lossless)
@@ -2033,11 +2256,11 @@ class GoCMemory(MemoryManagerBase):
                 after = self.active_tokens()
                 # If folding didn't reduce anything (should be rare), prune one node to avoid infinite loops.
                 if after >= before:
-                    self._prune_oldest_non_summary_to_storage()
+                    self._prune_oldest_non_summary_to_storage(protected=protected_high_keep if soft_anchor_enabled else None)
                 continue
 
             # Fallback pruning: keep summaries as anchors
-            self._prune_oldest_non_summary_to_storage()
+            self._prune_oldest_non_summary_to_storage(protected=protected_high_keep if soft_anchor_enabled else None)
 
         # Incrementally index any newly stored nodes (buffer retriever keeps them searchable immediately).
         if newly_stored:
@@ -2385,7 +2608,11 @@ class GoCMemory(MemoryManagerBase):
                     "k": int(kk),
                     "budget_unfold": int(self.budget_unfold),
                     "chosen_seed_ids": chosen_seed_ids[:30],
+                    "chosen_nodes_count": int(len(chosen_nodes)),
+                    "candidate_count": int(len(seed_ids or [])),
+                    "used_tokens_est": int(used),
                     "activated": activated[:30],
+                    "activated_count": int(len(activated)),
                 })
         except Exception:
             pass
@@ -2460,9 +2687,12 @@ class GoCMemory(MemoryManagerBase):
                 "query": query,
                 "k": int(k),
                 "budget_unfold": int(self.budget_unfold),
+                "candidate_count": int(len(candidates)),
                 "chosen_seed_ids": chosen_seed_ids[:30],
+                "chosen_nodes_count": int(len(chosen_nodes)),
                 "used_tokens_est": int(used_tokens),
                 "activated": activated[:30],
+                "activated_count": int(len(activated)),
             }
             if bool(getattr(self, "trace_unfold_candidates", False)):
                 ev["candidates"] = candidates[: min(40, len(candidates))]

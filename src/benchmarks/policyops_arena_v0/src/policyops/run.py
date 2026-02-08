@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 
 from .baselines import (
     DummyClient,
@@ -225,6 +225,177 @@ def _extract_clause_ids(results: Any) -> List[str]:
             if cid:
                 ids.append(str(cid))
     return ids
+
+
+def _unique_strs(values: List[Any]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for val in values:
+        if val is None:
+            continue
+        sval = str(val).strip()
+        if not sval or sval in seen:
+            continue
+        seen.add(sval)
+        out.append(sval)
+    return out
+
+
+def _clause_docid_map(world: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    clauses = getattr(world, "clauses", {}) if world is not None else {}
+    if not isinstance(clauses, dict):
+        return out
+    for cid, clause in clauses.items():
+        doc_id = str(getattr(clause, "doc_id", "") or "").strip()
+        if doc_id:
+            out[str(cid)] = doc_id
+    return out
+
+
+def _world_docid_set(world: Any) -> Set[str]:
+    return set(_clause_docid_map(world).values())
+
+
+def _clause_ids_to_doc_ids(clause_ids: List[str], world: Any) -> List[str]:
+    cmap = _clause_docid_map(world)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for cid in clause_ids:
+        did = cmap.get(str(cid))
+        if not did or did in seen:
+            continue
+        seen.add(did)
+        out.append(did)
+    return out
+
+
+def _pick_final_snapshot(snapshots: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not snapshots:
+        return None
+    for snap in reversed(snapshots):
+        if not isinstance(snap, dict):
+            continue
+        if str(snap.get("snapshot_kind", "")).lower() == "final":
+            return snap
+    for snap in reversed(snapshots):
+        if isinstance(snap, dict):
+            return snap
+    return None
+
+
+def _extract_active_from_snapshot(
+    snapshot: Dict[str, Any] | None,
+    world: Any,
+) -> Tuple[List[str], List[str], List[str]]:
+    if not isinstance(snapshot, dict):
+        return [], [], []
+    nodes = snapshot.get("nodes")
+    if not isinstance(nodes, dict):
+        nodes = {}
+    active_node_ids = _unique_strs(list(snapshot.get("active") or []))
+
+    clause_ids: List[str] = []
+    doc_ids: List[str] = []
+    seen_clause: Set[str] = set()
+    seen_doc: Set[str] = set()
+    world_clause_ids = (
+        {str(k) for k in getattr(world, "clauses", {}).keys()}
+        if world is not None
+        else set()
+    )
+    world_doc_ids = _world_docid_set(world)
+
+    for nid in active_node_ids:
+        node = nodes.get(nid)
+        if not isinstance(node, dict):
+            continue
+        for raw in list(node.get("docids") or []):
+            d = str(raw).strip()
+            if not d:
+                continue
+            if d in world_clause_ids and d not in seen_clause:
+                seen_clause.add(d)
+                clause_ids.append(d)
+            if d in world_doc_ids and d not in seen_doc:
+                seen_doc.add(d)
+                doc_ids.append(d)
+        if node.get("docids"):
+            continue
+        text_preview = str(node.get("text_preview", "") or "")
+        m = re.search(r"CLAUSE_ID:\s*([^\s|]+)", text_preview)
+        if m:
+            cid = str(m.group(1)).strip()
+            if cid in world_clause_ids and cid not in seen_clause:
+                seen_clause.add(cid)
+                clause_ids.append(cid)
+
+    # Ensure doc ids include clause->doc mapping for recalled clause ids.
+    for did in _clause_ids_to_doc_ids(clause_ids, world):
+        if did not in seen_doc:
+            seen_doc.add(did)
+            doc_ids.append(did)
+    return active_node_ids, clause_ids, doc_ids
+
+
+def _match_snapshot_nodes_for_clause_ids(
+    snapshot: Dict[str, Any] | None,
+    clause_ids: List[str],
+) -> Tuple[List[str], List[str]]:
+    if not isinstance(snapshot, dict):
+        return [], []
+    nodes = snapshot.get("nodes")
+    if not isinstance(nodes, dict):
+        return [], []
+    clause_set = set(str(cid) for cid in clause_ids if cid)
+    if not clause_set:
+        return [], []
+    matched_nodes: List[str] = []
+    matched_docids: List[str] = []
+    seen_nodes: Set[str] = set()
+    seen_docids: Set[str] = set()
+    for nid, node in nodes.items():
+        if not isinstance(node, dict):
+            continue
+        node_docids = [str(d) for d in (node.get("docids") or []) if d]
+        if not (clause_set & set(node_docids)):
+            continue
+        nid_s = str(nid)
+        if nid_s not in seen_nodes:
+            seen_nodes.add(nid_s)
+            matched_nodes.append(nid_s)
+        for d in node_docids:
+            if d not in seen_docids:
+                seen_docids.add(d)
+                matched_docids.append(d)
+    return matched_nodes, matched_docids
+
+
+def _is_threaded_or_bridged(mode: str | None) -> bool:
+    if not isinstance(mode, str):
+        return False
+    return mode.startswith("threaded_") or mode.startswith("bridged_")
+
+
+def _is_non_winning_branch_clause(task: Any, world: Any, clause_id: str) -> bool:
+    clause = world.clauses.get(clause_id) if world and getattr(world, "clauses", None) else None
+    if clause is None:
+        return False
+
+    distractor = getattr(task, "branch_distractor_clause_id", None)
+    if distractor and str(clause_id) == str(distractor):
+        return True
+
+    slot = task.context.get("slot") if isinstance(getattr(task, "context", None), dict) else None
+    bridge_for_slot = getattr(clause, "bridge_for_slot", None)
+    if slot and bridge_for_slot and str(bridge_for_slot) != str(slot):
+        return True
+
+    doc_id = str(getattr(clause, "doc_id", "") or "")
+    if doc_id.startswith("DECOY"):
+        return True
+
+    return False
 
 
 def _min_rank(results: List[Dict[str, Any]], target_ids: List[str]) -> int | None:
@@ -1373,6 +1544,8 @@ def _evaluate_method(
         goc_graph_path: Path | None = None
         goc_graph_task_path: Path | None = None
         goc_graph_dot_path: Path | None = None
+        goc_internal_graph_task_path: Path | None = None
+        goc_internal_snapshots: List[Dict[str, Any]] = []
         log_graph = False
         if method == "goc" and args.save_goc_graph:
             if args.goc_graph_sample_rate >= 1.0:
@@ -1385,6 +1558,7 @@ def _evaluate_method(
                 log_graph = bucket <= float(args.goc_graph_sample_rate)
         if log_graph:
             goc_graph = GoCGraph(goc_graph_version=args.goc_graph_schema)
+            goc_internal_graph_task_path = run_dir / "graphs_internal" / f"{task.task_id}.jsonl"
             if args.goc_graph_dir and args.goc_graph_dir.endswith(".jsonl"):
                 goc_graph_path = Path(args.goc_graph_dir)
                 goc_graph_task_path = run_dir / "graphs" / f"{task.task_id}.jsonl"
@@ -1789,7 +1963,15 @@ def _evaluate_method(
                 open_split_mode=getattr(args, "open_split_mode", "all_union_rank"),
                 open_split_hop1=int(getattr(args, "open_split_hop1", 0)),
                 open_policy=getattr(args, "open_policy", "current"),
+                save_internal_graph=bool(log_graph),
+                internal_budget_active=1200,
+                internal_budget_unfold=650,
+                internal_unfold_k=8,
             )
+            if isinstance(diag, dict):
+                maybe_snaps = diag.get("goc_internal_snapshots")
+                if isinstance(maybe_snaps, list):
+                    goc_internal_snapshots = [s for s in maybe_snaps if isinstance(s, dict)]
             if controller_action:
                 controller_actions[controller_action] = controller_actions.get(controller_action, 0) + 1
         elif method == "similarity_only":
@@ -2125,6 +2307,93 @@ def _evaluate_method(
                 clause = world.clauses.get(cid)
                 if clause and str(clause.doc_id).startswith("DECOY"):
                     opened_decoy_clause_count += 1
+        capture_goc_advantages = method in {"goc", "similarity_only"}
+        opened_for_prompt_clause_ids = (
+            list(diag.get("opened_for_prompt_clause_ids") or [])
+            if isinstance(diag, dict) and isinstance(diag.get("opened_for_prompt_clause_ids"), list)
+            else []
+        )
+        opened_total_clause_ids = (
+            list(diag.get("opened_total_clause_ids") or [])
+            if isinstance(diag, dict) and isinstance(diag.get("opened_total_clause_ids"), list)
+            else []
+        )
+        opened_evidence_clause_ids = _unique_strs(
+            opened_total_clause_ids or opened_for_prompt_clause_ids or list(opened_ids)
+        )
+        opened_evidence_doc_ids = _clause_ids_to_doc_ids(opened_evidence_clause_ids, world)
+        active_context_node_ids: List[str] = []
+        active_context_clause_ids: List[str] = []
+        active_context_doc_ids: List[str] = []
+        unfolded_activated_node_ids: List[str] = []
+        unfolded_activated_clause_ids: List[str] = []
+        unfolded_activated_doc_ids: List[str] = []
+        closure_recalled_clause_ids: List[str] = []
+        closure_recall_core: float | None = None
+        wrong_branch_recall_rate: float | None = None
+        if capture_goc_advantages:
+            final_internal_snapshot = _pick_final_snapshot(goc_internal_snapshots)
+            (
+                active_context_node_ids,
+                active_context_clause_ids,
+                active_context_doc_ids,
+            ) = _extract_active_from_snapshot(final_internal_snapshot, world)
+            if not active_context_clause_ids:
+                if threaded_mode and episode_id == 3 and e3_context_clause_ids:
+                    active_context_clause_ids = _unique_strs(list(e3_context_clause_ids))
+                elif opened_for_prompt_clause_ids:
+                    active_context_clause_ids = _unique_strs(opened_for_prompt_clause_ids)
+                else:
+                    active_context_clause_ids = _unique_strs(opened_evidence_clause_ids)
+            if not active_context_doc_ids:
+                active_context_doc_ids = _clause_ids_to_doc_ids(active_context_clause_ids, world)
+
+            if method == "goc":
+                unfolded_from_diag = (
+                    list(diag.get("goc_unfold_selected_clause_ids") or [])
+                    if isinstance(diag, dict)
+                    and isinstance(diag.get("goc_unfold_selected_clause_ids"), list)
+                    else []
+                )
+                unfolded_activated_clause_ids = _unique_strs(
+                    unfolded_from_diag or list(goc_unfold_selected_clause_ids)
+                )
+                (
+                    unfolded_activated_node_ids,
+                    unfolded_docids_from_nodes,
+                ) = _match_snapshot_nodes_for_clause_ids(
+                    final_internal_snapshot,
+                    unfolded_activated_clause_ids,
+                )
+                if not unfolded_activated_node_ids and unfolded_activated_clause_ids:
+                    unfolded_activated_node_ids = list(unfolded_activated_clause_ids)
+                world_doc_ids = _world_docid_set(world)
+                unfolded_activated_doc_ids = _unique_strs(
+                    _clause_ids_to_doc_ids(unfolded_activated_clause_ids, world)
+                    + [d for d in unfolded_docids_from_nodes if d in world_doc_ids]
+                )
+
+            closure_recalled_clause_ids = _unique_strs(
+                unfolded_activated_clause_ids + active_context_clause_ids
+            )
+            if gold_core_ids:
+                core_set = set(_unique_strs(gold_core_ids))
+                closure_recall_core = (
+                    len(core_set & set(closure_recalled_clause_ids)) / float(len(core_set))
+                    if core_set
+                    else None
+                )
+            if _is_threaded_or_bridged(scenario_mode):
+                recall_ids = closure_recalled_clause_ids or unfolded_activated_clause_ids
+                if recall_ids:
+                    wrong_branch_hits = sum(
+                        1
+                        for cid in recall_ids
+                        if _is_non_winning_branch_clause(task, world, str(cid))
+                    )
+                    wrong_branch_recall_rate = wrong_branch_hits / float(len(recall_ids))
+                else:
+                    wrong_branch_recall_rate = 0.0
         record: Dict[str, Any] = {
             "task_id": task.task_id,
             "method": method,
@@ -2243,6 +2512,17 @@ def _evaluate_method(
             "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
             "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
             "goc_unfold_reason": goc_unfold_reason,
+            "opened_evidence_clause_ids": opened_evidence_clause_ids,
+            "opened_evidence_doc_ids": opened_evidence_doc_ids,
+            "active_context_node_ids": active_context_node_ids,
+            "active_context_clause_ids": active_context_clause_ids,
+            "active_context_doc_ids": active_context_doc_ids,
+            "unfolded_activated_node_ids": unfolded_activated_node_ids,
+            "unfolded_activated_clause_ids": unfolded_activated_clause_ids,
+            "unfolded_activated_doc_ids": unfolded_activated_doc_ids,
+            "closure_recalled_clause_ids": closure_recalled_clause_ids,
+            "closure_recall_core": closure_recall_core,
+            "wrong_branch_recall_rate": wrong_branch_recall_rate,
             "min_gold_core_rank_hop2": min_gold_core_rank_hop2,
             "min_gold_core_rank_union": min_gold_core_rank_union,
             "min_gold_winning_rank_hop2": min_gold_winning_rank_hop2,
@@ -2478,9 +2758,13 @@ def _evaluate_method(
             record["raw_path"] = str(raw_path)
         record["goc_graph_jsonl_path"] = str(goc_graph_task_path) if goc_graph_task_path else None
         record["goc_graph_dot_path"] = str(goc_graph_dot_path) if goc_graph_dot_path else None
+        record["goc_internal_graph_jsonl_path"] = (
+            str(goc_internal_graph_task_path) if goc_internal_graph_task_path else None
+        )
         if method == "goc" and getattr(args, "goc_graph_sample_rate", 1.0) <= 0.0:
             record["goc_graph_jsonl_path"] = None
             record["goc_graph_dot_path"] = None
+            record["goc_internal_graph_jsonl_path"] = None
         records.append(record)
 
         if threaded_mode and thread_state and episode_id:
@@ -3037,6 +3321,30 @@ def _evaluate_method(
                 record["goc_graph_dot_path"] = str(goc_graph_dot_path)
             if goc_graph_task_path:
                 record["goc_graph_jsonl_path"] = str(goc_graph_task_path)
+            if method == "goc" and goc_internal_graph_task_path:
+                snapshots = [s for s in (goc_internal_snapshots or []) if isinstance(s, dict)]
+                if not snapshots:
+                    try:
+                        from src.memory import GoCMemory
+
+                        _tmp_mem = GoCMemory(budget_active=1200, budget_unfold=650, unfold_k=8)
+                        _snap0 = _tmp_mem.snapshot()
+                        _snap0["snapshot_kind"] = "step"
+                        _snap0["snapshot_idx"] = 1
+                        _snapf = _tmp_mem.snapshot()
+                        _snapf["snapshot_kind"] = "final"
+                        _snapf["snapshot_idx"] = 2
+                        snapshots = [_snap0, _snapf]
+                    except Exception:
+                        snapshots = []
+                if snapshots:
+                    goc_internal_graph_task_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(goc_internal_graph_task_path, "w", encoding="utf-8") as fp:
+                        for snap in snapshots:
+                            fp.write(json.dumps(snap, ensure_ascii=False) + "\n")
+                    record["goc_internal_graph_jsonl_path"] = str(goc_internal_graph_task_path)
+                else:
+                    record["goc_internal_graph_jsonl_path"] = None
 
     aggregate = aggregate_metrics(metrics)
     aggregate["gold_decision_distribution"] = gold_decision_distribution(tasks)
@@ -3292,6 +3600,14 @@ def _evaluate_method(
     )
     aggregate["goc_folded_episode_count_mean"] = _mean_metric(
         "goc_folded_episode_count",
+        default=None,
+    )
+    aggregate["closure_recall_core_mean"] = _mean_metric(
+        "closure_recall_core",
+        default=None,
+    )
+    aggregate["wrong_branch_recall_rate_mean"] = _mean_metric(
+        "wrong_branch_recall_rate",
         default=None,
     )
     aggregate["judge_accuracy_packed_allcritical"] = _mean_metric(
@@ -3682,6 +3998,12 @@ def cmd_compare(args: argparse.Namespace) -> None:
                         "goc_folded_episode_count_mean": metrics.get(
                             "goc_folded_episode_count_mean"
                         ),
+                        "closure_recall_core_mean": metrics.get(
+                            "closure_recall_core_mean"
+                        ),
+                        "wrong_branch_recall_rate_mean": metrics.get(
+                            "wrong_branch_recall_rate_mean"
+                        ),
                     }
                 )
         if summary_rows:
@@ -3700,6 +4022,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 "goc_unfolded_clause_count_mean",
                 "goc_unfolded_critical_clause_count_mean",
                 "goc_folded_episode_count_mean",
+                "closure_recall_core_mean",
+                "wrong_branch_recall_rate_mean",
             ]
             with csv_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -3900,6 +4224,12 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "episode_commit_success_e2": method_report["metrics"].get("episode_commit_success_e2"),
             "episode_commit_success_e3": method_report["metrics"].get("episode_commit_success_e3"),
             "deep_rank_core_rate": method_report["metrics"].get("deep_rank_core_rate"),
+            "closure_recall_core_mean": method_report["metrics"].get(
+                "closure_recall_core_mean"
+            ),
+            "wrong_branch_recall_rate_mean": method_report["metrics"].get(
+                "wrong_branch_recall_rate_mean"
+            ),
             "min_gold_core_rank_union_mean": method_report["metrics"].get(
                 "min_gold_core_rank_union_mean"
             ),
@@ -4310,6 +4640,12 @@ def _run_compare_with_tasks(
             "episode_commit_success_e2": method_report["metrics"].get("episode_commit_success_e2"),
             "episode_commit_success_e3": method_report["metrics"].get("episode_commit_success_e3"),
             "deep_rank_core_rate": method_report["metrics"].get("deep_rank_core_rate"),
+            "closure_recall_core_mean": method_report["metrics"].get(
+                "closure_recall_core_mean"
+            ),
+            "wrong_branch_recall_rate_mean": method_report["metrics"].get(
+                "wrong_branch_recall_rate_mean"
+            ),
             "min_gold_core_rank_union_mean": method_report["metrics"].get(
                 "min_gold_core_rank_union_mean"
             ),
@@ -4556,6 +4892,10 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     ),
                     "selection_upper_bound_judge_acc": metrics.get("selection_upper_bound_judge_acc"),
                     "deep_rank_core_rate": metrics.get("deep_rank_core_rate"),
+                    "closure_recall_core_mean": metrics.get("closure_recall_core_mean"),
+                    "wrong_branch_recall_rate_mean": metrics.get(
+                        "wrong_branch_recall_rate_mean"
+                    ),
                     "min_gold_core_rank_union_mean": metrics.get("min_gold_core_rank_union_mean"),
                     "min_gold_core_rank_union_median": metrics.get("min_gold_core_rank_union_median"),
                     "min_gold_core_rank_union_p90": metrics.get("min_gold_core_rank_union_p90"),
@@ -4616,6 +4956,8 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "full_episode_supporting_count_mean",
         "selection_upper_bound_judge_acc",
         "deep_rank_core_rate",
+        "closure_recall_core_mean",
+        "wrong_branch_recall_rate_mean",
         "min_gold_core_rank_union_mean",
         "min_gold_core_rank_union_median",
         "min_gold_core_rank_union_p90",
