@@ -20,13 +20,14 @@ def _write_compare(
     goc_critical: float,
     full_history_e3_judge: float = 0.4,
     goc_e3_judge: float = 0.6,
+    judge: str = "symbolic_packed",
 ) -> None:
     compare_dir = run_dir / "runs" / "compare"
     compare_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
         "timestamp": timestamp,
-        "judge": "symbolic_packed",
+        "judge": judge,
         "scenario_params": {
             "scenario_mode": "threaded_v1_3_fu",
             "thread_context_budget_chars": budget,
@@ -40,6 +41,9 @@ def _write_compare(
                     "e3_packed_any_critical_rate": 1.0,
                     "e3_packed_critical_count_mean": 1.0,
                     "e3_judge_accuracy_packed": full_history_e3_judge,
+                    "e3_judge_accuracy_full_episode": (
+                        full_history_e3_judge if judge == "symbolic_full_episode" else None
+                    ),
                     "e3_context_clause_count_mean": 3.0,
                     "e3_context_chars_used_mean": 900.0,
                     "e3_context_token_est_mean": 225.0,
@@ -50,6 +54,15 @@ def _write_compare(
                     "goc_unfolded_critical_clause_count_mean": None,
                     "goc_folded_episode_count_mean": None,
                     "judge_accuracy": full_history_e3_judge,
+                    "e3_packed_any_critical_rate_full_episode": (
+                        1.0 if judge == "symbolic_full_episode" else None
+                    ),
+                    "e3_packed_all_critical_rate_full_episode": (
+                        full_history_critical if judge == "symbolic_full_episode" else None
+                    ),
+                    "full_episode_supporting_count_mean": (
+                        1.8 if judge == "symbolic_full_episode" else None
+                    ),
                 },
                 "records": [],
             },
@@ -60,6 +73,9 @@ def _write_compare(
                     "e3_packed_any_critical_rate": 1.0,
                     "e3_packed_critical_count_mean": 2.0,
                     "e3_judge_accuracy_packed": goc_e3_judge,
+                    "e3_judge_accuracy_full_episode": (
+                        goc_e3_judge if judge == "symbolic_full_episode" else None
+                    ),
                     "e3_context_clause_count_mean": 2.0,
                     "e3_context_chars_used_mean": 850.0,
                     "e3_context_token_est_mean": 210.0,
@@ -70,6 +86,15 @@ def _write_compare(
                     "goc_unfolded_critical_clause_count_mean": 2.0,
                     "goc_folded_episode_count_mean": 2.0,
                     "judge_accuracy": goc_e3_judge,
+                    "e3_packed_any_critical_rate_full_episode": (
+                        1.0 if judge == "symbolic_full_episode" else None
+                    ),
+                    "e3_packed_all_critical_rate_full_episode": (
+                        goc_critical if judge == "symbolic_full_episode" else None
+                    ),
+                    "full_episode_supporting_count_mean": (
+                        2.4 if judge == "symbolic_full_episode" else None
+                    ),
                 },
                 "records": [],
             },
@@ -248,3 +273,40 @@ def test_efficiency_thresholds_generated(tmp_path: Path) -> None:
     ]
     assert target
     assert target[0][idx_budget] == "1400"
+
+
+def test_packed_vs_full_episode_gap_generated(tmp_path: Path) -> None:
+    run_dir = tmp_path / "threaded_run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_compare(
+        run_dir,
+        "packed",
+        budget=1300,
+        run_id="20260206_010000",
+        timestamp="2026-02-06T01:00:00Z",
+        full_history_trunc=0.40,
+        full_history_critical=0.30,
+        goc_critical=0.55,
+        full_history_e3_judge=0.30,
+        goc_e3_judge=0.55,
+        judge="symbolic_packed",
+    )
+    _write_compare(
+        run_dir,
+        "full",
+        budget=1300,
+        run_id="20260206_020000",
+        timestamp="2026-02-06T02:00:00Z",
+        full_history_trunc=0.40,
+        full_history_critical=0.45,
+        goc_critical=0.70,
+        full_history_e3_judge=0.45,
+        goc_e3_judge=0.70,
+        judge="symbolic_full_episode",
+    )
+    analyze_bundle(run_dir)
+    gap_md = run_dir / "analysis_bundle" / "packed_vs_full_episode_gap.md"
+    assert gap_md.exists()
+    text = gap_md.read_text(encoding="utf-8")
+    assert "acc_gap_full_minus_packed" in text
+    assert "all_critical_gap_full_minus_packed" in text

@@ -240,3 +240,66 @@ def test_symbolic_packed_allcritical_requires_all_critical(tmp_path: Path) -> No
                 continue
             if rec.get("e3_packed_all_critical") is False:
                 assert rec.get("judge_correct") is False
+
+
+def test_symbolic_full_episode_records_and_metrics(tmp_path: Path) -> None:
+    report = _run_compare(
+        tmp_path / "full_episode",
+        budget=500,
+        methods=["goc", "full_history", "similarity_only", "agent_fold"],
+        judge="symbolic_full_episode",
+    )
+    for report_obj in report.get("method_reports", {}).values():
+        metrics = report_obj.get("metrics", {}) or {}
+        assert "e3_judge_accuracy_full_episode" in metrics
+        assert "e3_packed_all_critical_rate_full_episode" in metrics
+        assert "e3_packed_any_critical_rate_full_episode" in metrics
+        assert "full_episode_supporting_count_mean" in metrics
+        for rec in report_obj.get("records", []):
+            assert isinstance(rec.get("e12_opened_clause_ids"), list)
+            assert isinstance(rec.get("full_episode_clause_ids"), list)
+            if rec.get("episode_id") == 3:
+                assert len(rec.get("full_episode_clause_ids") or []) >= len(
+                    rec.get("e3_packed_clause_ids") or []
+                )
+
+
+def test_symbolic_full_episode_superset_of_packed(tmp_path: Path) -> None:
+    packed_report = _run_compare(
+        tmp_path / "packed",
+        budget=500,
+        methods=["full_history"],
+        judge="symbolic_packed",
+    )
+    full_report = _run_compare(
+        tmp_path / "full",
+        budget=500,
+        methods=["full_history"],
+        judge="symbolic_full_episode",
+    )
+    packed_records = {
+        rec.get("task_id"): rec
+        for rec in (
+            packed_report.get("method_reports", {})
+            .get("full_history", {})
+            .get("records", [])
+        )
+        if rec.get("episode_id") == 3
+    }
+    full_records = {
+        rec.get("task_id"): rec
+        for rec in (
+            full_report.get("method_reports", {})
+            .get("full_history", {})
+            .get("records", [])
+        )
+        if rec.get("episode_id") == 3
+    }
+    assert packed_records
+    assert full_records
+    common_ids = sorted(set(packed_records) & set(full_records))
+    assert common_ids
+    for task_id in common_ids:
+        packed_ids = set(packed_records[task_id].get("e3_packed_clause_ids") or [])
+        full_ids = set(full_records[task_id].get("full_episode_clause_ids") or [])
+        assert packed_ids.issubset(full_ids)

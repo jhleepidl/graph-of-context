@@ -57,6 +57,7 @@ def summarize_context_budget_sweep(
 ) -> Tuple[Optional[Path], Optional[Path], Optional[Path], List[Dict[str, Any]]]:
     compare_paths = list(run_dir.rglob("runs/compare/*.json"))
     latest_rows: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    latest_full_rows: Dict[Tuple[int, str], Dict[str, Any]] = {}
     all_threaded_fu_budgets: set[int] = set()
     symbolic_threaded_fu_budgets: set[int] = set()
     for path in compare_paths:
@@ -233,10 +234,114 @@ def summarize_context_budget_sweep(
             if existing is None or sort_key > existing.get("_sort_key", (0.0, "")):
                 latest_rows[key] = row
 
+    # Optional overlay: symbolic_full_episode diagnostics keyed by (budget, method).
+    for path in compare_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        scenario_params = payload.get("scenario_params", {}) or {}
+        scenario_mode = scenario_params.get("scenario_mode")
+        if not (isinstance(scenario_mode, str) and scenario_mode.startswith("threaded_v1_3_fu")):
+            continue
+        if payload.get("judge") != "symbolic_full_episode":
+            continue
+        budget_val = scenario_params.get("thread_context_budget_chars")
+        if budget_val is None:
+            continue
+        try:
+            budget = int(budget_val)
+        except (TypeError, ValueError):
+            continue
+        sort_key = _run_sort_key(payload, path)
+        for method, report_obj in payload.get("method_reports", {}).items():
+            metrics = report_obj.get("metrics", {}) or {}
+            records = report_obj.get("records", []) or []
+            e3_records = [r for r in records if r.get("episode_id") == 3]
+
+            def _mean_bool(vals: List[bool]) -> Optional[float]:
+                if not vals:
+                    return None
+                return sum(1.0 for v in vals if v) / len(vals)
+
+            def _mean_from_records(key: str) -> Optional[float]:
+                vals = [
+                    float(r.get(key))
+                    for r in e3_records
+                    if isinstance(r.get(key), (int, float))
+                ]
+                return sum(vals) / len(vals) if vals else None
+
+            e3_judge_acc_full = metrics.get("e3_judge_accuracy_full_episode")
+            if e3_judge_acc_full is None:
+                e3_judge_acc_full = metrics.get("episode_judge_accuracy_e3")
+            if e3_judge_acc_full is None:
+                e3_judge_acc_full = metrics.get("judge_accuracy_full_episode")
+            if e3_judge_acc_full is None:
+                e3_judge_acc_full = _mean_bool(
+                    [
+                        bool(r.get("judge_correct_full_episode"))
+                        for r in e3_records
+                        if r.get("judge_correct_full_episode") is not None
+                    ]
+                )
+            e3_all_critical_full = metrics.get("e3_packed_all_critical_rate_full_episode")
+            if e3_all_critical_full is None:
+                e3_all_critical_full = _mean_bool(
+                    [
+                        bool(r.get("e3_packed_all_critical_full_episode"))
+                        for r in e3_records
+                        if r.get("e3_packed_all_critical_full_episode") is not None
+                    ]
+                )
+            e3_any_critical_full = metrics.get("e3_packed_any_critical_rate_full_episode")
+            if e3_any_critical_full is None:
+                e3_any_critical_full = _mean_bool(
+                    [
+                        bool(r.get("e3_packed_any_critical_full_episode"))
+                        for r in e3_records
+                        if r.get("e3_packed_any_critical_full_episode") is not None
+                    ]
+                )
+
+            row = {
+                "budget": budget,
+                "method": method,
+                "e3_judge_acc_full_episode": e3_judge_acc_full,
+                "e3_packed_all_critical_rate_full_episode": e3_all_critical_full,
+                "e3_packed_any_critical_rate_full_episode": e3_any_critical_full,
+                "full_episode_supporting_count_mean": metrics.get(
+                    "full_episode_supporting_count_mean"
+                )
+                if metrics.get("full_episode_supporting_count_mean") is not None
+                else _mean_from_records("full_episode_supporting_count"),
+                "_sort_key": sort_key,
+                "_run_id": payload.get("run_id") or path.stem,
+            }
+            key = (budget, method)
+            existing = latest_full_rows.get(key)
+            if existing is None or sort_key > existing.get("_sort_key", (0.0, "")):
+                latest_full_rows[key] = row
+
     sweep_rows = [
         {k: v for k, v in row.items() if not k.startswith("_")}
         for row in latest_rows.values()
     ]
+    for row in sweep_rows:
+        key = (int(row.get("budget", 0)), str(row.get("method", "")))
+        full_row = latest_full_rows.get(key)
+        row["e3_judge_acc_full_episode"] = (
+            full_row.get("e3_judge_acc_full_episode") if full_row else None
+        )
+        row["e3_packed_all_critical_rate_full_episode"] = (
+            full_row.get("e3_packed_all_critical_rate_full_episode") if full_row else None
+        )
+        row["e3_packed_any_critical_rate_full_episode"] = (
+            full_row.get("e3_packed_any_critical_rate_full_episode") if full_row else None
+        )
+        row["full_episode_supporting_count_mean"] = (
+            full_row.get("full_episode_supporting_count_mean") if full_row else None
+        )
     sweep_rows.sort(key=lambda r: (r.get("budget", 0), str(r.get("method", ""))))
 
     if not sweep_rows:
@@ -246,8 +351,11 @@ def summarize_context_budget_sweep(
         "budget",
         "method",
         "e3_judge_acc_packed",
+        "e3_judge_acc_full_episode",
         "e3_packed_all_critical_rate",
+        "e3_packed_all_critical_rate_full_episode",
         "e3_packed_any_critical_rate",
+        "e3_packed_any_critical_rate_full_episode",
         "e3_packed_contains_critical0_rate",
         "e3_packed_contains_critical1_rate",
         "e3_packed_critical_count_mean",
@@ -263,6 +371,7 @@ def summarize_context_budget_sweep(
         "goc_unfolded_clause_count_mean",
         "goc_unfolded_critical_clause_count_mean",
         "goc_folded_episode_count_mean",
+        "full_episode_supporting_count_mean",
         "judge_accuracy",
     ]
     sweep_csv = output_dir / "results_context_budget_sweep.csv"
@@ -411,6 +520,86 @@ def summarize_context_budget_sweep(
     calib_md.write_text("\n".join(calib_lines), encoding="utf-8")
 
     return sweep_csv, sweep_md, calib_md, sweep_rows
+
+
+def summarize_packed_vs_full_episode_gap(
+    output_dir: Path,
+    sweep_rows: List[Dict[str, Any]],
+) -> Optional[Path]:
+    if not sweep_rows:
+        return None
+
+    def _num(val: Any) -> Optional[float]:
+        if isinstance(val, (int, float)) and not math.isnan(float(val)):
+            return float(val)
+        return None
+
+    fields = [
+        "budget",
+        "method",
+        "e3_judge_acc_packed",
+        "e3_judge_acc_full_episode",
+        "acc_gap_full_minus_packed",
+        "e3_packed_all_critical_rate",
+        "e3_packed_all_critical_rate_full_episode",
+        "all_critical_gap_full_minus_packed",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for row in sorted(
+        sweep_rows,
+        key=lambda item: (int(item.get("budget") or 0), str(item.get("method") or "")),
+    ):
+        packed_acc = _num(row.get("e3_judge_acc_packed"))
+        full_acc = _num(row.get("e3_judge_acc_full_episode"))
+        packed_all = _num(row.get("e3_packed_all_critical_rate"))
+        full_all = _num(row.get("e3_packed_all_critical_rate_full_episode"))
+        rows.append(
+            {
+                "budget": row.get("budget"),
+                "method": row.get("method"),
+                "e3_judge_acc_packed": packed_acc,
+                "e3_judge_acc_full_episode": full_acc,
+                "acc_gap_full_minus_packed": (
+                    full_acc - packed_acc
+                    if packed_acc is not None and full_acc is not None
+                    else None
+                ),
+                "e3_packed_all_critical_rate": packed_all,
+                "e3_packed_all_critical_rate_full_episode": full_all,
+                "all_critical_gap_full_minus_packed": (
+                    full_all - packed_all
+                    if packed_all is not None and full_all is not None
+                    else None
+                ),
+            }
+        )
+
+    def _fmt(val: Any) -> str:
+        if isinstance(val, (int, float)):
+            return f"{float(val):.4f}"
+        return "n/a"
+
+    gap_md = output_dir / "packed_vs_full_episode_gap.md"
+    lines: List[str] = []
+    lines.append("# Packed vs Full-Episode Gap")
+    lines.append("")
+    lines.append(
+        "Interpretation: larger positive gaps indicate retention/packing loss in packed-only E3 context."
+    )
+    lines.append("")
+    lines.append("|" + "|".join(fields) + "|")
+    lines.append("|" + "|".join(["---"] * len(fields)) + "|")
+    for row in rows:
+        lines.append(
+            "|"
+            + "|".join(
+                _fmt(row.get(field)) if field not in {"budget", "method"} else str(row.get(field))
+                for field in fields
+            )
+            + "|"
+        )
+    gap_md.write_text("\n".join(lines), encoding="utf-8")
+    return gap_md
 
 
 def summarize_cost_efficiency_reports(
@@ -1871,11 +2060,16 @@ def analyze_bundle(run_dir: Path) -> Dict[str, Path]:
     accuracy_matched_cost_md = None
     efficiency_thresholds_csv = None
     efficiency_thresholds_md = None
+    packed_vs_full_episode_gap_md = None
     if threaded_mode:
         sweep_csv, sweep_md, calib_md, sweep_rows = summarize_context_budget_sweep(
             run_dir,
             output_dir,
             prefer_non_saturated_goc=True,
+        )
+        packed_vs_full_episode_gap_md = summarize_packed_vs_full_episode_gap(
+            output_dir,
+            sweep_rows,
         )
         cost_pareto_md, accuracy_matched_cost_md = summarize_cost_efficiency_reports(
             output_dir,
@@ -2141,6 +2335,8 @@ def analyze_bundle(run_dir: Path) -> Dict[str, Path]:
         result["efficiency_thresholds_csv"] = efficiency_thresholds_csv
     if efficiency_thresholds_md:
         result["efficiency_thresholds_md"] = efficiency_thresholds_md
+    if packed_vs_full_episode_gap_md:
+        result["packed_vs_full_episode_gap_md"] = packed_vs_full_episode_gap_md
     if slot_summary_rows:
         result["slot_summary_md"] = slot_md
         result["slot_summary_csv"] = slot_csv

@@ -755,7 +755,12 @@ def quickcheck_compare_report(
     _add_check("selection_metrics_sanity", sel_pass, sel_details)
 
     # Judge metrics present
-    if report.get("judge") in {"symbolic", "symbolic_packed", "symbolic_packed_allcritical"}:
+    if report.get("judge") in {
+        "symbolic",
+        "symbolic_packed",
+        "symbolic_packed_allcritical",
+        "symbolic_full_episode",
+    }:
         missing_record = 0
         missing_metric = 0
         for method, report_obj in method_reports.items():
@@ -786,6 +791,7 @@ def quickcheck_compare_report(
             "judge_used_any_core_rate",
             "judge_used_any_bridge_rate",
             "judge_used_any_critical_core_rate",
+            "judge_used_any_decoy_rate",
         ]
         if any(k not in metrics for k in support_keys):
             missing_support += 1
@@ -793,7 +799,8 @@ def quickcheck_compare_report(
             f"{method}:count_mean={metrics.get('judge_supporting_count_mean')},"
             f"core_rate={metrics.get('judge_used_any_core_rate')},"
             f"bridge_rate={metrics.get('judge_used_any_bridge_rate')},"
-            f"critical_rate={metrics.get('judge_used_any_critical_core_rate')}"
+            f"critical_rate={metrics.get('judge_used_any_critical_core_rate')},"
+            f"decoy_rate={metrics.get('judge_used_any_decoy_rate')}"
         )
     _add_check(
         "acc_no_core_evidence_rate_present",
@@ -931,8 +938,12 @@ def quickcheck_compare_report(
                     "e3_packed_dropped_clause_count",
                     "e3_packed_clause_lens",
                     "e3_packed_clause_is_critical",
+                    "e12_opened_clause_ids",
+                    "full_episode_clause_ids",
                     "e3_packed_all_critical",
                     "e3_packed_any_critical",
+                    "e3_packed_all_critical_full_episode",
+                    "e3_packed_any_critical_full_episode",
                     "e3_litm_filler_count",
                     "e3_litm_filler_position",
                 ]:
@@ -966,6 +977,57 @@ def quickcheck_compare_report(
             truncation_bad == 0 and dropped_bad == 0,
             f"checked={checked_records}, truncation_bad={truncation_bad}, dropped_bad={dropped_bad}",
         )
+        full_episode_list_bad = 0
+        full_episode_subset_bad = 0
+        full_episode_checked = 0
+        for report_obj in method_reports.values():
+            for rec in report_obj.get("records", []) or []:
+                if rec.get("episode_id") != 3:
+                    continue
+                packed_ids = rec.get("e3_packed_clause_ids")
+                full_ids = rec.get("full_episode_clause_ids")
+                if not isinstance(packed_ids, list) or not isinstance(full_ids, list):
+                    full_episode_list_bad += 1
+                    continue
+                full_episode_checked += 1
+                if not set(packed_ids).issubset(set(full_ids)):
+                    full_episode_subset_bad += 1
+        _add_check(
+            "full_episode_clause_ids_sane",
+            full_episode_list_bad == 0 and full_episode_subset_bad == 0,
+            (
+                f"checked={full_episode_checked}, "
+                f"list_bad={full_episode_list_bad}, subset_bad={full_episode_subset_bad}"
+            ),
+        )
+        if report.get("judge") == "symbolic_full_episode":
+            compare_non_decreasing = 0
+            compare_checked = 0
+            for method, report_obj in method_reports.items():
+                metrics = report_obj.get("metrics", {}) or {}
+                full_acc = metrics.get("e3_judge_accuracy_full_episode")
+                packed_acc = metrics.get("e3_judge_accuracy_packed")
+                if not isinstance(full_acc, (int, float)) or not isinstance(packed_acc, (int, float)):
+                    continue
+                compare_checked += 1
+                if float(full_acc) + 1e-9 >= float(packed_acc):
+                    compare_non_decreasing += 1
+            if compare_checked == 0:
+                _add_check(
+                    "full_episode_acc_vs_packed",
+                    True,
+                    "no paired metrics to compare in this run",
+                )
+            else:
+                ratio = compare_non_decreasing / compare_checked
+                _add_check(
+                    "full_episode_acc_vs_packed",
+                    ratio >= 0.8,
+                    (
+                        f"paired={compare_checked}, non_decreasing={compare_non_decreasing}, "
+                        f"ratio={ratio:.3f}"
+                    ),
+                )
         jitter_max = report.get("scenario_params", {}).get("e3_clause_jitter_max_chars")
         jitter_critical = report.get("scenario_params", {}).get(
             "e3_clause_jitter_max_chars_critical"
@@ -1105,7 +1167,7 @@ def quickcheck_sweep_summary(
         "selection_gap",
         "selection_efficiency",
     ]
-    if judge_mode == "symbolic":
+    if isinstance(judge_mode, str) and judge_mode.startswith("symbolic"):
         required.append("judge_accuracy")
 
     missing = 0
@@ -1351,12 +1413,17 @@ def _evaluate_method(
         e3_packed_clause_ids: List[str] = []
         e3_packed_clause_lens: List[int] = []
         e3_packed_clause_is_critical: List[bool] = []
+        e12_opened_clause_ids: List[str] = []
+        full_episode_clause_ids: List[str] = []
         e3_packed_contains_critical: bool | None = None
         e3_packed_contains_critical0: bool | None = None
         e3_packed_contains_critical1: bool | None = None
         e3_packed_critical_count: int | None = None
         e3_packed_all_critical: bool | None = None
         e3_packed_any_critical: bool | None = None
+        e3_packed_all_critical_full_episode: bool | None = None
+        e3_packed_any_critical_full_episode: bool | None = None
+        e3_packed_critical_count_full_episode: int | None = None
         e3_decoy_clause_count: int | None = None
         e3_litm_filler_count: int | None = None
         e3_litm_filler_position: str | None = None
@@ -1369,6 +1436,8 @@ def _evaluate_method(
         goc_unfolded_critical_clause_count: int | None = None
         goc_unfold_selected_clause_ids: List[str] = []
         goc_unfold_reason: str | None = None
+        judge_correct_full_episode: bool | None = None
+        full_episode_supporting_count: int | None = None
         if threaded_mode and thread_state and episode_id:
             task_for_run = copy.deepcopy(task)
             commit_refs = _format_commit_refs(
@@ -1421,6 +1490,7 @@ def _evaluate_method(
                 if commit2.get("short_fact") is not None:
                     commit_facts["commit2.fact2"] = commit2.get("short_fact")
             opened_history_ids = list(dict.fromkeys(thread_state.get("opened_history_ids", [])))
+            e12_opened_clause_ids = list(opened_history_ids)
             thread_cfg = dict(getattr(task, "thread_config", None) or {})
             e3_litm_filler_clause_ids = list(
                 dict.fromkeys(thread_cfg.get("e3_litm_filler_clause_ids") or [])
@@ -1505,6 +1575,9 @@ def _evaluate_method(
             e3_packed_dropped_clause_count = dropped_clause_count
             e3_context_truncated = e3_packed_truncated
             e3_packed_clause_ids = list(e3_context_clause_ids)
+            full_episode_clause_ids = list(
+                dict.fromkeys(e12_opened_clause_ids + e3_packed_clause_ids)
+            )
             e3_packed_clause_lens = [len(c.get("text", "")) for c in context_clauses]
             e3_decoy_clause_count = 0
             for cid in e3_context_clause_ids:
@@ -1545,6 +1618,15 @@ def _evaluate_method(
                     e3_packed_contains_critical = e3_packed_critical_count > 0
                     e3_packed_any_critical = e3_packed_contains_critical
                     e3_packed_all_critical = e3_packed_critical_count == len(critical_core_ids)
+                    e3_packed_critical_count_full_episode = sum(
+                        1 for cid in critical_core_ids if cid in full_episode_clause_ids
+                    )
+                    e3_packed_any_critical_full_episode = (
+                        e3_packed_critical_count_full_episode > 0
+                    )
+                    e3_packed_all_critical_full_episode = (
+                        e3_packed_critical_count_full_episode == len(critical_core_ids)
+                    )
                     e3_packed_contains_critical0 = (
                         critical0_id in e3_packed_clause_ids if critical0_id else None
                     )
@@ -1798,6 +1880,7 @@ def _evaluate_method(
                 dict.fromkeys(thread_state.get("opened_history_ids", []) + history_source)
             )
             thread_state["opened_history_ids"] = opened_history_ids
+            e12_opened_clause_ids = list(opened_history_ids)
         if threaded_mode and thread_state and episode_id == 3:
             commit1 = thread_state.get("commit1") or {}
             commit2 = thread_state.get("commit2") or {}
@@ -1808,6 +1891,14 @@ def _evaluate_method(
                 )
             )
             commit_supporting_clause_ids = commit_clause_ids
+            if not e12_opened_clause_ids:
+                e12_opened_clause_ids = list(
+                    dict.fromkeys(thread_state.get("opened_history_ids", []))
+                )
+            if not full_episode_clause_ids:
+                full_episode_clause_ids = list(
+                    dict.fromkeys(e12_opened_clause_ids + e3_packed_clause_ids)
+                )
         primary_results = diag.get("primary_search_results", []) if isinstance(diag, dict) else []
         gold_core_ids = list(
             getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
@@ -1899,9 +1990,16 @@ def _evaluate_method(
         judge_supporting_clause_ids: List[str] | None = None
         judge_supporting_count: int | None = None
         judge_mode = getattr(args, "judge", "llm")
-        if judge_mode in {"symbolic", "symbolic_packed", "symbolic_packed_allcritical"}:
+        if judge_mode in {
+            "symbolic",
+            "symbolic_packed",
+            "symbolic_packed_allcritical",
+            "symbolic_full_episode",
+        }:
             if judge_mode in {"symbolic_packed", "symbolic_packed_allcritical"} and threaded_mode and episode_id == 3:
                 judge_pred = judge_from_opened_clauses(task, e3_packed_clause_ids, world)
+            elif judge_mode == "symbolic_full_episode" and threaded_mode and episode_id == 3:
+                judge_pred = judge_from_opened_clauses(task, full_episode_clause_ids, world)
             elif judge_mode == "symbolic" and threaded_mode and episode_id == 3 and commit_clause_ids is not None:
                 judge_pred = judge_threaded_final(task, commit_clause_ids, world)
             else:
@@ -1912,6 +2010,9 @@ def _evaluate_method(
                 judge_pred.get("supporting_clause_ids") or []
             )
             judge_supporting_count = len(judge_supporting_clause_ids)
+            if judge_mode == "symbolic_full_episode":
+                judge_correct_full_episode = judge_correct
+                full_episode_supporting_count = judge_supporting_count
         if method == "engine":
             normalize_reason = None
             decision_before_norm = pred.get("decision")
@@ -1943,6 +2044,8 @@ def _evaluate_method(
                     and e3_evidence_valid
                 )
                 judge_correct = thread_judge_correct
+                if judge_mode == "symbolic_full_episode":
+                    judge_correct_full_episode = judge_correct
                 if isinstance(judge_correct, bool):
                     judge_correct_packed_allcritical = bool(
                         judge_correct and e3_packed_all_critical is True
@@ -1953,6 +2056,8 @@ def _evaluate_method(
             judge_correct_packed_allcritical = bool(
                 judge_correct and e3_packed_all_critical is True
             )
+            if judge_mode == "symbolic_full_episode":
+                judge_correct_full_episode = judge_correct
         if threaded_mode and episode_id == 3:
             if e3_context_chars_used is None:
                 e3_context_chars_used = 0
@@ -1970,6 +2075,13 @@ def _evaluate_method(
                 e3_context_token_est = int(math.ceil(max(0, e3_context_chars_used) / 4.0))
             if e3_packed_token_est is None:
                 e3_packed_token_est = int(math.ceil(max(0, e3_packed_total_chars_after) / 4.0))
+        if threaded_mode:
+            if not e12_opened_clause_ids and thread_state:
+                e12_opened_clause_ids = list(
+                    dict.fromkeys(thread_state.get("opened_history_ids", []))
+                )
+            if not full_episode_clause_ids:
+                full_episode_clause_ids = list(e12_opened_clause_ids)
         task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
         metrics.append(task_metrics)
         tool_calls.append(env.tool_call_count)
@@ -2032,8 +2144,10 @@ def _evaluate_method(
             "judge_decision": judge_decision,
             "judge_correct": judge_correct,
             "judge_correct_packed_allcritical": judge_correct_packed_allcritical,
+            "judge_correct_full_episode": judge_correct_full_episode,
             "judge_supporting_clause_ids": judge_supporting_clause_ids,
             "judge_supporting_count": judge_supporting_count,
+            "full_episode_supporting_count": full_episode_supporting_count,
             "scenario_mode": scenario_mode,
             "thread_id": thread_id,
             "episode_id": episode_id,
@@ -2099,6 +2213,8 @@ def _evaluate_method(
             "e3_packed_token_est": e3_packed_token_est,
             "e3_context_truncated": e3_context_truncated,
             "e3_context_clause_ids": e3_context_clause_ids,
+            "e12_opened_clause_ids": list(e12_opened_clause_ids),
+            "full_episode_clause_ids": list(full_episode_clause_ids),
             "e3_packed_clause_lens": list(e3_packed_clause_lens),
             "e3_packed_clause_is_critical": list(e3_packed_clause_is_critical),
             "e3_packed_total_chars_before": e3_packed_total_chars_before,
@@ -2116,6 +2232,9 @@ def _evaluate_method(
             "e3_packed_critical_count": e3_packed_critical_count,
             "e3_packed_any_critical": e3_packed_any_critical,
             "e3_packed_all_critical": e3_packed_all_critical,
+            "e3_packed_critical_count_full_episode": e3_packed_critical_count_full_episode,
+            "e3_packed_any_critical_full_episode": e3_packed_any_critical_full_episode,
+            "e3_packed_all_critical_full_episode": e3_packed_all_critical_full_episode,
             "e3_litm_filler_count": e3_litm_filler_count,
             "e3_litm_filler_position": e3_litm_filler_position,
             "e3_litm_filler_clause_ids": list(e3_litm_filler_clause_ids),
@@ -2313,6 +2432,7 @@ def _evaluate_method(
         judge_used_any_core = None
         judge_used_any_bridge = None
         judge_used_any_critical_core = None
+        judge_used_any_decoy = None
         if isinstance(record.get("judge_supporting_clause_ids"), list):
             supporting = set(record.get("judge_supporting_clause_ids") or [])
             core_ids = set(record.get("gold_evidence_core_ids") or [])
@@ -2322,9 +2442,16 @@ def _evaluate_method(
             critical_ids = set(record.get("critical_core_clause_ids") or [])
             if critical_ids:
                 judge_used_any_critical_core = bool(supporting & critical_ids)
+            decoy_ids = {
+                cid
+                for cid in supporting
+                if (world.clauses.get(cid) and str(world.clauses[cid].doc_id).startswith("DECOY"))
+            }
+            judge_used_any_decoy = bool(decoy_ids)
         record["judge_used_any_core"] = judge_used_any_core
         record["judge_used_any_bridge"] = judge_used_any_bridge
         record["judge_used_any_critical_core"] = judge_used_any_critical_core
+        record["judge_used_any_decoy"] = judge_used_any_decoy
         record["acc_no_core_evidence"] = bool(
             record.get("judge_correct") is True
             and (record.get("opened_gold_coverage_core") in {0, 0.0})
@@ -3017,6 +3144,11 @@ def _evaluate_method(
         if getattr(args, "judge", "llm") == "symbolic_packed"
         else None
     )
+    aggregate["judge_accuracy_full_episode"] = (
+        aggregate.get("judge_accuracy")
+        if getattr(args, "judge", "llm") == "symbolic_full_episode"
+        else None
+    )
     aggregate["acc_no_core_evidence_rate"] = _mean_metric("acc_no_core_evidence", default=0.0)
     aggregate["judge_used_any_core_rate"] = _mean_metric("judge_used_any_core", default=None)
     aggregate["judge_used_any_bridge_rate"] = _mean_metric("judge_used_any_bridge", default=None)
@@ -3024,7 +3156,15 @@ def _evaluate_method(
         "judge_used_any_critical_core",
         default=None,
     )
+    aggregate["judge_used_any_decoy_rate"] = _mean_metric(
+        "judge_used_any_decoy",
+        default=None,
+    )
     aggregate["judge_supporting_count_mean"] = _mean_metric("judge_supporting_count", default=None)
+    aggregate["full_episode_supporting_count_mean"] = _mean_metric(
+        "full_episode_supporting_count",
+        default=None,
+    )
     aggregate["opened_bridge_count_mean"] = _mean_metric("opened_bridge_count", default=0.0)
     aggregate["opened_meta_count_mean"] = _mean_metric("opened_meta_count", default=0.0)
     aggregate["opened_rule_count_mean"] = _mean_metric("opened_rule_count", default=0.0)
@@ -3055,6 +3195,14 @@ def _evaluate_method(
     )
     aggregate["e3_packed_all_critical_rate"] = _mean_metric(
         "e3_packed_all_critical",
+        default=None,
+    )
+    aggregate["e3_packed_any_critical_rate_full_episode"] = _mean_metric(
+        "e3_packed_any_critical_full_episode",
+        default=None,
+    )
+    aggregate["e3_packed_all_critical_rate_full_episode"] = _mean_metric(
+        "e3_packed_all_critical_full_episode",
         default=None,
     )
     aggregate["e3_context_truncated_rate"] = _mean_metric("e3_packed_truncated", default=None)
@@ -3193,6 +3341,12 @@ def _evaluate_method(
             aggregate["e3_judge_accuracy_packed"] = aggregate.get("episode_judge_accuracy_e3")
         else:
             aggregate["e3_judge_accuracy_packed"] = None
+        if getattr(args, "judge", "llm") == "symbolic_full_episode":
+            aggregate["e3_judge_accuracy_full_episode"] = aggregate.get(
+                "episode_judge_accuracy_e3"
+            )
+        else:
+            aggregate["e3_judge_accuracy_full_episode"] = None
         if getattr(args, "judge", "llm") == "symbolic_packed_allcritical":
             aggregate["e3_judge_accuracy_packed_allcritical"] = aggregate.get("episode_judge_accuracy_e3")
         else:
@@ -3207,6 +3361,17 @@ def _evaluate_method(
                 if e3_allcritical_vals
                 else None
             )
+        if getattr(args, "judge", "llm") != "symbolic_full_episode":
+            e3_full_episode_vals = [
+                1.0 if rec.get("judge_correct_full_episode") else 0.0
+                for rec in records
+                if rec.get("episode_id") == 3
+                and rec.get("judge_correct_full_episode") is not None
+            ]
+            if e3_full_episode_vals:
+                aggregate["e3_judge_accuracy_full_episode"] = (
+                    sum(e3_full_episode_vals) / len(e3_full_episode_vals)
+                )
     if getattr(args, "open_policy", "current") == "oracle_open_if_in_union":
         aggregate["selection_upper_bound_judge_acc"] = aggregate.get("judge_accuracy")
     else:
@@ -3702,6 +3867,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
             "judge_accuracy": method_report["metrics"].get("judge_accuracy"),
             "judge_accuracy_packed": method_report["metrics"].get("judge_accuracy_packed"),
+            "judge_accuracy_full_episode": method_report["metrics"].get(
+                "judge_accuracy_full_episode"
+            ),
             "judge_accuracy_packed_allcritical": method_report["metrics"].get(
                 "judge_accuracy_packed_allcritical"
             ),
@@ -3711,8 +3879,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "judge_used_any_critical_core_rate": method_report["metrics"].get(
                 "judge_used_any_critical_core_rate"
             ),
+            "judge_used_any_decoy_rate": method_report["metrics"].get(
+                "judge_used_any_decoy_rate"
+            ),
             "judge_supporting_count_mean": method_report["metrics"].get(
                 "judge_supporting_count_mean"
+            ),
+            "full_episode_supporting_count_mean": method_report["metrics"].get(
+                "full_episode_supporting_count_mean"
             ),
             "selection_upper_bound_judge_acc": method_report["metrics"].get(
                 "selection_upper_bound_judge_acc"
@@ -3778,8 +3952,17 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "selection_gap": method_report["metrics"].get("selection_gap"),
             "selection_efficiency": method_report["metrics"].get("selection_efficiency"),
             "e3_judge_accuracy_packed": method_report["metrics"].get("e3_judge_accuracy_packed"),
+            "e3_judge_accuracy_full_episode": method_report["metrics"].get(
+                "e3_judge_accuracy_full_episode"
+            ),
             "e3_judge_accuracy_packed_allcritical": method_report["metrics"].get(
                 "e3_judge_accuracy_packed_allcritical"
+            ),
+            "e3_packed_any_critical_rate_full_episode": method_report["metrics"].get(
+                "e3_packed_any_critical_rate_full_episode"
+            ),
+            "e3_packed_all_critical_rate_full_episode": method_report["metrics"].get(
+                "e3_packed_all_critical_rate_full_episode"
             ),
             "e3_packed_total_chars_before_mean": method_report["metrics"].get(
                 "e3_packed_total_chars_before_mean"
@@ -4097,14 +4280,23 @@ def _run_compare_with_tasks(
             "decision_accuracy": method_report["metrics"].get("decision_accuracy"),
             "judge_accuracy": method_report["metrics"].get("judge_accuracy"),
             "judge_accuracy_packed": method_report["metrics"].get("judge_accuracy_packed"),
+            "judge_accuracy_full_episode": method_report["metrics"].get(
+                "judge_accuracy_full_episode"
+            ),
             "acc_no_core_evidence_rate": method_report["metrics"].get("acc_no_core_evidence_rate"),
             "judge_used_any_core_rate": method_report["metrics"].get("judge_used_any_core_rate"),
             "judge_used_any_bridge_rate": method_report["metrics"].get("judge_used_any_bridge_rate"),
             "judge_used_any_critical_core_rate": method_report["metrics"].get(
                 "judge_used_any_critical_core_rate"
             ),
+            "judge_used_any_decoy_rate": method_report["metrics"].get(
+                "judge_used_any_decoy_rate"
+            ),
             "judge_supporting_count_mean": method_report["metrics"].get(
                 "judge_supporting_count_mean"
+            ),
+            "full_episode_supporting_count_mean": method_report["metrics"].get(
+                "full_episode_supporting_count_mean"
             ),
             "selection_upper_bound_judge_acc": method_report["metrics"].get(
                 "selection_upper_bound_judge_acc"
@@ -4350,13 +4542,18 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "method": method,
                     "decision_accuracy": metrics.get("decision_accuracy"),
                     "judge_accuracy": metrics.get("judge_accuracy"),
+                    "judge_accuracy_full_episode": metrics.get("judge_accuracy_full_episode"),
                     "acc_no_core_evidence_rate": metrics.get("acc_no_core_evidence_rate"),
                     "judge_used_any_core_rate": metrics.get("judge_used_any_core_rate"),
                     "judge_used_any_bridge_rate": metrics.get("judge_used_any_bridge_rate"),
                     "judge_used_any_critical_core_rate": metrics.get(
                         "judge_used_any_critical_core_rate"
                     ),
+                    "judge_used_any_decoy_rate": metrics.get("judge_used_any_decoy_rate"),
                     "judge_supporting_count_mean": metrics.get("judge_supporting_count_mean"),
+                    "full_episode_supporting_count_mean": metrics.get(
+                        "full_episode_supporting_count_mean"
+                    ),
                     "selection_upper_bound_judge_acc": metrics.get("selection_upper_bound_judge_acc"),
                     "deep_rank_core_rate": metrics.get("deep_rank_core_rate"),
                     "min_gold_core_rank_union_mean": metrics.get("min_gold_core_rank_union_mean"),
@@ -4409,11 +4606,14 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "method",
         "decision_accuracy",
         "judge_accuracy",
+        "judge_accuracy_full_episode",
         "acc_no_core_evidence_rate",
         "judge_used_any_core_rate",
         "judge_used_any_bridge_rate",
         "judge_used_any_critical_core_rate",
+        "judge_used_any_decoy_rate",
         "judge_supporting_count_mean",
+        "full_episode_supporting_count_mean",
         "selection_upper_bound_judge_acc",
         "deep_rank_core_rate",
         "min_gold_core_rank_union_mean",
@@ -4642,7 +4842,13 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--llm", choices=["dummy", "openai"], default="openai")
     ev.add_argument(
         "--judge",
-        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        choices=[
+            "llm",
+            "symbolic",
+            "symbolic_packed",
+            "symbolic_packed_allcritical",
+            "symbolic_full_episode",
+        ],
         default="llm",
     )
     ev.add_argument("--dotenv", type=str, default=".env")
@@ -4730,7 +4936,13 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
     cmp.add_argument(
         "--judge",
-        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        choices=[
+            "llm",
+            "symbolic",
+            "symbolic_packed",
+            "symbolic_packed_allcritical",
+            "symbolic_full_episode",
+        ],
         default="llm",
     )
     cmp.add_argument("--dotenv", type=str, default=".env")
@@ -4829,7 +5041,13 @@ def build_parser() -> argparse.ArgumentParser:
     swp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
     swp.add_argument(
         "--judge",
-        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        choices=[
+            "llm",
+            "symbolic",
+            "symbolic_packed",
+            "symbolic_packed_allcritical",
+            "symbolic_full_episode",
+        ],
         default="llm",
     )
     swp.add_argument(
@@ -4951,7 +5169,13 @@ def build_parser() -> argparse.ArgumentParser:
     abl.add_argument("--llm", choices=["dummy", "openai"], default="openai")
     abl.add_argument(
         "--judge",
-        choices=["llm", "symbolic", "symbolic_packed", "symbolic_packed_allcritical"],
+        choices=[
+            "llm",
+            "symbolic",
+            "symbolic_packed",
+            "symbolic_packed_allcritical",
+            "symbolic_full_episode",
+        ],
         default="llm",
     )
     abl.add_argument("--dotenv", type=str, default=".env")
