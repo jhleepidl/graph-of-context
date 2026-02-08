@@ -9,6 +9,7 @@ import random
 import hashlib
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -213,6 +214,24 @@ def _avg_p90(values: List[int]) -> Dict[str, float]:
     idx = int(0.9 * (len(ordered) - 1))
     p90 = ordered[idx]
     return {"avg": avg, "p90": float(p90)}
+
+
+def _task_metrics_from_record(record: Dict[str, Any]) -> Dict[str, float]:
+    def _as_float(key: str, default: float = 0.0) -> float:
+        value = record.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return float(default)
+
+    return {
+        "decision_accuracy": 1.0 if record.get("decision_correct") else 0.0,
+        "condition_f1": _as_float("condition_f1"),
+        "evidence_precision": _as_float("evidence_precision"),
+        "evidence_recall": _as_float("evidence_recall"),
+        "evidence_precision_core": _as_float("evidence_precision_core"),
+        "evidence_recall_core": _as_float("evidence_recall_core"),
+        "critical_evidence_hit": _as_float("critical_evidence_hit"),
+    }
 
 
 def _extract_clause_ids(results: Any) -> List[str]:
@@ -429,6 +448,12 @@ def _tokenize(text: str) -> List[str]:
     return [t.lower() for t in text.split() if t.strip()]
 
 
+def _lexical_tokens(text: str) -> Set[str]:
+    if not text:
+        return set()
+    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+
+
 def _select_similarity_clause_ids(
     ticket: str,
     clause_ids: List[str],
@@ -448,6 +473,184 @@ def _select_similarity_clause_ids(
         scored.append((cid, score))
     scored.sort(key=lambda item: item[1], reverse=True)
     return [cid for cid, _ in scored[:top_k]]
+
+
+def extract_activity(ticket_text: str) -> Set[str]:
+    text = (ticket_text or "").lower()
+    acts: Set[str] = set()
+    if "retain" in text or "retaining" in text:
+        acts.add("retain")
+    if "export" in text or "exporting" in text:
+        acts.add("export")
+    if "share" in text or "sharing" in text:
+        acts.add("share")
+    if "logs" in text:
+        acts.add("logs")
+    if "telemetry" in text:
+        acts.add("telemetry")
+    if "health" in text:
+        acts.add("health")
+    return acts
+
+
+def clause_activity(clause_text: str) -> Set[str]:
+    return extract_activity(clause_text)
+
+
+def _extract_retention_days_from_text(text: str) -> int | None:
+    if not text:
+        return None
+    match = re.search(r"retention\s*days?\s*[:=]\s*(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"\b(\d+)\s*days?\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _compute_pivot_compliance(
+    *,
+    ticket_initial: str,
+    ticket_updated: str,
+    pivot_type: str,
+    raw_output: str | None,
+) -> tuple[bool | None, bool | None, int | None, int | None]:
+    if not ticket_updated:
+        return None, None, None, None
+    kind = str(pivot_type or "retention_flip")
+    text = str(raw_output or "").lower()
+    if kind != "retention_flip":
+        return None, None, None, None
+    old_days = _extract_retention_days_from_text(ticket_initial)
+    updated_days = _extract_retention_days_from_text(ticket_updated)
+    if updated_days is None:
+        return None, None, old_days, updated_days
+    has_updated = str(updated_days) in text
+    opposite_days = 90 if updated_days == 30 else 30 if updated_days == 90 else None
+    has_opposite = str(opposite_days) in text if opposite_days is not None else False
+    has_old = str(old_days) in text if old_days is not None else False
+    pivot_compliant = bool(has_updated and not has_opposite and not (has_old and old_days != updated_days))
+    stale_evidence = bool(has_old and old_days != updated_days) or bool(has_opposite)
+    return pivot_compliant, stale_evidence, old_days, updated_days
+
+
+def _token_jaccard(a: Set[str], b: Set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return float(len(a & b)) / float(len(union))
+
+
+def _build_clause_dependency_neighbors(
+    clause_ids: List[str],
+    world: Any,
+) -> Dict[str, Set[str]]:
+    ordered_ids = _unique_strs(clause_ids)
+    neighbors: Dict[str, Set[str]] = {cid: set() for cid in ordered_ids}
+    if not ordered_ids or world is None:
+        return neighbors
+
+    clause_set = set(ordered_ids)
+    clauses = getattr(world, "clauses", {}) if world is not None else {}
+    if not isinstance(clauses, dict):
+        clauses = {}
+    world_meta = getattr(world, "meta", {}) if world is not None else {}
+    term_definitions = (
+        world_meta.get("term_definitions", {})
+        if isinstance(world_meta, dict)
+        else {}
+    )
+    if not isinstance(term_definitions, dict):
+        term_definitions = {}
+
+    doc_to_clause_ids: Dict[str, List[str]] = {}
+    for cid in ordered_ids:
+        clause = clauses.get(cid)
+        if clause is None:
+            continue
+        doc_id = str(getattr(clause, "doc_id", "") or "").strip()
+        if doc_id:
+            doc_to_clause_ids.setdefault(doc_id, []).append(cid)
+
+        targets = getattr(clause, "targets", None)
+        if isinstance(targets, dict):
+            for key in ("overrides", "revokes", "defines"):
+                raw_vals = targets.get(key) or []
+                if not isinstance(raw_vals, list):
+                    continue
+                for raw in raw_vals:
+                    target_id = str(raw).strip()
+                    if not target_id or target_id == cid or target_id not in clause_set:
+                        continue
+                    neighbors.setdefault(cid, set()).add(target_id)
+                    neighbors.setdefault(target_id, set()).add(cid)
+
+        terms_used = getattr(clause, "terms_used", None)
+        if isinstance(terms_used, list):
+            for term in terms_used:
+                term_key = str(term).strip()
+                if not term_key:
+                    continue
+                def_clause_id = str(term_definitions.get(term_key, "") or "").strip()
+                if not def_clause_id or def_clause_id == cid or def_clause_id not in clause_set:
+                    continue
+                neighbors.setdefault(cid, set()).add(def_clause_id)
+                neighbors.setdefault(def_clause_id, set()).add(cid)
+
+    # Keep same-document clauses lightly connected to avoid disconnected closures when
+    # explicit dependency links are sparse.
+    for doc_clause_ids in doc_to_clause_ids.values():
+        if len(doc_clause_ids) <= 1:
+            continue
+        for idx in range(1, len(doc_clause_ids)):
+            left = doc_clause_ids[idx - 1]
+            right = doc_clause_ids[idx]
+            neighbors.setdefault(left, set()).add(right)
+            neighbors.setdefault(right, set()).add(left)
+    return neighbors
+
+
+def _expand_clause_dependency_closure(
+    seed_clause_ids: List[str],
+    candidate_clause_ids: List[str],
+    world: Any,
+    max_hops: int,
+) -> List[str]:
+    ordered_candidates = _unique_strs(candidate_clause_ids)
+    if not ordered_candidates:
+        return []
+    candidate_set = set(ordered_candidates)
+    seeds = [cid for cid in _unique_strs(seed_clause_ids) if cid in candidate_set]
+    if not seeds:
+        return []
+    max_hops = max(0, int(max_hops or 0))
+    if max_hops <= 0:
+        return list(seeds)
+
+    neighbors = _build_clause_dependency_neighbors(ordered_candidates, world)
+    visited: Set[str] = set(seeds)
+    frontier: List[str] = list(seeds)
+    for _hop in range(max_hops):
+        if not frontier:
+            break
+        next_frontier: List[str] = []
+        for cid in frontier:
+            for nid in neighbors.get(cid, set()):
+                if nid in visited or nid not in candidate_set:
+                    continue
+                visited.add(nid)
+                next_frontier.append(nid)
+        frontier = next_frontier
+
+    closure_ids = [cid for cid in ordered_candidates if cid in visited]
+    if not closure_ids:
+        return list(seeds)
+    return closure_ids
 
 
 def _extract_commit_supporting(
@@ -661,10 +864,30 @@ def _select_goc_unfold_clause_ids(
     critical_clause_ids: List[str],
     ticket: str,
     world: Any,
-) -> tuple[List[str], Dict[str, List[str]]]:
+    *,
+    activity_filter: bool = False,
+    activity_filter_fallback: bool = True,
+    mmr_lambda: float = 0.35,
+    anchor_top1_lexical: bool = True,
+    max_selected: int = 4,
+    include_debug: bool = False,
+) -> tuple[List[str], Dict[str, List[str]], Dict[str, Any]]:
     ticket_tokens = set(_tokenize(ticket))
+    ticket_lex_tokens = _lexical_tokens(ticket)
+    ticket_activity = extract_activity(ticket)
+    action_activity = {"retain", "export", "share"}
+    activity_filter = bool(activity_filter)
+    activity_filter_fallback = bool(activity_filter_fallback)
+    mmr_lambda = float(mmr_lambda or 0.35)
+    anchor_top1_lexical = bool(anchor_top1_lexical)
+    max_selected = int(max_selected or 4)
+    max_selected = max(1, max_selected)
+    include_debug = bool(include_debug)
+
     scored: List[tuple[str, float]] = []
     reasons: Dict[str, List[str]] = {}
+    candidates: List[Dict[str, Any]] = []
+    candidate_by_id: Dict[str, Dict[str, Any]] = {}
     for cid in opened_history_ids:
         clause = world.clauses.get(cid) if world else None
         if not clause:
@@ -688,15 +911,134 @@ def _select_goc_unfold_clause_ids(
         if ticket_tokens & tokens:
             score += 2.0
             cid_reasons.append("ticket_match")
+        lexical_score = float(len(ticket_lex_tokens & _lexical_tokens(clause.text)))
+        acts = clause_activity(clause.text)
+        cand = {
+            "cid": cid,
+            "base_score": float(score),
+            "lexical_score": lexical_score,
+            "activity": acts,
+            "token_set": _lexical_tokens(clause.text),
+        }
+        candidates.append(cand)
+        candidate_by_id[cid] = cand
         scored.append((cid, score))
         reasons[cid] = cid_reasons
+
+    def _score_key(c: Dict[str, Any]) -> tuple[float, float, str]:
+        return (float(c.get("base_score", 0.0)), float(c.get("lexical_score", 0.0)), str(c.get("cid", "")))
+
     scored.sort(key=lambda item: (-item[1], item[0]))
     ordered = [cid for cid, _ in scored]
-    # Ensure commit anchors are first in stable order.
-    critical_first = [cid for cid in critical_clause_ids if cid in ordered]
-    commit_first = [cid for cid in commit_clause_ids if cid in ordered and cid not in critical_first]
-    remaining = [cid for cid in ordered if cid not in critical_first and cid not in commit_first]
-    return critical_first + commit_first + remaining, reasons
+    filter_fallback_used = False
+
+    if not activity_filter:
+        # Backward-compatible ordering when activity filtering is disabled.
+        critical_first = [cid for cid in critical_clause_ids if cid in ordered]
+        commit_first = [cid for cid in commit_clause_ids if cid in ordered and cid not in critical_first]
+        remaining = [cid for cid in ordered if cid not in critical_first and cid not in commit_first]
+        legacy_ordered = critical_first + commit_first + remaining
+        debug_payload: Dict[str, Any] = {}
+        if include_debug:
+            top10 = sorted(candidates, key=lambda c: _score_key(c), reverse=True)[:10]
+            debug_payload = {
+                "ticket_activity": sorted(ticket_activity),
+                "selected_activity_summary": [
+                    {
+                        "clause_id": cid,
+                        "activity": sorted(candidate_by_id.get(cid, {}).get("activity", set())),
+                    }
+                    for cid in legacy_ordered[:max_selected]
+                ],
+                "top10_candidates_by_base_score": [
+                    {"clause_id": c["cid"], "score": float(c["base_score"])}
+                    for c in top10
+                ],
+                "filter_fallback_used": False,
+            }
+        return legacy_ordered, reasons, debug_payload
+
+    filtered_candidates: List[Dict[str, Any]] = []
+    ticket_action = ticket_activity & action_activity
+    if ticket_action:
+        for cand in candidates:
+            if cand["activity"] & ticket_action:
+                filtered_candidates.append(cand)
+                reasons[cand["cid"]].append("activity_match")
+    if not filtered_candidates and activity_filter_fallback:
+        filtered_candidates = list(candidates)
+        filter_fallback_used = True
+
+    selected_ids: List[str] = []
+    working = list(filtered_candidates)
+    if anchor_top1_lexical and working:
+        anchor = sorted(
+            working,
+            key=lambda c: (
+                float(c.get("lexical_score", 0.0)),
+                float(c.get("base_score", 0.0)),
+                str(c.get("cid", "")),
+            ),
+            reverse=True,
+        )[0]
+        anchor_cid = str(anchor["cid"])
+        selected_ids.append(anchor_cid)
+        reasons[anchor_cid].append("anchor_top1_lexical")
+
+    while len(selected_ids) < max_selected:
+        remaining = [cand for cand in working if cand["cid"] not in selected_ids]
+        if not remaining:
+            break
+        best_cid = None
+        best_val = None
+        for cand in remaining:
+            redundancy = 0.0
+            if selected_ids:
+                redundancy = max(
+                    _token_jaccard(
+                        cand.get("token_set", set()),
+                        candidate_by_id.get(sel_id, {}).get("token_set", set()),
+                    )
+                    for sel_id in selected_ids
+                    if sel_id in candidate_by_id
+                )
+            mmr_value = float(cand.get("base_score", 0.0)) - float(mmr_lambda) * redundancy
+            tie = (
+                mmr_value,
+                float(cand.get("lexical_score", 0.0)),
+                float(cand.get("base_score", 0.0)),
+                str(cand.get("cid", "")),
+            )
+            if best_val is None or tie > best_val:
+                best_val = tie
+                best_cid = str(cand["cid"])
+        if not best_cid:
+            break
+        selected_ids.append(best_cid)
+        reasons[best_cid].append("mmr_selected")
+
+    if not selected_ids:
+        selected_ids = [cid for cid in ordered[:max_selected]]
+
+    debug_payload = {}
+    if include_debug:
+        top10 = sorted(candidates, key=lambda c: _score_key(c), reverse=True)[:10]
+        debug_payload = {
+            "ticket_activity": sorted(ticket_activity),
+            "selected_activity_summary": [
+                {
+                    "clause_id": cid,
+                    "activity": sorted(candidate_by_id.get(cid, {}).get("activity", set())),
+                }
+                for cid in selected_ids
+            ],
+            "top10_candidates_by_base_score": [
+                {"clause_id": c["cid"], "score": float(c["base_score"])}
+                for c in top10
+            ],
+            "filter_fallback_used": bool(filter_fallback_used),
+        }
+    return selected_ids, reasons, debug_payload
 
 
 def _run_shared_topk(
@@ -837,6 +1179,28 @@ def _apply_threaded_budget_default(args: argparse.Namespace) -> None:
     current = getattr(args, "thread_context_budget_chars", None)
     if current is None or current == 8000:
         setattr(args, "thread_context_budget_chars", THREADED_FU_RECOMMENDED_BUDGET)
+
+
+def _resolve_goc_internal_budgets(args: argparse.Namespace) -> Tuple[int, int, int]:
+    active_tokens = int(getattr(args, "goc_internal_budget_active_tokens", 1200) or 1200)
+    unfold_tokens = int(getattr(args, "goc_internal_budget_unfold_tokens", 650) or 650)
+    unfold_k = int(getattr(args, "goc_internal_unfold_k", 8) or 8)
+    if bool(getattr(args, "goc_budget_follow_sweep", False)):
+        divisor = max(1, int(getattr(args, "goc_budget_chars_to_tokens_divisor", 4) or 4))
+        budget_chars = int(getattr(args, "thread_context_budget_chars", 0) or 0)
+        if budget_chars > 0:
+            active_tokens = max(200, budget_chars // divisor)
+            unfold_tokens = max(100, int(0.55 * active_tokens))
+    return active_tokens, unfold_tokens, unfold_k
+
+
+def _resolve_goc_unfold_controls(args: argparse.Namespace) -> Tuple[int, int, str]:
+    max_nodes = int(getattr(args, "goc_unfold_max_nodes", 0) or 0)
+    hops = int(getattr(args, "goc_unfold_hops", 0) or 0)
+    mode = str(getattr(args, "goc_unfold_budget_mode", "nodes_and_hops") or "nodes_and_hops")
+    if mode not in {"nodes_only", "hops_only", "nodes_and_hops"}:
+        mode = "nodes_and_hops"
+    return max(0, max_nodes), max(0, hops), mode
 
 
 def quickcheck_compare_report(
@@ -1515,9 +1879,142 @@ def _evaluate_method(
     episode_judge: Dict[int, List[float]] = {1: [], 2: [], 3: []}
     episode_commit: Dict[int, List[float]] = {1: [], 2: [], 3: []}
     episode_cov_core: Dict[int, List[float]] = {1: [], 2: [], 3: []}
+    (
+        goc_internal_budget_active_tokens,
+        goc_internal_budget_unfold_tokens,
+        goc_internal_unfold_k,
+    ) = _resolve_goc_internal_budgets(args)
+    (
+        goc_unfold_max_nodes_cfg,
+        goc_unfold_hops_cfg,
+        goc_unfold_budget_mode_cfg,
+    ) = _resolve_goc_unfold_controls(args)
+    save_event_trace = bool(getattr(args, "save_event_trace", False))
+    event_trace_sample_rate = float(getattr(args, "event_trace_sample_rate", 1.0) or 1.0)
+    event_trace_sample_rate = max(0.0, min(1.0, event_trace_sample_rate))
+    event_trace_dir_arg = str(getattr(args, "event_trace_dir", "") or "").strip()
+    event_trace_root = Path(event_trace_dir_arg) if event_trace_dir_arg else (run_dir / "event_traces")
+    event_trace_run_id = run_id or run_dir.name
+    task_iterable: List[Any] = list(tasks)
+    parallel_workers = max(1, int(getattr(args, "parallel_workers", 1) or 1))
+    threaded_modes = {"threaded_v1_2", "threaded_v1_3_fu", "threaded_v1_3_fu_decoy"}
+    tasks_are_threaded = bool(
+        any(getattr(t, "thread_id", None) for t in tasks)
+        or any(getattr(t, "scenario_mode", getattr(args, "scenario_mode", "v0")) in threaded_modes for t in tasks)
+    )
+    if parallel_workers > 1 and len(tasks) > 1:
+        if controller_mode == "train":
+            raise ValueError(
+                "parallel_workers > 1 is not supported with controller_mode=train "
+                "(controller updates must run sequentially)."
+            )
+        if (
+            method == "goc"
+            and bool(getattr(args, "save_goc_graph", False))
+            and str(getattr(args, "goc_graph_dir", "") or "").endswith(".jsonl")
+        ):
+            raise ValueError(
+                "parallel_workers > 1 is not supported with --goc_graph_dir ending in .jsonl "
+                "(shared graph jsonl file would race). Use per-task graph output directory."
+            )
 
-    total_tasks = len(tasks)
-    for task_idx, task in enumerate(tasks, start=1):
+        grouped_tasks: List[Tuple[str, List[Any]]] = []
+        if tasks_are_threaded:
+            grouped: Dict[str, List[Any]] = {}
+            order: List[str] = []
+            for task in tasks:
+                key = str(getattr(task, "thread_id", None) or f"__task__:{task.task_id}")
+                if key not in grouped:
+                    grouped[key] = []
+                    order.append(key)
+                grouped[key].append(task)
+            for key in order:
+                grouped_tasks.append(
+                    (
+                        key,
+                        sorted(
+                            grouped[key],
+                            key=lambda t: (
+                                int(getattr(t, "episode_id", 0) or 0),
+                                str(getattr(t, "task_id", "")),
+                            ),
+                        ),
+                    )
+                )
+        else:
+            grouped_tasks = [(str(task.task_id), [task]) for task in tasks]
+
+        def _run_group(task_group: List[Any]) -> Dict[str, Any]:
+            local_args = argparse.Namespace(**vars(args))
+            local_args.parallel_workers = 1
+            return _evaluate_method(
+                method,
+                world,
+                task_group,
+                local_args,
+                client,
+                run_dir,
+                run_id=run_id,
+                controller=controller,
+                controller_mode=controller_mode,
+                controller_policy=controller_policy,
+                llm_backend=llm_backend,
+                client_class=client_class,
+                resolved_model=resolved_model,
+            )
+
+        ordered_reports: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            fut_to_idx = {
+                executor.submit(_run_group, task_group): idx
+                for idx, (_key, task_group) in enumerate(grouped_tasks)
+            }
+            tmp_reports: Dict[int, Dict[str, Any]] = {}
+            for fut in as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                tmp_reports[idx] = fut.result()
+            ordered_reports = [tmp_reports[idx] for idx in range(len(grouped_tasks))]
+
+        merged_records: List[Dict[str, Any]] = []
+        merged_thread_records: List[Dict[str, Any]] = []
+        merged_controller_actions: Dict[str, int] = {}
+        for rep in ordered_reports:
+            merged_records.extend(list(rep.get("records") or []))
+            merged_thread_records.extend(list(rep.get("thread_records") or []))
+            for action, count in (rep.get("controller_actions_distribution") or {}).items():
+                merged_controller_actions[action] = merged_controller_actions.get(action, 0) + int(count or 0)
+
+        task_pos = {str(task.task_id): idx for idx, task in enumerate(tasks)}
+        merged_records.sort(key=lambda r: task_pos.get(str(r.get("task_id", "")), 10**9))
+        merged_thread_records.sort(
+            key=lambda r: (
+                str(r.get("thread_id") or ""),
+                int(r.get("episode_id") or 0),
+                task_pos.get(str(r.get("task_id", "")), 10**9),
+            )
+        )
+
+        records = merged_records
+        thread_records = merged_thread_records
+        controller_actions = merged_controller_actions
+        for rec in records:
+            episode_id = rec.get("episode_id")
+            if not rec.get("thread_id") or episode_id not in {1, 2, 3}:
+                continue
+            if isinstance(rec.get("judge_correct"), bool):
+                episode_judge[int(episode_id)].append(1.0 if rec.get("judge_correct") else 0.0)
+            if isinstance(rec.get("commit_correct"), bool):
+                episode_commit[int(episode_id)].append(1.0 if rec.get("commit_correct") else 0.0)
+            if isinstance(rec.get("opened_gold_coverage_core"), (int, float)):
+                episode_cov_core[int(episode_id)].append(float(rec.get("opened_gold_coverage_core") or 0.0))
+        metrics = [_task_metrics_from_record(rec) for rec in records]
+        tool_calls = [int(rec.get("tool_calls") or 0) for rec in records]
+        open_calls = [int(rec.get("open_calls") or 0) for rec in records]
+        prompt_tokens_list = [int(rec.get("prompt_tokens") or 0) for rec in records]
+        task_iterable = []
+
+    total_tasks = len(task_iterable)
+    for task_idx, task in enumerate(task_iterable, start=1):
         if total_tasks and (task_idx == 1 or task_idx % 25 == 0 or task_idx == total_tasks):
             print(
                 f"[eval:{method}] task {task_idx}/{total_tasks} ({task.task_id})",
@@ -1585,6 +2082,13 @@ def _evaluate_method(
         agent_query_policy = getattr(args, "agent_query_policy", "single_hop")
         shared_open_policy = getattr(args, "thread_open_policy", "current")
         task_for_run = task
+        ticket_initial = str(getattr(task, "ticket_initial", None) or task.user_ticket or "")
+        ticket_updated = str(getattr(task, "ticket_updated", None) or "").strip()
+        pivot_type = str(getattr(task, "pivot_type", None) or "")
+        is_pivot_task = bool(ticket_updated)
+        if ticket_initial and ticket_initial != str(getattr(task, "user_ticket", "") or ""):
+            task_for_run = copy.deepcopy(task)
+            task_for_run.user_ticket = ticket_initial
         e3_context_budget_chars: int | None = None
         e3_context_chars_used: int | None = None
         e3_context_clause_count: int | None = None
@@ -1623,10 +2127,16 @@ def _evaluate_method(
         goc_unfolded_critical_clause_count: int | None = None
         goc_unfold_selected_clause_ids: List[str] = []
         goc_unfold_reason: str | None = None
+        goc_closure_candidate_count: int | None = None
+        goc_unfolded_node_count: int | None = None
+        goc_selected_node_ids: List[str] = []
+        goc_unfolded_node_ids: List[str] = []
         judge_correct_full_episode: bool | None = None
         full_episode_supporting_count: int | None = None
         if threaded_mode and thread_state and episode_id:
-            task_for_run = copy.deepcopy(task)
+            if task_for_run is task:
+                task_for_run = copy.deepcopy(task)
+            task_for_run.user_ticket = ticket_initial or task_for_run.user_ticket
             commit_refs = _format_commit_refs(
                 (thread_state.get("commit1") or {}).get("short_fact"),
                 (thread_state.get("commit2") or {}).get("short_fact"),
@@ -1634,6 +2144,19 @@ def _evaluate_method(
             )
             if commit_refs:
                 task_for_run.user_ticket = f"{task_for_run.user_ticket}\n\n{commit_refs}"
+        if threaded_mode and episode_id == 3 and is_pivot_task:
+            if task_for_run is task:
+                task_for_run = copy.deepcopy(task)
+                task_for_run.user_ticket = ticket_initial or task_for_run.user_ticket
+            task_for_run.user_ticket = (
+                f"{task_for_run.user_ticket}\n\n"
+                "Ticket Update (latest user instruction):\n"
+                f"{ticket_updated}"
+            )
+        elif (not threaded_mode) and is_pivot_task:
+            if task_for_run is task:
+                task_for_run = copy.deepcopy(task)
+            task_for_run.user_ticket = ticket_updated
         if threaded_mode and episode_id in {1, 2} and shared_open_policy == "shared_topk":
             pred, opened_ids, prompt, raw_output, diag = _run_shared_topk(
                 task_for_run,
@@ -1700,6 +2223,7 @@ def _evaluate_method(
             context_clause_ids: List[str] = []
             summary_text = None
             reason_map: Dict[str, List[str]] = {}
+            goc_selection_debug: Dict[str, Any] = {}
             if method in {"full", "full_history"}:
                 compose_strategy = "full_history"
                 context_clause_ids = list(dict.fromkeys(opened_history_ids))
@@ -1726,13 +2250,75 @@ def _evaluate_method(
                 clause_objs = [world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)]
                 summary_text = summarize_clause_history(clause_objs, max_items=6)
                 critical_clause_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
-                context_clause_ids, reason_map = _select_goc_unfold_clause_ids(
+                activity_filter = bool(getattr(args, "goc_activity_filter", False))
+                activity_filter_fallback = bool(
+                    getattr(args, "goc_activity_filter_fallback", True)
+                )
+                mmr_lambda = float(getattr(args, "goc_mmr_lambda", 0.35) or 0.35)
+                anchor_top1 = bool(getattr(args, "goc_anchor_top1_lexical", True))
+                include_activity_debug = bool(
+                    getattr(args, "goc_activity_debug_in_snapshot", False)
+                )
+
+                # First pass chooses anchor seeds from full opened history.
+                anchor_ids, _anchor_reason_map, _anchor_debug = _select_goc_unfold_clause_ids(
                     opened_history_ids,
                     commit_clause_ids,
                     critical_clause_ids,
                     task_for_run.user_ticket,
                     world,
+                    activity_filter=activity_filter,
+                    activity_filter_fallback=activity_filter_fallback,
+                    mmr_lambda=mmr_lambda,
+                    anchor_top1_lexical=anchor_top1,
+                    max_selected=max(1, min(4, len(opened_history_ids))),
+                    include_debug=False,
                 )
+                anchor_ids = _unique_strs(
+                    list(anchor_ids[: max(1, min(4, len(anchor_ids)))])
+                    if anchor_ids
+                    else list(commit_clause_ids[:2]) + list(critical_clause_ids[:2]) + list(opened_history_ids[:2])
+                )
+
+                unfold_candidate_ids = list(opened_history_ids)
+                if (
+                    goc_unfold_budget_mode_cfg in {"hops_only", "nodes_and_hops"}
+                    and goc_unfold_hops_cfg > 0
+                    and anchor_ids
+                ):
+                    closure_ids = _expand_clause_dependency_closure(
+                        anchor_ids,
+                        opened_history_ids,
+                        world,
+                        max_hops=goc_unfold_hops_cfg,
+                    )
+                    if closure_ids:
+                        unfold_candidate_ids = closure_ids
+                    else:
+                        unfold_candidate_ids = list(anchor_ids)
+
+                if goc_unfold_budget_mode_cfg == "hops_only":
+                    max_selected = max(1, len(unfold_candidate_ids))
+                else:
+                    max_selected = int(goc_unfold_max_nodes_cfg) if goc_unfold_max_nodes_cfg > 0 else 4
+
+                context_clause_ids, reason_map, goc_selection_debug = _select_goc_unfold_clause_ids(
+                    unfold_candidate_ids,
+                    commit_clause_ids,
+                    critical_clause_ids,
+                    task_for_run.user_ticket,
+                    world,
+                    activity_filter=activity_filter,
+                    activity_filter_fallback=activity_filter_fallback,
+                    mmr_lambda=mmr_lambda,
+                    anchor_top1_lexical=anchor_top1,
+                    max_selected=max_selected,
+                    include_debug=include_activity_debug,
+                )
+                goc_closure_candidate_count = int(len(unfold_candidate_ids))
+                goc_unfolded_node_count = int(len(unfold_candidate_ids))
+                goc_unfolded_node_ids = list(unfold_candidate_ids)
+                goc_selected_node_ids = list(context_clause_ids)
                 goc_folded_episode_count = 2
             context_budget = int(getattr(args, "thread_context_budget_chars", 8000))
             e3_context_budget_chars = context_budget
@@ -1774,6 +2360,11 @@ def _evaluate_method(
             if method == "goc":
                 goc_unfolded_clause_count = len(context_clauses)
                 goc_unfold_selected_clause_ids = list(e3_context_clause_ids[:10])
+                goc_selected_node_ids = list(e3_context_clause_ids)
+                if not goc_unfolded_node_ids:
+                    goc_unfolded_node_ids = list(e3_context_clause_ids)
+                    goc_unfolded_node_count = len(goc_unfolded_node_ids)
+                    goc_closure_candidate_count = len(goc_unfolded_node_ids)
                 reasons: List[str] = []
                 for cid in e3_context_clause_ids:
                     reasons.extend(reason_map.get(cid, []))
@@ -1888,6 +2479,12 @@ def _evaluate_method(
                                 "episode_id": episode_id,
                                 "clause_ids": e3_context_clause_ids,
                                 "reason": goc_unfold_reason,
+                                "goc_unfold_max_nodes": goc_unfold_max_nodes_cfg,
+                                "goc_unfold_hops": goc_unfold_hops_cfg,
+                                "closure_candidate_count": goc_closure_candidate_count,
+                                "unfolded_node_count": goc_unfolded_node_count,
+                                "selected_node_ids": goc_selected_node_ids,
+                                "unfolded_node_ids": goc_unfolded_node_ids,
                             },
                         ),
                     )
@@ -1930,7 +2527,18 @@ def _evaluate_method(
                 "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
                 "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
                 "goc_unfold_reason": goc_unfold_reason,
+                "goc_unfold_max_nodes": goc_unfold_max_nodes_cfg if method == "goc" else None,
+                "goc_unfold_hops": goc_unfold_hops_cfg if method == "goc" else None,
+                "goc_unfold_budget_mode": (
+                    goc_unfold_budget_mode_cfg if method == "goc" else None
+                ),
+                "closure_candidate_count": goc_closure_candidate_count,
+                "unfolded_node_count": goc_unfolded_node_count,
+                "selected_node_ids": list(goc_selected_node_ids),
+                "unfolded_node_ids": list(goc_unfolded_node_ids),
             }
+            if bool(getattr(args, "goc_activity_debug_in_snapshot", False)) and goc_selection_debug:
+                diag["goc_activity_debug"] = goc_selection_debug
         elif method == "topk":
             pred, opened_ids, prompt, raw_output, diag = run_topk_rag(
                 task_for_run,
@@ -1977,9 +2585,20 @@ def _evaluate_method(
                 open_split_hop1=int(getattr(args, "open_split_hop1", 0)),
                 open_policy=getattr(args, "open_policy", "current"),
                 save_internal_graph=bool(log_graph),
-                internal_budget_active=1200,
-                internal_budget_unfold=650,
-                internal_unfold_k=8,
+                internal_budget_active=int(goc_internal_budget_active_tokens),
+                internal_budget_unfold=int(goc_internal_budget_unfold_tokens),
+                internal_unfold_k=int(goc_internal_unfold_k),
+                goc_activity_filter=bool(getattr(args, "goc_activity_filter", False)),
+                goc_activity_filter_fallback=bool(
+                    getattr(args, "goc_activity_filter_fallback", True)
+                ),
+                goc_mmr_lambda=float(getattr(args, "goc_mmr_lambda", 0.35) or 0.35),
+                goc_anchor_top1_lexical=bool(
+                    getattr(args, "goc_anchor_top1_lexical", True)
+                ),
+                goc_activity_debug_in_snapshot=bool(
+                    getattr(args, "goc_activity_debug_in_snapshot", False)
+                ),
             )
             if isinstance(diag, dict):
                 maybe_snaps = diag.get("goc_internal_snapshots")
@@ -2184,6 +2803,10 @@ def _evaluate_method(
         judge_correct_packed_allcritical: bool | None = None
         judge_supporting_clause_ids: List[str] | None = None
         judge_supporting_count: int | None = None
+        pivot_compliant: bool | None = None
+        stale_evidence: bool | None = None
+        pivot_old_days: int | None = None
+        pivot_updated_days: int | None = None
         judge_mode = getattr(args, "judge", "llm")
         if judge_mode in {
             "symbolic",
@@ -2277,6 +2900,27 @@ def _evaluate_method(
                 )
             if not full_episode_clause_ids:
                 full_episode_clause_ids = list(e12_opened_clause_ids)
+        if is_pivot_task and (not threaded_mode or episode_id == 3):
+            (
+                pivot_compliant,
+                stale_evidence,
+                pivot_old_days,
+                pivot_updated_days,
+            ) = _compute_pivot_compliance(
+                ticket_initial=ticket_initial,
+                ticket_updated=ticket_updated,
+                pivot_type=pivot_type,
+                raw_output=raw_output,
+            )
+            if isinstance(judge_correct, bool) and isinstance(pivot_compliant, bool):
+                # Pilot rule: final-stage correctness must also satisfy updated ticket intent.
+                judge_correct = bool(judge_correct and pivot_compliant)
+                if judge_mode == "symbolic_full_episode":
+                    judge_correct_full_episode = judge_correct
+                if isinstance(judge_correct, bool):
+                    judge_correct_packed_allcritical = bool(
+                        judge_correct and e3_packed_all_critical is True
+                    )
         task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
         metrics.append(task_metrics)
         tool_calls.append(env.tool_call_count)
@@ -2410,6 +3054,14 @@ def _evaluate_method(
         record: Dict[str, Any] = {
             "task_id": task.task_id,
             "method": method,
+            "ticket_initial": ticket_initial or None,
+            "ticket_updated": ticket_updated or None,
+            "pivot_type": pivot_type or None,
+            "is_pivot_task": bool(is_pivot_task),
+            "pivot_compliant": pivot_compliant,
+            "stale_evidence": stale_evidence,
+            "pivot_old_days": pivot_old_days,
+            "pivot_updated_days": pivot_updated_days,
             "opened_clause_ids": opened_ids,
             "opened_decoy_clause_count": opened_decoy_clause_count,
             "opened_decoy_present": opened_decoy_clause_count > 0,
@@ -2525,6 +3177,13 @@ def _evaluate_method(
             "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
             "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
             "goc_unfold_reason": goc_unfold_reason,
+            "goc_unfold_max_nodes": goc_unfold_max_nodes_cfg if method == "goc" else None,
+            "goc_unfold_hops": goc_unfold_hops_cfg if method == "goc" else None,
+            "goc_unfold_budget_mode": goc_unfold_budget_mode_cfg if method == "goc" else None,
+            "goc_closure_candidate_count": goc_closure_candidate_count,
+            "goc_unfolded_node_count": goc_unfolded_node_count,
+            "goc_selected_node_ids": list(goc_selected_node_ids),
+            "goc_unfolded_node_ids": list(goc_unfolded_node_ids),
             "opened_evidence_clause_ids": opened_evidence_clause_ids,
             "opened_evidence_doc_ids": opened_evidence_doc_ids,
             "active_context_node_ids": active_context_node_ids,
@@ -2757,6 +3416,8 @@ def _evaluate_method(
         )
         if include_raw_output:
             record["raw_output"] = raw_output or ""
+        prompt_path: Path | None = None
+        raw_path: Path | None = None
         if args.save_prompts:
             prompt_dir = run_dir / "prompts"
             prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -2774,6 +3435,157 @@ def _evaluate_method(
         record["goc_internal_graph_jsonl_path"] = (
             str(goc_internal_graph_task_path) if goc_internal_graph_task_path else None
         )
+        if save_event_trace:
+            trace_this_task = False
+            if event_trace_sample_rate >= 1.0:
+                trace_this_task = True
+            elif event_trace_sample_rate > 0.0:
+                digest = hashlib.md5(f"{method}:{task.task_id}".encode("utf-8")).hexdigest()
+                bucket = int(digest[:8], 16) / float(0xFFFFFFFF)
+                trace_this_task = bucket <= event_trace_sample_rate
+            if trace_this_task:
+                budget_chars = (
+                    record.get("e3_context_budget_chars")
+                    if record.get("e3_context_budget_chars") is not None
+                    else getattr(args, "thread_context_budget_chars", None)
+                )
+                budget_label = str(budget_chars) if budget_chars is not None else "na"
+                trace_path = (
+                    event_trace_root
+                    / method
+                    / f"budget_{budget_label}"
+                    / f"{task.task_id}.jsonl"
+                )
+                prompt_text = prompt or ""
+                prompt_payload: Dict[str, Any]
+                if prompt_path is not None:
+                    prompt_payload = {"prompt_path": str(prompt_path)}
+                else:
+                    prompt_payload = {
+                        "prompt_text": prompt_text[:20000],
+                        "prompt_text_truncated": len(prompt_text) > 20000,
+                    }
+                raw_text = raw_output or ""
+                prediction_payload: Dict[str, Any]
+                if raw_path is not None:
+                    prediction_payload = {"raw_path": str(raw_path)}
+                else:
+                    prediction_payload = {
+                        "raw_text": raw_text[:20000],
+                        "raw_text_truncated": len(raw_text) > 20000,
+                    }
+                prediction_payload["judge_correct"] = record.get("judge_correct")
+                prediction_payload["packed_all_critical"] = record.get(
+                    "judge_correct_packed_allcritical"
+                )
+                prediction_payload["judge_correct_packed_allcritical"] = record.get(
+                    "judge_correct_packed_allcritical"
+                )
+                snapshot_selected_clause_ids = _unique_strs(
+                    list(record.get("opened_for_prompt_clause_ids") or [])
+                    or list(record.get("e3_context_clause_ids") or [])
+                    or list(record.get("opened_clause_ids") or [])
+                )
+                snapshot_unfolded_clause_ids = _unique_strs(
+                    list(record.get("unfolded_activated_clause_ids") or [])
+                    or list(record.get("goc_unfold_selected_clause_ids") or [])
+                )
+                append_event(
+                    trace_path,
+                    build_event(
+                        event_trace_run_id,
+                        task.task_id,
+                        method,
+                        0,
+                        "INIT",
+                        {
+                            "thread_id": thread_id,
+                            "episode_id": episode_id,
+                            "budget_chars": budget_chars,
+                            "method": method,
+                            "model": resolved_model,
+                            "is_pivot_task": bool(record.get("is_pivot_task")),
+                            "pivot_type": record.get("pivot_type"),
+                            "pivot_old_days": record.get("pivot_old_days"),
+                            "pivot_updated_days": record.get("pivot_updated_days"),
+                        },
+                    ),
+                )
+                append_event(
+                    trace_path,
+                    build_event(
+                        event_trace_run_id,
+                        task.task_id,
+                        method,
+                        1,
+                        "PROMPT",
+                        prompt_payload,
+                    ),
+                )
+                append_event(
+                    trace_path,
+                    build_event(
+                        event_trace_run_id,
+                        task.task_id,
+                        method,
+                        2,
+                        "PREDICTION",
+                        prediction_payload,
+                    ),
+                )
+                snapshot_payload: Dict[str, Any] = {
+                    "selected_clause_ids": snapshot_selected_clause_ids,
+                    "unfolded_clause_ids": snapshot_unfolded_clause_ids,
+                    "active_context_clause_ids": _unique_strs(
+                        list(record.get("active_context_clause_ids") or [])
+                    ),
+                    "prompt_tokens": record.get("prompt_tokens"),
+                    "e3_context_chars_used": record.get("e3_context_chars_used"),
+                    "e3_context_token_est": record.get("e3_context_token_est"),
+                    "e3_packed_token_est": record.get("e3_packed_token_est"),
+                    "pivot_compliant": record.get("pivot_compliant"),
+                    "stale_evidence": record.get("stale_evidence"),
+                    "goc_unfold_max_nodes": record.get("goc_unfold_max_nodes"),
+                    "goc_unfold_hops": record.get("goc_unfold_hops"),
+                    "goc_unfold_budget_mode": record.get("goc_unfold_budget_mode"),
+                    "closure_candidate_count": record.get("goc_closure_candidate_count"),
+                    "unfolded_node_count": record.get("goc_unfolded_node_count"),
+                    "selected_node_ids": _unique_strs(
+                        list(record.get("goc_selected_node_ids") or [])
+                    ),
+                    "unfolded_node_ids": _unique_strs(
+                        list(record.get("goc_unfolded_node_ids") or [])
+                    ),
+                }
+                if bool(getattr(args, "goc_activity_debug_in_snapshot", False)):
+                    debug_payload = record.get("goc_activity_debug")
+                    if isinstance(debug_payload, dict):
+                        if isinstance(debug_payload.get("ticket_activity"), list):
+                            snapshot_payload["ticket_activity"] = list(
+                                debug_payload.get("ticket_activity") or []
+                            )
+                        if debug_payload.get("selected_activity_summary") is not None:
+                            snapshot_payload["selected_activity_summary"] = debug_payload.get(
+                                "selected_activity_summary"
+                            )
+                        if debug_payload.get("top10_candidates_by_base_score") is not None:
+                            snapshot_payload["top10_candidates_by_base_score"] = debug_payload.get(
+                                "top10_candidates_by_base_score"
+                            )
+                        snapshot_payload["filter_fallback_used"] = bool(
+                            debug_payload.get("filter_fallback_used", False)
+                        )
+                append_event(
+                    trace_path,
+                    build_event(
+                        event_trace_run_id,
+                        task.task_id,
+                        method,
+                        3,
+                        "SNAPSHOT",
+                        snapshot_payload,
+                    ),
+                )
         if method == "goc" and getattr(args, "goc_graph_sample_rate", 1.0) <= 0.0:
             record["goc_graph_jsonl_path"] = None
             record["goc_graph_dot_path"] = None
@@ -2851,7 +3663,7 @@ def _evaluate_method(
             episode_node_id = f"episode:{task.task_id}"
             ticket_id = f"ticket:{task.task_id}"
             goc_graph.add_node(episode_node_id, "episode", step=goc_graph.step)
-            goc_graph.add_node(ticket_id, "ticket", text=task.user_ticket, step=goc_graph.step)
+            goc_graph.add_node(ticket_id, "ticket", text=task_for_run.user_ticket, step=goc_graph.step)
             _log("INIT", {"episode_id": episode_node_id, "ticket_id": ticket_id})
             goc_graph.step += 1
 
@@ -3607,6 +4419,14 @@ def _evaluate_method(
         "goc_unfolded_clause_count",
         default=None,
     )
+    aggregate["goc_closure_candidate_count_mean"] = _mean_metric(
+        "goc_closure_candidate_count",
+        default=None,
+    )
+    aggregate["goc_unfolded_node_count_mean"] = _mean_metric(
+        "goc_unfolded_node_count",
+        default=None,
+    )
     aggregate["goc_unfolded_critical_clause_count_mean"] = _mean_metric(
         "goc_unfolded_critical_clause_count",
         default=None,
@@ -3622,6 +4442,48 @@ def _evaluate_method(
     aggregate["wrong_branch_recall_rate_mean"] = _mean_metric(
         "wrong_branch_recall_rate",
         default=None,
+    )
+    pivot_records = [r for r in records if r.get("is_pivot_task")]
+    nonpivot_records = [r for r in records if not r.get("is_pivot_task")]
+    aggregate["pivot_rate_actual"] = (
+        float(len(pivot_records)) / float(len(records)) if records else 0.0
+    )
+    pivot_compliance_vals = [
+        1.0 if r.get("pivot_compliant") else 0.0
+        for r in pivot_records
+        if isinstance(r.get("pivot_compliant"), bool)
+    ]
+    aggregate["pivot_compliance_rate"] = (
+        sum(pivot_compliance_vals) / len(pivot_compliance_vals)
+        if pivot_compliance_vals
+        else None
+    )
+    stale_evidence_vals = [
+        1.0 if r.get("stale_evidence") else 0.0
+        for r in pivot_records
+        if isinstance(r.get("stale_evidence"), bool)
+    ]
+    aggregate["stale_evidence_rate"] = (
+        sum(stale_evidence_vals) / len(stale_evidence_vals)
+        if stale_evidence_vals
+        else None
+    )
+    pivot_acc_vals = [
+        1.0 if r.get("judge_correct") else 0.0
+        for r in pivot_records
+        if isinstance(r.get("judge_correct"), bool)
+    ]
+    nonpivot_acc_vals = [
+        1.0 if r.get("judge_correct") else 0.0
+        for r in nonpivot_records
+        if isinstance(r.get("judge_correct"), bool)
+    ]
+    pivot_acc = (sum(pivot_acc_vals) / len(pivot_acc_vals)) if pivot_acc_vals else None
+    nonpivot_acc = (sum(nonpivot_acc_vals) / len(nonpivot_acc_vals)) if nonpivot_acc_vals else None
+    aggregate["pivot_delta_accuracy"] = (
+        float(pivot_acc - nonpivot_acc)
+        if (pivot_acc is not None and nonpivot_acc is not None)
+        else None
     )
     aggregate["judge_accuracy_packed_allcritical"] = _mean_metric(
         "judge_correct_packed_allcritical",
@@ -3761,6 +4623,18 @@ def _evaluate_method(
         "controller_action_counts": action_counts,
         "controller_action_opened_gold_coverage_mean": action_cov_mean,
         "controller_action_opened_has_winning_clause_rate": action_winning_rate,
+        "goc_internal_budget_active_tokens": (
+            int(goc_internal_budget_active_tokens) if method in {"goc", "goc_base"} else None
+        ),
+        "goc_internal_budget_unfold_tokens": (
+            int(goc_internal_budget_unfold_tokens) if method in {"goc", "goc_base"} else None
+        ),
+        "goc_internal_unfold_k": int(goc_internal_unfold_k) if method in {"goc", "goc_base"} else None,
+        "goc_unfold_max_nodes": int(goc_unfold_max_nodes_cfg) if method in {"goc", "goc_base"} else None,
+        "goc_unfold_hops": int(goc_unfold_hops_cfg) if method in {"goc", "goc_base"} else None,
+        "goc_unfold_budget_mode": (
+            str(goc_unfold_budget_mode_cfg) if method in {"goc", "goc_base"} else None
+        ),
     }
     if controller_policy == "rerank" and isinstance(controller, RerankController):
         report["rerank_weights"] = dict(controller.weights)
@@ -3816,6 +4690,8 @@ def cmd_generate(args: argparse.Namespace) -> None:
         ),
         e3_clause_jitter_max_chars=int(getattr(args, "e3_clause_jitter_max_chars", 0) or 0),
         e3_clause_jitter_scope=str(getattr(args, "e3_clause_jitter_scope", "decoy_only") or "decoy_only"),
+        pivot_rate=float(getattr(args, "pivot_rate", 0.0) or 0.0),
+        pivot_type=str(getattr(args, "pivot_type", "retention_flip") or "retention_flip"),
         preset_name=getattr(args, "preset", None),
     )
     thread_ids = {t.thread_id for t in tasks if getattr(t, "thread_id", None)}
@@ -3999,6 +4875,48 @@ def cmd_compare(args: argparse.Namespace) -> None:
                     {
                         "budget": budget,
                         "method": method,
+                        "report_json": str(report_path),
+                        "goc_internal_budget_active_tokens": (
+                            report_obj.get("goc_internal_budget_active_tokens")
+                            if method == "goc"
+                            else None
+                        ),
+                        "goc_internal_budget_unfold_tokens": (
+                            report_obj.get("goc_internal_budget_unfold_tokens")
+                            if method == "goc"
+                            else None
+                        ),
+                        "goc_internal_unfold_k": (
+                            report_obj.get("goc_internal_unfold_k")
+                            if method == "goc"
+                            else None
+                        ),
+                        "goc_unfold_max_nodes": (
+                            report_obj.get("goc_unfold_max_nodes")
+                            if method == "goc"
+                            else None
+                        ),
+                        "goc_unfold_hops": (
+                            report_obj.get("goc_unfold_hops")
+                            if method == "goc"
+                            else None
+                        ),
+                        "goc_unfold_budget_mode": (
+                            report_obj.get("goc_unfold_budget_mode")
+                            if method == "goc"
+                            else None
+                        ),
+                        "judge_accuracy_packed": metrics.get("judge_accuracy_packed"),
+                        "judge_accuracy_packed_allcritical": metrics.get(
+                            "judge_accuracy_packed_allcritical"
+                        ),
+                        "rank_success_rate": metrics.get("rank_success_rate"),
+                        "winning_in_union_rate": metrics.get("winning_in_union_rate"),
+                        "selection_efficiency": metrics.get("selection_efficiency"),
+                        "e3_context_token_est_mean": metrics.get("e3_context_token_est_mean"),
+                        "e3_packed_token_est_mean": metrics.get("e3_packed_token_est_mean"),
+                        "acc_per_1k_tokens": metrics.get("acc_per_1k_tokens"),
+                        "cost_per_correct_token_est": metrics.get("cost_per_correct_token_est"),
                         "e3_context_truncated_rate": metrics.get("e3_context_truncated_rate"),
                         "e3_packed_all_critical_rate": metrics.get(
                             "e3_packed_all_critical_rate"
@@ -4021,6 +4939,12 @@ def cmd_compare(args: argparse.Namespace) -> None:
                         "goc_unfolded_clause_count_mean": metrics.get(
                             "goc_unfolded_clause_count_mean"
                         ),
+                        "goc_closure_candidate_count_mean": metrics.get(
+                            "goc_closure_candidate_count_mean"
+                        ),
+                        "goc_unfolded_node_count_mean": metrics.get(
+                            "goc_unfolded_node_count_mean"
+                        ),
                         "goc_unfolded_critical_clause_count_mean": metrics.get(
                             "goc_unfolded_critical_clause_count_mean"
                         ),
@@ -4041,6 +4965,22 @@ def cmd_compare(args: argparse.Namespace) -> None:
             fieldnames = [
                 "budget",
                 "method",
+                "report_json",
+                "goc_internal_budget_active_tokens",
+                "goc_internal_budget_unfold_tokens",
+                "goc_internal_unfold_k",
+                "goc_unfold_max_nodes",
+                "goc_unfold_hops",
+                "goc_unfold_budget_mode",
+                "judge_accuracy_packed",
+                "judge_accuracy_packed_allcritical",
+                "rank_success_rate",
+                "winning_in_union_rate",
+                "selection_efficiency",
+                "e3_context_token_est_mean",
+                "e3_packed_token_est_mean",
+                "acc_per_1k_tokens",
+                "cost_per_correct_token_est",
                 "e3_context_truncated_rate",
                 "e3_packed_all_critical_rate",
                 "e3_packed_any_critical_rate",
@@ -4049,6 +4989,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 "e3_context_clause_count_mean",
                 "e3_context_chars_used_mean",
                 "goc_unfolded_clause_count_mean",
+                "goc_closure_candidate_count_mean",
+                "goc_unfolded_node_count_mean",
                 "goc_unfolded_critical_clause_count_mean",
                 "goc_folded_episode_count_mean",
                 "closure_recall_core_mean",
@@ -4113,6 +5055,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
         llm_backend = "dummy"
     client_class = client.__class__.__name__
     resolved_model = getattr(client, "model", "dummy")
+    (
+        goc_internal_budget_active_tokens_eff,
+        goc_internal_budget_unfold_tokens_eff,
+        goc_internal_unfold_k_eff,
+    ) = _resolve_goc_internal_budgets(args)
 
     methods = args.methods or ["topk", "full", "goc", "oracle", "engine"]
     train_tasks, eval_tasks = _split_tasks(tasks, args.task_split, args.train_ratio, args.split_seed)
@@ -4378,6 +5325,25 @@ def cmd_compare(args: argparse.Namespace) -> None:
             ),
             "acc_per_1k_tokens": method_report["metrics"].get("acc_per_1k_tokens"),
         }
+        if method == "goc":
+            summary[method]["goc_internal_budget_active_tokens"] = method_report.get(
+                "goc_internal_budget_active_tokens"
+            )
+            summary[method]["goc_internal_budget_unfold_tokens"] = method_report.get(
+                "goc_internal_budget_unfold_tokens"
+            )
+            summary[method]["goc_internal_unfold_k"] = method_report.get(
+                "goc_internal_unfold_k"
+            )
+            summary[method]["goc_unfold_max_nodes"] = method_report.get(
+                "goc_unfold_max_nodes"
+            )
+            summary[method]["goc_unfold_hops"] = method_report.get(
+                "goc_unfold_hops"
+            )
+            summary[method]["goc_unfold_budget_mode"] = method_report.get(
+                "goc_unfold_budget_mode"
+            )
         if method == "oracle":
             oracle_cov = [
                 r.get("oracle_gold_coverage")
@@ -4419,6 +5385,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "thread_context_budget_chars": getattr(args, "thread_context_budget_chars", None),
         "thread_open_policy": getattr(args, "thread_open_policy", None),
         "thread_context_budget_sweep": getattr(args, "thread_context_budget_sweep", None),
+        "goc_internal_budget_active_tokens": int(goc_internal_budget_active_tokens_eff),
+        "goc_internal_budget_unfold_tokens": int(goc_internal_budget_unfold_tokens_eff),
+        "goc_internal_unfold_k": int(goc_internal_unfold_k_eff),
+        "goc_unfold_max_nodes": int(getattr(args, "goc_unfold_max_nodes", 0) or 0),
+        "goc_unfold_hops": int(getattr(args, "goc_unfold_hops", 0) or 0),
+        "goc_unfold_budget_mode": str(
+            getattr(args, "goc_unfold_budget_mode", "nodes_and_hops") or "nodes_and_hops"
+        ),
         "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
         "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
         "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
@@ -4427,6 +5401,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "e3_litm_filler_count_min": world.meta.get("e3_litm_filler_count_min"),
         "e3_litm_filler_count_max": world.meta.get("e3_litm_filler_count_max"),
         "e3_litm_filler_len_jitter_max": world.meta.get("e3_litm_filler_len_jitter_max"),
+        "pivot_rate_requested": world.meta.get("pivot_rate_requested"),
+        "pivot_rate_actual": world.meta.get("pivot_rate_actual"),
+        "pivot_type": world.meta.get("pivot_type"),
     }
     if any(getattr(t, "thread_id", None) for t in eval_tasks):
         scenario_params["n_threads"] = len({t.thread_id for t in eval_tasks if t.thread_id})
@@ -4449,6 +5426,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "gold_decision_distribution": gold_decision_distribution(eval_tasks),
         "summary": summary,
         "method_reports": method_reports,
+        "goc_internal_budget_active_tokens": int(goc_internal_budget_active_tokens_eff),
+        "goc_internal_budget_unfold_tokens": int(goc_internal_budget_unfold_tokens_eff),
+        "goc_internal_unfold_k": int(goc_internal_unfold_k_eff),
+        "goc_unfold_max_nodes": int(getattr(args, "goc_unfold_max_nodes", 0) or 0),
+        "goc_unfold_hops": int(getattr(args, "goc_unfold_hops", 0) or 0),
+        "goc_unfold_budget_mode": str(
+            getattr(args, "goc_unfold_budget_mode", "nodes_and_hops") or "nodes_and_hops"
+        ),
         "controller_enabled": bool(controller),
         "controller_mode": controller_mode,
         "controller_policy": args.controller_policy,
@@ -5223,6 +6208,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["decoy_only", "decoy_plus_noncritical", "all"],
         default="decoy_only",
     )
+    gen.add_argument("--pivot_rate", type=float, default=0.0)
+    gen.add_argument(
+        "--pivot_type",
+        choices=[
+            "retention_flip",
+            "entity_switch",
+            "constraint_add",
+            # Backward-compatible aliases
+            "action_flip",
+            "exception_add",
+        ],
+        default="retention_flip",
+    )
     gen.add_argument("--out_dir", type=Path, default=None)
     gen.set_defaults(func=cmd_generate)
 
@@ -5352,6 +6350,14 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--min_evidence_count", type=int, default=2)
     cmp.add_argument("--save_prompts", action="store_true", help="Save per-task prompts to files")
     cmp.add_argument("--save_raw", action="store_true", help="Save per-task raw outputs to files")
+    cmp.add_argument("--save_event_trace", action="store_true", help="Save per-task JSONL event traces")
+    cmp.add_argument(
+        "--event_trace_dir",
+        type=str,
+        default="",
+        help="Per-task event trace directory (default: <run_dir>/event_traces)",
+    )
+    cmp.add_argument("--event_trace_sample_rate", type=float, default=1.0)
     cmp.add_argument("--save_search_snapshot", action="store_true")
     cmp.add_argument("--search_snapshot_k", type=int, default=20)
     cmp.add_argument("--primary_search_top_k", type=int, default=20)
@@ -5362,6 +6368,43 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--goc_graph_dir", type=str, default="")
     cmp.add_argument("--goc_graph_schema", choices=["v0", "v1"], default="v0")
     cmp.add_argument("--goc_graph_sample_rate", type=float, default=1.0)
+    cmp.add_argument("--goc_internal_budget_active_tokens", type=int, default=1200)
+    cmp.add_argument("--goc_internal_budget_unfold_tokens", type=int, default=650)
+    cmp.add_argument("--goc_internal_unfold_k", type=int, default=8)
+    cmp.add_argument("--goc_budget_follow_sweep", action="store_true")
+    cmp.add_argument("--goc_budget_chars_to_tokens_divisor", type=int, default=4)
+    cmp.add_argument(
+        "--goc_unfold_max_nodes",
+        type=int,
+        default=0,
+        help="Max unfolded nodes in final active context (0 keeps legacy selection cap)",
+    )
+    cmp.add_argument(
+        "--goc_unfold_hops",
+        type=int,
+        default=0,
+        help="Dependency-closure hop depth from selected anchors (0 disables hop expansion)",
+    )
+    cmp.add_argument(
+        "--goc_unfold_budget_mode",
+        choices=["nodes_only", "hops_only", "nodes_and_hops"],
+        default="nodes_and_hops",
+    )
+    cmp.add_argument("--goc_activity_filter", action="store_true", default=False)
+    cmp.add_argument("--goc_activity_filter_fallback", action="store_true", default=True)
+    cmp.add_argument(
+        "--no_goc_activity_filter_fallback",
+        action="store_false",
+        dest="goc_activity_filter_fallback",
+    )
+    cmp.add_argument("--goc_mmr_lambda", type=float, default=0.35)
+    cmp.add_argument("--goc_anchor_top1_lexical", action="store_true", default=False)
+    cmp.add_argument(
+        "--no_goc_anchor_top1_lexical",
+        action="store_false",
+        dest="goc_anchor_top1_lexical",
+    )
+    cmp.add_argument("--goc_activity_debug_in_snapshot", action="store_true", default=False)
     cmp.add_argument(
         "--scenario_mode",
         choices=[
@@ -5422,6 +6465,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--debug_n", type=int, default=0)
     cmp.add_argument("--debug_task_ids", type=str, default="")
     cmp.add_argument("--n_threads", type=int, default=None)
+    cmp.add_argument("--parallel_workers", type=int, default=1)
     cmp.set_defaults(func=cmd_compare)
 
     swp = sub.add_parser("sweep", help="Run multi-seed/open_budget sweeps")

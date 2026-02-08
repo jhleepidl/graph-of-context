@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import hashlib
+import re
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -78,6 +79,220 @@ DECOY_MAX_CHARS = 320
 JITTER_FILLER_FRAGMENT = "(Additional context.)"
 JITTER_SCOPE_VALUES = {"decoy_only", "decoy_plus_noncritical", "all"}
 LITM_FILLER_POSITIONS = ["pre", "between", "post"]
+
+
+def _extract_retention_days_from_text(text: str) -> Optional[int]:
+    if not text:
+        return None
+    match = re.search(r"retention\s*days?\s*[:=]\s*(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"\b(\d+)\s*days?\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _make_pivot_ticket_update(
+    ticket_initial: str,
+    pivot_type: str,
+    *,
+    rng: random.Random,
+    task: Optional[Task] = None,
+) -> str:
+    initial = str(ticket_initial or "")
+    kind_raw = str(pivot_type or "retention_flip")
+    kind = {
+        "action_flip": "entity_switch",
+        "exception_add": "constraint_add",
+    }.get(kind_raw, kind_raw)
+    if kind == "retention_flip":
+        old_days = _extract_retention_days_from_text(initial)
+        if old_days is None:
+            old_days = 90
+        new_days = 30 if old_days > 30 else 90
+        updated = initial
+        replaced = False
+        if re.search(r"retention\s*days?\s*[:=]\s*\d+", updated, flags=re.IGNORECASE):
+            updated = re.sub(
+                r"(retention\s*days?\s*[:=]\s*)\d+",
+                rf"\g<1>{new_days}",
+                updated,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            replaced = True
+        if not replaced:
+            pattern = rf"\b{old_days}\s*days?\b"
+            if re.search(pattern, updated, flags=re.IGNORECASE):
+                updated = re.sub(
+                    pattern,
+                    f"{new_days} days",
+                    updated,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                replaced = True
+        if not replaced:
+            updated = (
+                f"{initial}\n\nUpdated requirement: retain logs for {new_days} days, not {old_days} days."
+            )
+        return updated
+    if kind == "entity_switch":
+        context = dict(getattr(task, "context", None) or {})
+        switch_spec: List[Tuple[str, List[str]]] = [
+            ("region", list(DEFAULT_REGIONS)),
+            ("product", list(DEFAULT_PRODUCTS)),
+            ("tier", list(DEFAULT_TIERS)),
+            ("data_type", list(DEFAULT_DATA_TYPES)),
+            ("purpose", list(DEFAULT_PURPOSES)),
+        ]
+        rng.shuffle(switch_spec)
+        chosen_key = None
+        old_val = None
+        new_val = None
+        for key, options in switch_spec:
+            cur = str(context.get(key, "") or "")
+            if not cur:
+                continue
+            candidates = [v for v in options if str(v) != cur]
+            if not candidates:
+                continue
+            chosen_key = key
+            old_val = cur
+            new_val = str(rng.choice(candidates))
+            break
+        if chosen_key and old_val and new_val:
+            updated = initial
+            # Replace only one mention to keep ticket shape stable.
+            updated = re.sub(
+                rf"\b{re.escape(old_val)}\b",
+                new_val,
+                updated,
+                count=1,
+            )
+            if updated.strip() == initial.strip():
+                updated = (
+                    f"{initial}\n\nUpdated context override: {chosen_key}={new_val} "
+                    f"(was {old_val})."
+                )
+            else:
+                updated = (
+                    f"{updated}\n\nUpdated context override: {chosen_key}={new_val} "
+                    f"(was {old_val})."
+                )
+            return updated
+        return f"{initial}\n\nUpdated context override: region=EU."
+    if kind == "constraint_add":
+        cond = str(rng.choice(CONDITION_KEYS))
+        return (
+            f"{initial}\n\nUpdated constraint: require_condition={cond}. "
+            f"This constraint must be reflected in the final answer."
+        )
+    return initial
+
+
+def _ensure_real_pivot_change(
+    initial: str,
+    updated: str,
+    *,
+    pivot_type: str,
+    task: Optional[Task],
+    rng: random.Random,
+) -> str:
+    if str(updated or "").strip() != str(initial or "").strip():
+        return updated
+    # Bounded retries first.
+    for _ in range(4):
+        retry = _make_pivot_ticket_update(initial, pivot_type, rng=rng, task=task)
+        if str(retry or "").strip() != str(initial or "").strip():
+            return retry
+    # Deterministic fallback to guarantee a real pivot.
+    kind = {
+        "action_flip": "entity_switch",
+        "exception_add": "constraint_add",
+    }.get(str(pivot_type or "retention_flip"), str(pivot_type or "retention_flip"))
+    if kind == "retention_flip":
+        old_days = _extract_retention_days_from_text(initial)
+        if old_days is None:
+            old_days = 90
+        new_days = 30 if old_days > 30 else 90
+        return (
+            f"{initial}\n\nUpdated requirement: retain logs for {new_days} days, not {old_days} days."
+        )
+    if kind == "entity_switch":
+        return (
+            f"{initial}\n\nUpdated context override: region=EU. "
+            "Final decision must follow the updated context."
+        )
+    if kind == "constraint_add":
+        return (
+            f"{initial}\n\nUpdated constraint: require_condition=legal_approval."
+        )
+    return f"{initial}\n\nUpdated requirement: apply latest ticket update."
+
+
+def _apply_late_pivot_updates(
+    tasks: List[Task],
+    *,
+    pivot_rate: float,
+    pivot_type: str,
+    seed: int,
+) -> None:
+    for task in tasks:
+        if not getattr(task, "ticket_initial", None):
+            task.ticket_initial = str(getattr(task, "user_ticket", "") or "")
+        task.user_ticket = str(task.ticket_initial or task.user_ticket or "")
+        task.ticket_updated = None
+        task.pivot_type = None
+
+    if float(pivot_rate or 0.0) <= 0.0:
+        return
+
+    rng = random.Random(seed + 9901)
+    by_thread: Dict[str, List[Task]] = {}
+    for task in tasks:
+        key = str(getattr(task, "thread_id", None) or f"__task__:{task.task_id}")
+        by_thread.setdefault(key, []).append(task)
+
+    for key in sorted(by_thread.keys()):
+        if rng.random() > float(pivot_rate):
+            continue
+        group = sorted(
+            by_thread[key],
+            key=lambda t: (
+                int(getattr(t, "episode_id", 0) or 0),
+                str(getattr(t, "task_id", "")),
+            ),
+        )
+        pivot_task = next(
+            (task for task in reversed(group) if int(getattr(task, "episode_id", 0) or 0) == 3),
+            group[-1],
+        )
+        initial = str(getattr(pivot_task, "ticket_initial", None) or pivot_task.user_ticket or "")
+        normalized_pivot_type = {
+            "action_flip": "entity_switch",
+            "exception_add": "constraint_add",
+        }.get(str(pivot_type or "retention_flip"), str(pivot_type or "retention_flip"))
+        updated = _make_pivot_ticket_update(
+            initial,
+            normalized_pivot_type,
+            rng=rng,
+            task=pivot_task,
+        )
+        updated = _ensure_real_pivot_change(
+            initial,
+            updated,
+            pivot_type=normalized_pivot_type,
+            task=pivot_task,
+            rng=rng,
+        )
+        if not updated or updated.strip() == initial.strip():
+            continue
+        pivot_task.ticket_updated = updated
+        pivot_task.pivot_type = str(normalized_pivot_type or "retention_flip")
 
 
 def _make_applies_if(
@@ -2105,6 +2320,8 @@ def generate_world_and_tasks(
     e3_litm_filler_len_jitter_max: int = 0,
     e3_clause_jitter_max_chars: int = 0,
     e3_clause_jitter_scope: str = "decoy_only",
+    pivot_rate: float = 0.0,
+    pivot_type: str = "retention_flip",
 ) -> Tuple[World, List[Task], Path, Path]:
     out_dir = Path(out_dir) if out_dir else Path(__file__).resolve().parents[2]
 
@@ -2219,6 +2436,13 @@ def generate_world_and_tasks(
             purposes=purposes,
         )
 
+    _apply_late_pivot_updates(
+        tasks,
+        pivot_rate=float(pivot_rate or 0.0),
+        pivot_type=str(pivot_type or "retention_flip"),
+        seed=seed,
+    )
+
     world_dir = out_dir / "data" / "worlds"
     tasks_dir = out_dir / "data" / "tasks"
     _write_jsonl(world_dir / "documents.jsonl", world.documents)
@@ -2246,6 +2470,11 @@ def generate_world_and_tasks(
     world.meta["e3_litm_filler_len_jitter_max"] = int(e3_litm_filler_len_jitter_max or 0)
     world.meta["e3_clause_jitter_scope"] = str(e3_clause_jitter_scope or "decoy_only")
     world.meta["exclusive_core_evidence"] = exclusive_core_evidence
+    world.meta["pivot_rate_requested"] = float(pivot_rate or 0.0)
+    world.meta["pivot_type"] = str(pivot_type or "retention_flip")
+    world.meta["pivot_rate_actual"] = (
+        sum(1 for t in tasks if getattr(t, "ticket_updated", None)) / max(1, len(tasks))
+    )
     if preset_name:
         world.meta["preset"] = preset_name
     (world_dir / "meta.json").write_text(json.dumps(world.meta, ensure_ascii=False), encoding="utf-8")

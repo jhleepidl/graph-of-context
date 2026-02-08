@@ -69,6 +69,9 @@ if USE_PYDANTIC:
         task_id: str
         timestamp: str
         user_ticket: str
+        ticket_initial: Optional[str] = None
+        ticket_updated: Optional[str] = None
+        pivot_type: Optional[str] = None
         context: Dict[str, Any]
         budgets: Dict[str, int]
         gold: Gold
@@ -151,6 +154,9 @@ else:
         task_id: str
         timestamp: str
         user_ticket: str
+        ticket_initial: Optional[str] = None
+        ticket_updated: Optional[str] = None
+        pivot_type: Optional[str] = None
         context: Dict[str, Any]
         budgets: Dict[str, int]
         gold: Gold

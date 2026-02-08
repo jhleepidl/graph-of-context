@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import time
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +59,9 @@ class OpenAIClient(LLMClient):
         base_url: str = "https://api.openai.com/v1",
         timeout: int = 60,
         dotenv_path: str = ".env",
+        max_retries: int = 6,
+        backoff_base: float = 1.0,
+        backoff_max: float = 20.0,
     ) -> None:
         if api_key is None:
             _load_dotenv(dotenv_path)
@@ -66,46 +72,68 @@ class OpenAIClient(LLMClient):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.max_retries = int(max_retries)
+        self.backoff_base = float(backoff_base)
+        self.backoff_max = float(backoff_max)
+
+    def _backoff_sleep(self, attempt: int) -> None:
+        delay = min(self.backoff_max, self.backoff_base * (2 ** max(0, int(attempt))))
+        jitter = random.uniform(0.0, max(0.0, delay * 0.25))
+        time.sleep(min(self.backoff_max, delay + jitter))
 
     def generate(self, prompt: str) -> str:
         payload = {"model": self.model, "input": prompt}
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/responses",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            raw = resp.read().decode("utf-8")
-        response = json.loads(raw)
-        text = response.get("output_text")
-        if isinstance(text, str) and text.strip():
-            return text
-        output = response.get("output", [])
-        chunks: List[str] = []
-        if isinstance(output, list):
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-                content = item.get("content", [])
-                if not isinstance(content, list):
-                    continue
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if isinstance(part.get("text"), str):
-                        chunks.append(part["text"])
-        if chunks:
-            return "\n".join(chunks)
-        choices = response.get("choices", [])
-        if isinstance(choices, list) and choices:
-            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-                return msg["content"]
+        retryable_http_codes = {429, 500, 502, 503, 504}
+        for attempt in range(self.max_retries + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/responses",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                response = json.loads(raw)
+                text = response.get("output_text")
+                if isinstance(text, str) and text.strip():
+                    return text
+                output = response.get("output", [])
+                chunks: List[str] = []
+                if isinstance(output, list):
+                    for item in output:
+                        if not isinstance(item, dict):
+                            continue
+                        content = item.get("content", [])
+                        if not isinstance(content, list):
+                            continue
+                        for part in content:
+                            if not isinstance(part, dict):
+                                continue
+                            if isinstance(part.get("text"), str):
+                                chunks.append(part["text"])
+                if chunks:
+                    return "\n".join(chunks)
+                choices = response.get("choices", [])
+                if isinstance(choices, list) and choices:
+                    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                        return msg["content"]
+                return ""
+            except urllib.error.HTTPError as exc:
+                status_code = int(getattr(exc, "code", 0) or 0)
+                should_retry = status_code in retryable_http_codes and attempt < self.max_retries
+                if not should_retry:
+                    raise
+                self._backoff_sleep(attempt)
+            except urllib.error.URLError:
+                if attempt >= self.max_retries:
+                    raise
+                self._backoff_sleep(attempt)
         return ""
 
 
@@ -282,6 +310,165 @@ def _search_with_rewrite(
             results.append([])
     merged = _merge_search_results(results, top_k=top_k)
     return merged, queries, []
+
+
+def _lexical_tokens(text: str) -> set[str]:
+    if not text:
+        return set()
+    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+
+
+def _extract_activity_terms(text: str) -> set[str]:
+    lowered = (text or "").lower()
+    acts: set[str] = set()
+    if "retain" in lowered or "retaining" in lowered or "retention" in lowered:
+        acts.add("retain")
+    if "export" in lowered or "exporting" in lowered:
+        acts.add("export")
+    if "share" in lowered or "sharing" in lowered:
+        acts.add("share")
+    if "logs" in lowered:
+        acts.add("logs")
+    if "telemetry" in lowered:
+        acts.add("telemetry")
+    if "health" in lowered:
+        acts.add("health")
+    return acts
+
+
+def _token_jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return float(len(a & b)) / float(len(union))
+
+
+def _reorder_candidates_activity_mmr(
+    ticket_text: str,
+    candidate_ids: List[str],
+    clause_lookup: Dict[str, Any],
+    base_scores: Dict[str, float],
+    *,
+    max_selected: int = 4,
+    activity_filter: bool = False,
+    activity_filter_fallback: bool = True,
+    mmr_lambda: float = 0.35,
+    anchor_top1_lexical: bool = True,
+) -> Tuple[List[str], Dict[str, Any]]:
+    unique_candidates: List[str] = []
+    seen: set[str] = set()
+    for cid in candidate_ids:
+        if cid and cid not in seen:
+            unique_candidates.append(cid)
+            seen.add(cid)
+    if not unique_candidates:
+        return [], {}
+    if not activity_filter:
+        return list(unique_candidates), {}
+
+    ticket_tokens = _lexical_tokens(ticket_text)
+    ticket_activity = _extract_activity_terms(ticket_text)
+    action_terms = {"retain", "export", "share"}
+    ticket_actions = ticket_activity & action_terms
+    max_selected = max(1, int(max_selected or 4))
+
+    candidates: List[Dict[str, Any]] = []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for idx, cid in enumerate(unique_candidates):
+        clause = clause_lookup.get(cid)
+        text = str(getattr(clause, "text", "") or "")
+        tokens = _lexical_tokens(text)
+        acts = _extract_activity_terms(text)
+        cand = {
+            "cid": cid,
+            "base_score": float(base_scores.get(cid, float(len(unique_candidates) - idx))),
+            "lexical_score": float(len(ticket_tokens & tokens)),
+            "activity": acts,
+            "token_set": tokens,
+        }
+        candidates.append(cand)
+        by_id[cid] = cand
+
+    filtered = [c for c in candidates if c["activity"] & ticket_actions] if ticket_actions else []
+    filter_fallback_used = False
+    if not filtered and activity_filter_fallback:
+        filtered = list(candidates)
+        filter_fallback_used = True
+
+    selected: List[str] = []
+    if anchor_top1_lexical and filtered:
+        anchor = sorted(
+            filtered,
+            key=lambda c: (
+                float(c.get("lexical_score", 0.0)),
+                float(c.get("base_score", 0.0)),
+                str(c.get("cid", "")),
+            ),
+            reverse=True,
+        )[0]
+        selected.append(str(anchor["cid"]))
+
+    while len(selected) < max_selected:
+        remaining = [c for c in filtered if c["cid"] not in selected]
+        if not remaining:
+            break
+        best_id: Optional[str] = None
+        best_val: Optional[Tuple[float, float, float, str]] = None
+        for cand in remaining:
+            redundancy = 0.0
+            if selected:
+                redundancy = max(
+                    _token_jaccard(
+                        cand.get("token_set", set()),
+                        by_id.get(sel_id, {}).get("token_set", set()),
+                    )
+                    for sel_id in selected
+                    if sel_id in by_id
+                )
+            mmr_value = float(cand.get("base_score", 0.0)) - float(mmr_lambda) * redundancy
+            tie = (
+                mmr_value,
+                float(cand.get("lexical_score", 0.0)),
+                float(cand.get("base_score", 0.0)),
+                str(cand.get("cid", "")),
+            )
+            if best_val is None or tie > best_val:
+                best_val = tie
+                best_id = str(cand.get("cid"))
+        if not best_id:
+            break
+        selected.append(best_id)
+
+    if not selected:
+        selected = list(unique_candidates[:max_selected])
+
+    selected_set = set(selected)
+    reordered = list(selected) + [cid for cid in unique_candidates if cid not in selected_set]
+    top10 = sorted(
+        candidates,
+        key=lambda c: (
+            float(c.get("base_score", 0.0)),
+            float(c.get("lexical_score", 0.0)),
+            str(c.get("cid", "")),
+        ),
+        reverse=True,
+    )[:10]
+    debug = {
+        "ticket_activity": sorted(ticket_activity),
+        "selected_activity_summary": [
+            {"clause_id": cid, "activity": sorted(by_id.get(cid, {}).get("activity", set()))}
+            for cid in selected
+        ],
+        "top10_candidates_by_base_score": [
+            {"clause_id": c["cid"], "score": float(c["base_score"])}
+            for c in top10
+        ],
+        "filter_fallback_used": bool(filter_fallback_used),
+        "selected_clause_ids": list(selected),
+    }
+    return reordered, debug
 
 
 def _extract_conditions(*candidates: Any) -> List[str]:
@@ -681,6 +868,11 @@ def run_goc_heuristic(
     internal_budget_active: int = 1200,
     internal_budget_unfold: int = 650,
     internal_unfold_k: int = 8,
+    goc_activity_filter: bool = False,
+    goc_activity_filter_fallback: bool = True,
+    goc_mmr_lambda: float = 0.35,
+    goc_anchor_top1_lexical: bool = True,
+    goc_activity_debug_in_snapshot: bool = False,
 ) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
     errors: List[str] = []
     fallback_prediction = {
@@ -721,6 +913,7 @@ def run_goc_heuristic(
     hop2_pool_used_count = 0
     goc_internal_snapshots: List[Dict[str, Any]] = []
     goc_internal_mem = None
+    goc_activity_debug_payload: Dict[str, Any] = {}
 
     if save_internal_graph:
         try:
@@ -1291,6 +1484,26 @@ def run_goc_heuristic(
             rest = [cid for cid in ranked_ids if cid not in fixed]
             rest_sorted = sorted(rest, key=_soft_bonus, reverse=True)
             ranked_ids = fixed + rest_sorted
+        remaining_budget = max(0, env.open_budget - len(opened_set))
+        if goc_activity_filter and remaining_budget > 0:
+            base_scores: Dict[str, float] = {}
+            for idx, cid in enumerate(ranked_ids):
+                # Preserve current ranking while still allowing lexical/diversity re-ordering.
+                rank_score = float(len(ranked_ids) - idx)
+                merged_item = merged.get(cid)
+                retrieval_score = float(merged_item.get("score", 0.0)) if merged_item else 0.0
+                base_scores[cid] = rank_score + retrieval_score
+            ranked_ids, goc_activity_debug_payload = _reorder_candidates_activity_mmr(
+                task.user_ticket,
+                ranked_ids,
+                env.world.clauses,
+                base_scores,
+                max_selected=min(4, remaining_budget),
+                activity_filter=bool(goc_activity_filter),
+                activity_filter_fallback=bool(goc_activity_filter_fallback),
+                mmr_lambda=float(goc_mmr_lambda),
+                anchor_top1_lexical=bool(goc_anchor_top1_lexical),
+            )
         _open_from_candidates(ranked_ids, env.open_budget, origin=None, allow_bridge=True)
 
     if bridge_probe_clause_id:
@@ -1411,6 +1624,8 @@ def run_goc_heuristic(
     if rerank_scores is not None:
         diag["rerank_used"] = True
         diag["rerank_top_score"] = max(rerank_scores.values()) if rerank_scores else None
+    if goc_activity_debug_in_snapshot and goc_activity_debug_payload:
+        diag["goc_activity_debug"] = dict(goc_activity_debug_payload)
     if save_internal_graph:
         _append_internal_snapshot("final")
         diag["goc_internal_snapshots"] = list(goc_internal_snapshots)
