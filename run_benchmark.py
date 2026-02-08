@@ -163,6 +163,24 @@ def main():
     ap.add_argument("--stage_aware_unfold_on_final", action="store_true", default=True, help="Proactively unfold around Q1/commit anchors on FINAL prompts.")
     ap.add_argument("--no_stage_aware_unfold_on_final", action="store_false", dest="stage_aware_unfold_on_final", help="Disable stage-aware unfold on FINAL prompts.")
     ap.add_argument("--stage_final_unfold_k", type=int, default=6, help="How many nodes to unfold on FINAL stage (default: 6).")
+    ap.add_argument("--enable_unfold_trigger", action="store_true", help="Enable query-vs-context unfolding trigger.")
+    ap.add_argument("--unfold_trigger_missing_terms_threshold", type=int, default=3)
+    ap.add_argument("--unfold_trigger_min_token_len", type=int, default=4)
+    ap.add_argument("--unfold_trigger_max_keywords", type=int, default=48)
+    ap.add_argument("--unfold_trigger_k", type=int, default=6)
+    ap.add_argument("--unfold_trigger_log_missing_limit", type=int, default=12)
+    ap.add_argument(
+        "--unfold_trigger_always_on_required_keys",
+        action="store_true",
+        default=True,
+        help="Always trigger unfold when relocation_* required keys appear in the query.",
+    )
+    ap.add_argument(
+        "--no_unfold_trigger_always_on_required_keys",
+        action="store_false",
+        dest="unfold_trigger_always_on_required_keys",
+        help="Disable always-on relocation_* key trigger for unfold decisions.",
+    )
 
     # retriever knobs
     ap.add_argument("--retriever", type=str, default="bm25", choices=["bm25", "faiss"])
@@ -331,6 +349,15 @@ def main():
             committed_supporting_titles_n=args.committed_supporting_titles_n,
             stage_aware_unfold_on_final=args.stage_aware_unfold_on_final,
             stage_final_unfold_k=args.stage_final_unfold_k,
+            enable_unfold_trigger=bool(args.enable_unfold_trigger),
+            unfold_trigger_missing_terms_threshold=int(args.unfold_trigger_missing_terms_threshold),
+            unfold_trigger_min_token_len=int(args.unfold_trigger_min_token_len),
+            unfold_trigger_max_keywords=int(args.unfold_trigger_max_keywords),
+            unfold_trigger_k=int(args.unfold_trigger_k),
+            unfold_trigger_log_missing_limit=int(args.unfold_trigger_log_missing_limit),
+            unfold_trigger_always_on_required_keys=bool(
+                args.unfold_trigger_always_on_required_keys
+            ),
             budget_active=args.budget_active,
             budget_unfold=args.budget_unfold,
             unfold_k=args.unfold_k,

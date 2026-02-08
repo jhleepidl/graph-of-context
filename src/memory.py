@@ -2652,13 +2652,34 @@ class GoCMemory(MemoryManagerBase):
                 if n and n.storage_text:
                     snip = self._extract_storage_snippet(n.storage_text, query)
                 if snip:
-                    self.add_node(
-                        thread="main",
-                        kind="summary",
-                        text=f"[UNFOLD_SNIPPET] {snip}",
-                        docids=list(n.docids or []),
-                        storage_text=None,
-                    )
+                    # Snippet must be ACTIVE so get_active_text() includes it in the next prompt.
+                    remaining = int(self.budget_unfold) - int(used)
+                    if remaining <= 0:
+                        return activated
+                    snip_text = f"[UNFOLD_SNIPPET] {snip}"
+                    if approx_token_count(snip_text) > remaining:
+                        # Shrink snippet to fit remaining unfold budget.
+                        max_chars = max(80, int(len(snip) * (float(remaining) / max(1.0, float(approx_token_count(snip_text))))))
+                        snip = snip[:max_chars].rstrip()
+                        snip_text = f"[UNFOLD_SNIPPET] {snip}"
+                        guard = 0
+                        while approx_token_count(snip_text) > remaining and len(snip) > 40 and guard < 8:
+                            guard += 1
+                            snip = snip[: max(40, int(len(snip) * 0.8))].rstrip()
+                            snip_text = f"[UNFOLD_SNIPPET] {snip}"
+                    if snip and approx_token_count(snip_text) <= remaining:
+                        sn_id = self.add_node(
+                            thread="main",
+                            kind="summary",
+                            text=snip_text,
+                            docids=list(n.docids or []),
+                            storage_text=None,
+                        )
+                        # Include snippet id in `activated` for consistent unfold accounting/tracing.
+                        self.active.append(sn_id)
+                        self.nodes[sn_id].ttl = int(getattr(self, "ttl_unfold", 4) or 4)
+                        activated.append(sn_id)
+                        used += int(self.nodes[sn_id].token_len)
         except Exception:
             pass
 

@@ -732,14 +732,12 @@ class ToolLoopLLMAgent:
         self._maybe_apply_goc_annotations(call=call, cur_step=cur_step, tool_nid=nid, task_id=task_id, method=method, run_tag=run_tag)
         return nid
 
-    def _drain_mem_events(self, *, task_id: str, method: str, run_tag: str, step: int):
-        """Drain structured events from the memory manager and write to the trace.
-
-        Memory managers may emit events (e.g., GoC fold decisions). This keeps
-        trace files self-contained for paper figures and ablations.
-        """
+    def _drain_mem_events(self, task_id: str, method: str, run_tag: str, step: int):
+        """Drain MemoryManager event buffer and log/accumulate stats."""
+        if not hasattr(self.mem, "drain_events"):
+            return
         try:
-            evs = self.mem.drain_events()
+            evs = self.mem.drain_events()  # type: ignore[attr-defined]
         except Exception:
             return
         if not evs:
@@ -747,13 +745,45 @@ class ToolLoopLLMAgent:
         for ev in evs:
             if not isinstance(ev, dict):
                 continue
-            obj = dict(ev)
-            # Attach run metadata for easier post-hoc analysis.
-            obj.setdefault("task_id", task_id)
-            obj.setdefault("method", method)
-            obj.setdefault("run_tag", run_tag)
-            obj.setdefault("step", int(step))
-            self._trace(obj)
+            ev_type = (ev or {}).get("type", "unknown")
+            # Trace each memory event as a top-level event while attaching run metadata.
+            try:
+                obj = dict(ev)
+                obj["task_id"] = task_id
+                obj["method"] = method
+                obj["run_tag"] = run_tag
+                obj["step"] = int(step)
+                self._trace(obj)
+            except Exception:
+                pass
+
+            # Aggregate (keep existing counter behavior).
+            try:
+                if ev_type == "fold":
+                    self.counters["mem_fold_events"] += 1
+                    self.counters["mem_fold_removed_tokens_est"] += int(ev.get("chunk_tokens", 0))
+                    self.counters["mem_fold_overflow_tokens_est"] += int(ev.get("overflow_tokens", 0))
+                    self.counters["mem_fold_chunk_nodes"] += int(ev.get("chunk_size", 0))
+                elif ev_type == "unfold":
+                    self.counters["mem_unfold_events"] += 1
+                    self.counters["mem_unfold_added_tokens_est"] += int(
+                        ev.get("added_tokens", ev.get("used_tokens_est", 0)) or 0
+                    )
+                    self.counters["mem_unfold_activated_nodes"] += int(
+                        ev.get("activated_count", len(ev.get("activated", []) or [])) or 0
+                    )
+                elif ev_type == "rag_unfold":
+                    self.counters["mem_rag_unfold_events"] += 1
+                    self.counters["mem_rag_unfold_activated_nodes"] += int(
+                        len(ev.get("activated", []) or [])
+                    )
+                elif ev_type in ("pef_fold", "pef_roll_fold"):
+                    self.counters[f"mem_{ev_type}_events"] += 1
+                    self.counters[f"mem_{ev_type}_episode_nodes"] += int(
+                        ev.get("episode_nodes", ev.get("rolled_nodes", 0))
+                    )
+            except Exception:
+                pass
 
     def _accum_usage(self, usage: Optional[Dict[str, Any]]):
         if not usage:
@@ -2104,52 +2134,6 @@ class ToolLoopLLMAgent:
             self.counters["prompt_est_active_other_lines"] += int(est.get("active_other_lines", 0))
         except Exception:
             pass
-
-    def _drain_mem_events(self, task_id: str, method: str, run_tag: str, step: int):
-        """Drain MemoryManager event buffer and log/accumulate stats."""
-        if not hasattr(self.mem, "drain_events"):
-            return
-        try:
-            evs = self.mem.drain_events()  # type: ignore[attr-defined]
-        except Exception:
-            return
-        if not evs:
-            return
-        for ev in evs:
-            ev_type = (ev or {}).get("type", "unknown")
-            # Trace
-            try:
-                self._trace({
-                    "type": "mem_event",
-                    "task_id": task_id,
-                    "method": method,
-                    "run_tag": run_tag,
-                    "step": step,
-                    "ev_type": ev_type,
-                    "event": ev,
-                })
-            except Exception:
-                pass
-
-            # Aggregate
-            try:
-                if ev_type == "fold":
-                    self.counters["mem_fold_events"] += 1
-                    self.counters["mem_fold_removed_tokens_est"] += int(ev.get("chunk_tokens", 0))
-                    self.counters["mem_fold_overflow_tokens_est"] += int(ev.get("overflow_tokens", 0))
-                    self.counters["mem_fold_chunk_nodes"] += int(ev.get("chunk_size", 0))
-                elif ev_type == "unfold":
-                    self.counters["mem_unfold_events"] += 1
-                    self.counters["mem_unfold_added_tokens_est"] += int(ev.get("added_tokens", ev.get("used_tokens_est", 0)) or 0)
-                    self.counters["mem_unfold_activated_nodes"] += int(ev.get("activated_count", len(ev.get("activated", []) or [])) or 0)
-                elif ev_type == "rag_unfold":
-                    self.counters["mem_rag_unfold_events"] += 1
-                    self.counters["mem_rag_unfold_activated_nodes"] += int(len(ev.get("activated", []) or []))
-                elif ev_type in ("pef_fold", "pef_roll_fold"):
-                    self.counters[f"mem_{ev_type}_events"] += 1
-                    self.counters[f"mem_{ev_type}_episode_nodes"] += int(ev.get("episode_nodes", ev.get("rolled_nodes", 0)))
-            except Exception:
-                pass
 
     def _json_recovery_prompt(self) -> str:
         return (

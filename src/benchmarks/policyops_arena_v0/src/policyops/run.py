@@ -798,6 +798,13 @@ def _apply_preset(args: argparse.Namespace) -> None:
         if hasattr(args, key) and config.get(key) is not None:
             current = getattr(args, key)
             should_apply = current is None or isinstance(current, bool)
+            if key == "n_threads":
+                # For threaded generation, unset n_threads falls back to n_tasks.
+                # If caller explicitly set n_tasks (e.g. --n_tasks 60), do not
+                # force preset n_threads and unexpectedly inflate run size.
+                n_tasks_current = getattr(args, "n_tasks", None) if hasattr(args, "n_tasks") else None
+                n_tasks_explicit = n_tasks_current not in {None, 200}
+                should_apply = current is None and not n_tasks_explicit
             if key == "e3_clause_jitter_max_chars":
                 should_apply = current in {None, 0}
             if key == "e3_clause_jitter_scope":
@@ -1509,7 +1516,13 @@ def _evaluate_method(
     episode_commit: Dict[int, List[float]] = {1: [], 2: [], 3: []}
     episode_cov_core: Dict[int, List[float]] = {1: [], 2: [], 3: []}
 
-    for task in tasks:
+    total_tasks = len(tasks)
+    for task_idx, task in enumerate(tasks, start=1):
+        if total_tasks and (task_idx == 1 or task_idx % 25 == 0 or task_idx == total_tasks):
+            print(
+                f"[eval:{method}] task {task_idx}/{total_tasks} ({task.task_id})",
+                flush=True,
+            )
         scenario_mode = getattr(task, "scenario_mode", getattr(args, "scenario_mode", "v0"))
         threaded_mode = scenario_mode in {"threaded_v1_2", "threaded_v1_3_fu", "threaded_v1_3_fu_decoy"}
         thread_id = getattr(task, "thread_id", None)
@@ -3762,7 +3775,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
     _normalize_scenario_mode_arg(args)
     _apply_preset(args)
     _apply_generation_defaults(args)
-    generate_world_and_tasks(
+    _, tasks, _, _ = generate_world_and_tasks(
         out_dir=args.out_dir,
         seed=args.seed,
         n_docs=args.n_docs,
@@ -3805,7 +3818,14 @@ def cmd_generate(args: argparse.Namespace) -> None:
         e3_clause_jitter_scope=str(getattr(args, "e3_clause_jitter_scope", "decoy_only") or "decoy_only"),
         preset_name=getattr(args, "preset", None),
     )
-    print("Generated PolicyOps Arena v0 data.")
+    thread_ids = {t.thread_id for t in tasks if getattr(t, "thread_id", None)}
+    if thread_ids:
+        print(
+            f"Generated PolicyOps Arena v0 data. tasks={len(tasks)} threads={len(thread_ids)}",
+            flush=True,
+        )
+    else:
+        print(f"Generated PolicyOps Arena v0 data. tasks={len(tasks)}", flush=True)
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
@@ -3952,7 +3972,12 @@ def cmd_compare(args: argparse.Namespace) -> None:
         sweep_dir = Path(base_dir) / "runs" / "context_budget_sweep" / sweep_stamp
         sweep_dir.mkdir(parents=True, exist_ok=True)
         summary_rows: List[Dict[str, Any]] = []
-        for budget in sweep_values:
+        total_budgets = len(sweep_values)
+        for budget_idx, budget in enumerate(sweep_values, start=1):
+            print(
+                f"[compare-sweep] starting budget={budget} ({budget_idx}/{total_budgets})",
+                flush=True,
+            )
             sweep_args = argparse.Namespace(**vars(args))
             sweep_args.thread_context_budget_sweep = ""
             sweep_args.thread_context_budget_chars = budget
@@ -3963,6 +3988,10 @@ def cmd_compare(args: argparse.Namespace) -> None:
             report_path = new_files[-1] if new_files else None
             if report_path is None:
                 continue
+            print(
+                f"[compare-sweep] finished budget={budget} report={report_path}",
+                flush=True,
+            )
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             for method, report_obj in payload.get("method_reports", {}).items():
                 metrics = report_obj.get("metrics", {}) or {}
@@ -4055,6 +4084,21 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     world = load_world(world_dir)
     tasks = load_tasks(tasks_path)
+    if getattr(args, "n_threads", None):
+        thread_ids = [t.thread_id for t in tasks if getattr(t, "thread_id", None)]
+        if thread_ids:
+            unique = sorted(dict.fromkeys(thread_ids))
+            selected = set(unique[: int(args.n_threads)])
+            tasks = [t for t in tasks if t.thread_id in selected]
+    if any(getattr(t, "thread_id", None) for t in tasks):
+        tasks = sorted(
+            tasks,
+            key=lambda t: (
+                t.thread_id or "",
+                t.episode_id or 0,
+                t.task_id,
+            ),
+        )
 
     if args.llm == "dummy" and args.model != "dummy":
         raise RuntimeError(
@@ -4074,6 +4118,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
     train_tasks, eval_tasks = _split_tasks(tasks, args.task_split, args.train_ratio, args.split_seed)
     if args.controller_mode == "train" and not train_tasks:
         train_tasks = eval_tasks
+    if llm_backend == "openai":
+        llm_methods = [m for m in methods if m != "engine"]
+        est_calls = len(eval_tasks) * len(llm_methods)
+        print(
+            f"[compare] eval_tasks={len(eval_tasks)} methods={methods} "
+            f"llm_methods={llm_methods} est_llm_calls~{est_calls}",
+            flush=True,
+        )
     controller: Controller | RerankController | None = None
     controller_mode = "off"
     state_path = None

@@ -95,6 +95,13 @@ def run_llm(
     stage_final_unfold_k: int = 6,
     stage_aware_unfold_on_commit: bool = True,
     stage_commit_unfold_k: int = 6,
+    enable_unfold_trigger: bool = False,
+    unfold_trigger_missing_terms_threshold: int = 3,
+    unfold_trigger_min_token_len: int = 4,
+    unfold_trigger_max_keywords: int = 48,
+    unfold_trigger_k: int = 6,
+    unfold_trigger_log_missing_limit: int = 12,
+    unfold_trigger_always_on_required_keys: bool = True,
 
     # Optional: override LLM-assisted GoC annotation settings (prompt gating + schema)
     # If None, defaults are used (and per-method overrides like GoC-HybridDep apply).
@@ -333,6 +340,15 @@ def run_llm(
                 stage_final_unfold_k=int(stage_final_unfold_k),
                 stage_aware_unfold_on_commit=bool(stage_aware_unfold_on_commit),
                 stage_commit_unfold_k=int(stage_commit_unfold_k),
+                enable_unfold_trigger=bool(enable_unfold_trigger),
+                unfold_trigger_missing_terms_threshold=int(unfold_trigger_missing_terms_threshold),
+                unfold_trigger_min_token_len=int(unfold_trigger_min_token_len),
+                unfold_trigger_max_keywords=int(unfold_trigger_max_keywords),
+                unfold_trigger_k=int(unfold_trigger_k),
+                unfold_trigger_log_missing_limit=int(unfold_trigger_log_missing_limit),
+                unfold_trigger_always_on_required_keys=bool(
+                    unfold_trigger_always_on_required_keys
+                ),
             )
 
     # Shared bandit controller instance (read-only during evaluation).

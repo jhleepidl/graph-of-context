@@ -30,6 +30,24 @@ def main():
     ap.add_argument("--verbose_steps", action="store_true")
     ap.add_argument("--log_dir", type=str, default=None)
     ap.add_argument("--save_goc_internal_graph", action="store_true")
+    ap.add_argument("--enable_unfold_trigger", action="store_true", help="Enable query-vs-context unfolding trigger.")
+    ap.add_argument("--unfold_trigger_missing_terms_threshold", type=int, default=3)
+    ap.add_argument("--unfold_trigger_min_token_len", type=int, default=4)
+    ap.add_argument("--unfold_trigger_max_keywords", type=int, default=48)
+    ap.add_argument("--unfold_trigger_k", type=int, default=6)
+    ap.add_argument("--unfold_trigger_log_missing_limit", type=int, default=12)
+    ap.add_argument(
+        "--unfold_trigger_always_on_required_keys",
+        action="store_true",
+        default=True,
+        help="Always trigger unfold when relocation_* required keys appear in the query.",
+    )
+    ap.add_argument(
+        "--no_unfold_trigger_always_on_required_keys",
+        action="store_false",
+        dest="unfold_trigger_always_on_required_keys",
+        help="Disable always-on relocation_* key trigger for unfold decisions.",
+    )
 
     ap.add_argument("--prompt_context_chars", type=int, default=0)
     ap.add_argument("--log_context_chars", type=int, default=2500)
@@ -67,6 +85,15 @@ def main():
         verbose_steps=args.verbose_steps,
         log_dir=args.log_dir,
         save_goc_internal_graph=bool(args.save_goc_internal_graph),
+        enable_unfold_trigger=bool(args.enable_unfold_trigger),
+        unfold_trigger_missing_terms_threshold=int(args.unfold_trigger_missing_terms_threshold),
+        unfold_trigger_min_token_len=int(args.unfold_trigger_min_token_len),
+        unfold_trigger_max_keywords=int(args.unfold_trigger_max_keywords),
+        unfold_trigger_k=int(args.unfold_trigger_k),
+        unfold_trigger_log_missing_limit=int(args.unfold_trigger_log_missing_limit),
+        unfold_trigger_always_on_required_keys=bool(
+            args.unfold_trigger_always_on_required_keys
+        ),
     )
     print("Done:", res)
 
