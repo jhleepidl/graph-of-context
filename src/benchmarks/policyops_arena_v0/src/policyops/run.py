@@ -260,6 +260,103 @@ def _unique_strs(values: List[Any]) -> List[str]:
     return out
 
 
+# --- Phase 12: commit anchor by model evidence (canonicalize clause IDs) ---
+_CLAUSE_ID_CANON_RE = re.compile(r"\bC[-_\s]?0*(\d+)\b", re.IGNORECASE)
+
+def _canonicalize_clause_id(value: Any) -> str | None:
+    """Normalize clause identifiers to generator format C0001.
+
+    Accepts: 'C0001', 'C-001', 'c 1', '1', etc.
+    Returns None if it cannot be parsed.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Already in Cdddd
+    if len(s) >= 2 and (s[0] in {"C", "c"}) and s[1:].isdigit():
+        try:
+            return f"C{int(s[1:]):04d}"
+        except Exception:
+            return None
+    m = _CLAUSE_ID_CANON_RE.search(s)
+    if m:
+        try:
+            return f"C{int(m.group(1)):04d}"
+        except Exception:
+            return None
+    if s.isdigit():
+        try:
+            return f"C{int(s):04d}"
+        except Exception:
+            return None
+    return None
+
+
+def _canonicalize_clause_ids(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in values:
+        cid = _canonicalize_clause_id(item)
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def _extract_model_evidence_clause_ids(
+    pred: Any,
+    *,
+    opened_ids: List[str],
+    max_ids: int,
+    require_opened: bool,
+) -> List[str]:
+    if not isinstance(pred, dict):
+        return []
+    evidence_raw = pred.get("evidence") or []
+    model_ids = _canonicalize_clause_ids(evidence_raw)
+    if require_opened:
+        opened_set = set(opened_ids or [])
+        model_ids = [cid for cid in model_ids if cid in opened_set]
+    if max_ids and max_ids > 0:
+        model_ids = model_ids[:max_ids]
+    return model_ids
+
+
+def _choose_commit_anchor_ids(
+    *,
+    opened_supporting: List[str],
+    model_evidence: List[str],
+    source: str,
+    max_ids: int,
+    fallback_opened: bool,
+) -> Tuple[List[str], str]:
+    """Return (anchor_ids, source_used)."""
+    opened_supporting = list(opened_supporting or [])
+    model_evidence = list(model_evidence or [])
+    source_used = source
+    if source == "opened_supporting":
+        anchors = opened_supporting
+    elif source == "model_evidence":
+        anchors = model_evidence
+        if not anchors and fallback_opened:
+            anchors = opened_supporting
+            source_used = "opened_supporting_fallback"
+    elif source == "hybrid":
+        anchors = _unique_strs(list(model_evidence) + list(opened_supporting))
+        if not anchors and fallback_opened:
+            anchors = opened_supporting
+            source_used = "opened_supporting_fallback"
+    else:
+        anchors = opened_supporting
+        source_used = "opened_supporting"
+    if max_ids and max_ids > 0:
+        anchors = list(anchors)[:max_ids]
+    return list(anchors), source_used
+
 def _clause_docid_map(world: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
     clauses = getattr(world, "clauses", {}) if world is not None else {}
@@ -2856,35 +2953,70 @@ def _evaluate_method(
         e3_evidence_valid: bool | None = None
         thread_judge_correct: bool | None = None
         commit_clause_ids: List[str] | None = None
+        commit_anchor_clause_ids: List[str] | None = None
+        commit_anchor_source_used: str | None = None
+        commit_model_evidence_clause_ids: List[str] | None = None
         if threaded_mode and thread_state and episode_id in {1, 2}:
+            # Commit stage (episodes 1/2): store anchors for episode-3 "allowed evidence".
+            # Phase 12 adds an option to derive commit anchors from model-provided evidence IDs
+            # (lossless + recoverable, but correctness depends on citing the right clause IDs).
             commit_supporting_clause_ids = _extract_commit_supporting(
                 task,
                 opened_ids,
                 world,
                 episode_kind,
             )
+
+            commit_anchor_source = getattr(args, "commit_anchor_source", "opened_supporting")
+            commit_anchor_max_ids = int(getattr(args, "commit_anchor_max_ids", 4) or 0)
+            commit_anchor_require_opened = bool(getattr(args, "commit_anchor_require_opened", True))
+            commit_anchor_fallback_opened = bool(getattr(args, "commit_anchor_fallback_opened", True))
+
+            model_evidence_clause_ids = _extract_model_evidence_clause_ids(
+                pred,
+                opened_ids=opened_ids,
+                max_ids=0,
+                require_opened=commit_anchor_require_opened,
+            )
+            commit_model_evidence_clause_ids = list(model_evidence_clause_ids)
+
+            commit_anchor_clause_ids, commit_anchor_source_used_local = _choose_commit_anchor_ids(
+                opened_supporting=commit_supporting_clause_ids,
+                model_evidence=model_evidence_clause_ids,
+                source=str(commit_anchor_source),
+                max_ids=commit_anchor_max_ids,
+                fallback_opened=commit_anchor_fallback_opened,
+            )
+            commit_anchor_source_used = commit_anchor_source_used_local
+            commit_clause_ids = list(commit_anchor_clause_ids)
+
             commit_short_fact = _extract_commit_short_fact(
                 task,
-                commit_supporting_clause_ids,
+                commit_anchor_clause_ids,
                 world,
                 episode_kind,
             )
             core_ids = list(
                 getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
             )
-            commit_correct = bool(
-                commit_supporting_clause_ids
-                and any(cid in commit_supporting_clause_ids for cid in core_ids)
+            commit_correct = bool(commit_anchor_clause_ids) and any(
+                cid in set(commit_anchor_clause_ids) for cid in core_ids
             )
             if episode_id == 1:
                 thread_state["commit1"] = {
                     "supporting_clause_ids": commit_supporting_clause_ids,
+                    "anchor_clause_ids": commit_anchor_clause_ids,
+                    "model_evidence_clause_ids": model_evidence_clause_ids,
+                    "anchor_source": commit_anchor_source_used_local,
                     "short_fact": commit_short_fact or {},
                     "commit_correct": commit_correct,
                 }
             elif episode_id == 2:
                 thread_state["commit2"] = {
                     "supporting_clause_ids": commit_supporting_clause_ids,
+                    "anchor_clause_ids": commit_anchor_clause_ids,
+                    "model_evidence_clause_ids": model_evidence_clause_ids,
+                    "anchor_source": commit_anchor_source_used_local,
                     "short_fact": commit_short_fact or {},
                     "commit_correct": commit_correct,
                 }
@@ -2901,11 +3033,17 @@ def _evaluate_method(
             commit2 = thread_state.get("commit2") or {}
             commit_clause_ids = list(
                 dict.fromkeys(
+                    (commit1.get("anchor_clause_ids") or [])
+                    + (commit2.get("anchor_clause_ids") or [])
+                )
+            )
+            commit_supporting_clause_ids = list(
+                dict.fromkeys(
                     (commit1.get("supporting_clause_ids") or [])
                     + (commit2.get("supporting_clause_ids") or [])
                 )
             )
-            commit_supporting_clause_ids = commit_clause_ids
+            commit_anchor_clause_ids = commit_clause_ids
             if not e12_opened_clause_ids:
                 e12_opened_clause_ids = list(
                     dict.fromkeys(thread_state.get("opened_history_ids", []))
@@ -3332,6 +3470,9 @@ def _evaluate_method(
             "controller_action_opened_has_winning_clause": action_opened_has_winning,
             "controller_reward_breakdown": reward_breakdown,
             "commit_supporting_clause_ids": commit_supporting_clause_ids,
+            "commit_anchor_clause_ids": commit_anchor_clause_ids,
+            "commit_anchor_source_used": commit_anchor_source_used,
+            "commit_model_evidence_clause_ids": commit_model_evidence_clause_ids,
             "commit_short_fact": commit_short_fact,
             "commit_correct": commit_correct,
             "commit_clause_ids": commit_clause_ids,
@@ -3868,7 +4009,7 @@ def _evaluate_method(
             _log("INIT", {"episode_id": episode_node_id, "ticket_id": ticket_id})
             goc_graph.step += 1
 
-            if threaded_mode and episode_id and record.get("commit_supporting_clause_ids"):
+            if threaded_mode and episode_id and (record.get("commit_anchor_clause_ids") or record.get("commit_supporting_clause_ids")):
                 commit_node_id = f"commit:{thread_id}:C{episode_id}"
                 goc_graph.add_node(
                     commit_node_id,
@@ -3888,7 +4029,10 @@ def _evaluate_method(
                     "COMMIT_ANCHOR",
                     {
                         "commit_id": commit_node_id,
+                        "anchor_clause_ids": record.get("commit_anchor_clause_ids") or record.get("commit_clause_ids"),
                         "supporting_clause_ids": record.get("commit_supporting_clause_ids"),
+                        "anchor_source_used": record.get("commit_anchor_source_used"),
+                        "model_evidence_clause_ids": record.get("commit_model_evidence_clause_ids"),
                     },
                 )
 
@@ -6704,6 +6848,48 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--thread_context_budget_chars", type=int, default=8000)
     cmp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     cmp.add_argument("--thread_context_budget_sweep", type=str, default="")
+    # Phase 12: commit anchor selection for threaded mode (episodes 1/2).
+    # These anchors define the "allowed evidence" for episode-3 final answering in threaded settings.
+    cmp.add_argument(
+        "--commit_anchor_source",
+        choices=["opened_supporting", "model_evidence", "hybrid"],
+        default="opened_supporting",
+        help=(
+            "Commit anchor source for threaded mode: "
+            "opened_supporting=heuristic supporting clauses from opened evidence; "
+            "model_evidence=LLM output 'evidence' field; "
+            "hybrid=union(model_evidence, opened_supporting)."
+        ),
+    )
+    cmp.add_argument(
+        "--commit_anchor_max_ids",
+        type=int,
+        default=4,
+        help="Max anchor clause_ids per commit episode (0 disables cap).",
+    )
+    cmp.add_argument(
+        "--commit_anchor_require_opened",
+        action="store_true",
+        default=True,
+        help="When using model_evidence/hybrid, keep only evidence IDs that were opened in that episode.",
+    )
+    cmp.add_argument(
+        "--no_commit_anchor_require_opened",
+        action="store_false",
+        dest="commit_anchor_require_opened",
+    )
+    cmp.add_argument(
+        "--commit_anchor_fallback_opened",
+        action="store_true",
+        default=True,
+        help="If model_evidence/hybrid yields zero anchors, fall back to opened_supporting anchors.",
+    )
+    cmp.add_argument(
+        "--no_commit_anchor_fallback_opened",
+        action="store_false",
+        dest="commit_anchor_fallback_opened",
+    )
+
     cmp.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
     cmp.add_argument(
         "--search_score_mode",

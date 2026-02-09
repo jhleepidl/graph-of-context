@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
+import http.client
 import os
 import random
 import re
@@ -57,7 +60,10 @@ class OpenAIClient(LLMClient):
         model: str = "gpt-4.1-mini",
         api_key: str | None = None,
         base_url: str = "https://api.openai.com/v1",
-        timeout: int = 60,
+        # In parallel runs (e.g., PolicyOps compare with --parallel_workers > 1),
+        # occasional slow responses can exceed short read timeouts.
+        # Use a more forgiving default and still allow env overrides.
+        timeout: int = 120,
         dotenv_path: str = ".env",
         max_retries: int = 6,
         backoff_base: float = 1.0,
@@ -71,7 +77,34 @@ class OpenAIClient(LLMClient):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+
+        # Optional env overrides (useful on shared clusters / long runs)
+        env_timeout = os.environ.get("POLICYOPS_OPENAI_TIMEOUT")
+        if env_timeout:
+            try:
+                timeout = int(env_timeout)
+            except Exception:
+                pass
+        env_retries = os.environ.get("POLICYOPS_OPENAI_MAX_RETRIES")
+        if env_retries:
+            try:
+                max_retries = int(env_retries)
+            except Exception:
+                pass
+        env_backoff_base = os.environ.get("POLICYOPS_OPENAI_BACKOFF_BASE")
+        if env_backoff_base:
+            try:
+                backoff_base = float(env_backoff_base)
+            except Exception:
+                pass
+        env_backoff_max = os.environ.get("POLICYOPS_OPENAI_BACKOFF_MAX")
+        if env_backoff_max:
+            try:
+                backoff_max = float(env_backoff_max)
+            except Exception:
+                pass
+
+        self.timeout = int(timeout)
         self.max_retries = int(max_retries)
         self.backoff_base = float(backoff_base)
         self.backoff_max = float(backoff_max)
@@ -130,7 +163,16 @@ class OpenAIClient(LLMClient):
                 if not should_retry:
                     raise
                 self._backoff_sleep(attempt)
-            except urllib.error.URLError:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                socket.timeout,
+                ssl.SSLError,
+                http.client.RemoteDisconnected,
+                ConnectionResetError,
+                BrokenPipeError,
+                ConnectionAbortedError,
+            ):
                 if attempt >= self.max_retries:
                     raise
                 self._backoff_sleep(attempt)
