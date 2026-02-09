@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -178,7 +179,21 @@ def analyze(phase7_root: Path, out_dir: Path) -> Tuple[Path, Path, Path, Path, L
         pivot_type = str(run.get("pivot_type") or "unknown")
         run_type = str(run.get("run_type") or "")
         goc_k = _to_int(run.get("goc_K"))
+        if goc_k is None:
+            goc_k = _to_int(run.get("goc_k"))
+        if goc_k is None:
+            out_dir_str = str(run.get("out_dir") or "")
+            m = re.search(r"goc_K(\d+)_H(\d+)", out_dir_str)
+            if m:
+                goc_k = _to_int(m.group(1))
         goc_h = _to_int(run.get("goc_H"))
+        if goc_h is None:
+            goc_h = _to_int(run.get("goc_h"))
+        if goc_h is None:
+            out_dir_str = str(run.get("out_dir") or "")
+            m = re.search(r"goc_K(\d+)_H(\d+)", out_dir_str)
+            if m:
+                goc_h = _to_int(m.group(2))
         methods: List[str]
         if run_type == "baseline":
             methods = ["full", "similarity_only"]

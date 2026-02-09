@@ -128,7 +128,13 @@ def _discover_compare_artifacts(out_dir: Path) -> Tuple[Optional[Path], Optional
     sweep_csv = max(sweep_csv_candidates, key=lambda p: p.stat().st_mtime) if sweep_csv_candidates else None
     event_trace_sample = None
     if run_dir is not None:
-        trace_candidates = list(run_dir.glob("*/event_traces/**/*.jsonl"))
+        trace_candidates = []
+        for pat in [
+            "event_traces/**/*.jsonl",
+            "*/event_traces/**/*.jsonl",
+            "**/event_traces/**/*.jsonl",
+        ]:
+            trace_candidates.extend(list(run_dir.glob(pat)))
         if trace_candidates:
             event_trace_sample = max(trace_candidates, key=lambda p: p.stat().st_mtime)
     return report_json, run_dir, sweep_csv, event_trace_sample
@@ -212,11 +218,11 @@ def _build_entry(
     rc: int,
 ) -> RunEntry:
     report_json, run_dir, sweep_csv, trace_sample = _discover_compare_artifacts(out_dir)
+    # NOTE: event traces are valuable but should not gate success for analysis.
     success = bool(
         rc == 0
         and report_json is not None
         and sweep_csv is not None
-        and trace_sample is not None
     )
     notes: List[str] = []
     if rc != 0:

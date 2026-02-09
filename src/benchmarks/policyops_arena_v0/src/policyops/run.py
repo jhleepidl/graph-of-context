@@ -601,17 +601,21 @@ def _build_clause_dependency_neighbors(
                     continue
                 neighbors.setdefault(cid, set()).add(def_clause_id)
                 neighbors.setdefault(def_clause_id, set()).add(cid)
-
     # Keep same-document clauses lightly connected to avoid disconnected closures when
     # explicit dependency links are sparse.
-    for doc_clause_ids in doc_to_clause_ids.values():
-        if len(doc_clause_ids) <= 1:
-            continue
-        for idx in range(1, len(doc_clause_ids)):
-            left = doc_clause_ids[idx - 1]
-            right = doc_clause_ids[idx]
-            neighbors.setdefault(left, set()).add(right)
-            neighbors.setdefault(right, set()).add(left)
+    # NOTE: only enable this fallback when explicit dependency edges are genuinely sparse;
+    # otherwise it can dominate multi-hop closure expansion and wash out hop controls.
+    explicit_pairs = sum(len(v) for v in neighbors.values()) // 2
+    if explicit_pairs < max(1, len(ordered_ids) // 50):
+        for doc_clause_ids in doc_to_clause_ids.values():
+            if len(doc_clause_ids) <= 1:
+                continue
+            for idx in range(1, len(doc_clause_ids)):
+                left = doc_clause_ids[idx - 1]
+                right = doc_clause_ids[idx]
+                neighbors.setdefault(left, set()).add(right)
+                neighbors.setdefault(right, set()).add(left)
+
     return neighbors
 
 
@@ -620,38 +624,64 @@ def _expand_clause_dependency_closure(
     candidate_clause_ids: List[str],
     world: Any,
     max_hops: int,
+    *,
+    universe_clause_ids: List[str] | None = None,
 ) -> List[str]:
-    ordered_candidates = _unique_strs(candidate_clause_ids)
-    if not ordered_candidates:
+    """Expand a dependency closure up to `max_hops` starting from `seed_clause_ids`.
+
+    Key behaviors:
+    - Traversal can optionally use a broader `universe_clause_ids` (e.g., all world clauses),
+      rather than being restricted to the initial retrieval candidate pool. This makes hop controls
+      meaningful even when dependency nodes are not retrieved directly.
+    - Output ordering prioritizes: smaller hop distance -> earlier, then original candidate order,
+      then stable universe order.
+    """
+    preferred_order = _unique_strs(candidate_clause_ids)
+    ordered_universe = _unique_strs(universe_clause_ids) if universe_clause_ids else list(preferred_order)
+    if not ordered_universe:
         return []
-    candidate_set = set(ordered_candidates)
-    seeds = [cid for cid in _unique_strs(seed_clause_ids) if cid in candidate_set]
+    universe_set = set(ordered_universe)
+
+    seeds = [cid for cid in _unique_strs(seed_clause_ids) if cid in universe_set]
     if not seeds:
         return []
+
     max_hops = max(0, int(max_hops or 0))
     if max_hops <= 0:
         return list(seeds)
 
-    neighbors = _build_clause_dependency_neighbors(ordered_candidates, world)
+    neighbors = _build_clause_dependency_neighbors(ordered_universe, world)
+
+    # BFS with hop distance tracking.
     visited: Set[str] = set(seeds)
+    dist: Dict[str, int] = {cid: 0 for cid in seeds}
     frontier: List[str] = list(seeds)
-    for _hop in range(max_hops):
+    for hop in range(1, max_hops + 1):
         if not frontier:
             break
         next_frontier: List[str] = []
         for cid in frontier:
             for nid in neighbors.get(cid, set()):
-                if nid in visited or nid not in candidate_set:
+                if nid in visited or nid not in universe_set:
                     continue
                 visited.add(nid)
+                dist[nid] = hop
                 next_frontier.append(nid)
         frontier = next_frontier
 
-    closure_ids = [cid for cid in ordered_candidates if cid in visited]
-    if not closure_ids:
-        return list(seeds)
+    # Stable ordering: by hop distance, then by preferred candidate rank, then by universe rank.
+    pref_rank: Dict[str, int] = {cid: idx for idx, cid in enumerate(preferred_order)}
+    uni_rank: Dict[str, int] = {cid: idx for idx, cid in enumerate(ordered_universe)}
+    closure_ids = sorted(
+        (cid for cid in visited),
+        key=lambda cid: (
+            dist.get(cid, 10**9),
+            pref_rank.get(cid, 10**9),
+            uni_rank.get(cid, 10**9),
+            cid,
+        ),
+    )
     return closure_ids
-
 
 def _extract_commit_supporting(
     task: Any,
@@ -1201,6 +1231,52 @@ def _resolve_goc_unfold_controls(args: argparse.Namespace) -> Tuple[int, int, st
     if mode not in {"nodes_only", "hops_only", "nodes_and_hops"}:
         mode = "nodes_and_hops"
     return max(0, max_nodes), max(0, hops), mode
+
+
+def _resolve_goc_unfold_policy(args: argparse.Namespace) -> Tuple[str, Tuple[int, int], Tuple[int, int], str]:
+    """Resolve GoC unfold control policy.
+
+    Returns:
+      - policy: 'fixed' | 'adaptive_pivot' | 'adaptive_heuristic'
+      - default (max_nodes, hops)
+      - pivot   (max_nodes, hops)
+      - budget_mode: nodes_only | hops_only | nodes_and_hops
+
+    Notes:
+      - 'fixed' uses (--goc_unfold_max_nodes, --goc_unfold_hops).
+      - Adaptive policies select between default/pivot knobs per task.
+        By default, if *default/pivot* knobs are not set, we fall back to the fixed knobs.
+    """
+    policy = str(getattr(args, "goc_unfold_policy", "fixed") or "fixed")
+    max_nodes, hops, mode = _resolve_goc_unfold_controls(args)
+
+    def _int(v: Any) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    d_nodes = _int(getattr(args, "goc_unfold_default_max_nodes", 0) or 0)
+    d_hops = _int(getattr(args, "goc_unfold_default_hops", 0) or 0)
+    p_nodes = _int(getattr(args, "goc_unfold_pivot_max_nodes", 0) or 0)
+    p_hops = _int(getattr(args, "goc_unfold_pivot_hops", 0) or 0)
+
+    # fall back to fixed knobs when not provided
+    if d_nodes <= 0:
+        d_nodes = max_nodes
+    if d_hops <= 0:
+        d_hops = hops
+    if p_nodes <= 0:
+        p_nodes = max_nodes
+    if p_hops <= 0:
+        p_hops = hops
+
+    if policy not in {"fixed", "adaptive_pivot", "adaptive_heuristic"}:
+        policy = "fixed"
+
+    default_knobs = (max(0, d_nodes), max(0, d_hops))
+    pivot_knobs = (max(0, p_nodes), max(0, p_hops))
+    return policy, default_knobs, pivot_knobs, mode
 
 
 def quickcheck_compare_report(
@@ -1885,10 +1961,19 @@ def _evaluate_method(
         goc_internal_unfold_k,
     ) = _resolve_goc_internal_budgets(args)
     (
-        goc_unfold_max_nodes_cfg,
-        goc_unfold_hops_cfg,
-        goc_unfold_budget_mode_cfg,
+        _goc_unfold_max_nodes_fixed,
+        _goc_unfold_hops_fixed,
+        _goc_unfold_budget_mode_fixed,
     ) = _resolve_goc_unfold_controls(args)
+    (
+        goc_unfold_policy,
+        (goc_unfold_default_max_nodes_cfg, goc_unfold_default_hops_cfg),
+        (goc_unfold_pivot_max_nodes_cfg, goc_unfold_pivot_hops_cfg),
+        goc_unfold_budget_mode_cfg,
+    ) = _resolve_goc_unfold_policy(args)
+    # For backward compatibility in debug/diag, keep 'cfg' as the default knobs.
+    goc_unfold_max_nodes_cfg = int(goc_unfold_default_max_nodes_cfg)
+    goc_unfold_hops_cfg = int(goc_unfold_default_hops_cfg)
     save_event_trace = bool(getattr(args, "save_event_trace", False))
     event_trace_sample_rate = float(getattr(args, "event_trace_sample_rate", 1.0) or 1.0)
     event_trace_sample_rate = max(0.0, min(1.0, event_trace_sample_rate))
@@ -2127,6 +2212,17 @@ def _evaluate_method(
         goc_unfolded_critical_clause_count: int | None = None
         goc_unfold_selected_clause_ids: List[str] = []
         goc_unfold_reason: str | None = None
+        # Phase 8: per-task unfold knobs (always defined for GoC to avoid UnboundLocalError
+        # on non-final episodes / early exits).
+        goc_unfold_max_nodes_used: int | None = None
+        goc_unfold_hops_used: int | None = None
+        if method == "goc":
+            goc_unfold_max_nodes_used = int(_goc_unfold_max_nodes_fixed or 0)
+            goc_unfold_hops_used = int(_goc_unfold_hops_fixed or 0)
+        goc_candidate_pool_count: int | None = None
+        goc_candidate_pool_added_count: int | None = None
+        goc_candidate_pool_ids_preclosure: List[str] | None = None
+        goc_policyops_dep_graph_snapshot: Dict[str, Any] | None = None
         goc_closure_candidate_count: int | None = None
         goc_unfolded_node_count: int | None = None
         goc_selected_node_ids: List[str] = []
@@ -2280,17 +2376,58 @@ def _evaluate_method(
                     else list(commit_clause_ids[:2]) + list(critical_clause_ids[:2]) + list(opened_history_ids[:2])
                 )
 
+                candidate_pool_size = int(getattr(args, "goc_candidate_pool_size", 0) or 0)
                 unfold_candidate_ids = list(opened_history_ids)
+                if candidate_pool_size > 0:
+                    try:
+                        pool_results = env.search(task_for_run.user_ticket, top_k=candidate_pool_size)
+                    except Exception:
+                        pool_results = []
+                    if pool_results:
+                        seen = set(unfold_candidate_ids)
+                        pool_results_sorted = sorted(
+                            pool_results, key=lambda it: it.get("score", 0.0), reverse=True
+                        )
+                        for item in pool_results_sorted:
+                            cid = item.get("clause_id")
+                            if cid and cid not in seen:
+                                unfold_candidate_ids.append(cid)
+                                seen.add(cid)
+                goc_candidate_pool_count = int(len(unfold_candidate_ids))
+                goc_candidate_pool_added_count = int(
+                    max(0, len(unfold_candidate_ids) - len(opened_history_ids))
+                )
+                goc_candidate_pool_ids_preclosure = list(unfold_candidate_ids)
+                # Resolve per-task unfold knobs (Phase 8): fixed vs adaptive policies.
+                goc_unfold_max_nodes_used = int(goc_unfold_max_nodes_cfg) if goc_unfold_max_nodes_cfg is not None else 0
+                goc_unfold_hops_used = int(goc_unfold_hops_cfg) if goc_unfold_hops_cfg is not None else 0
+                if goc_unfold_policy in {"adaptive_pivot", "adaptive_heuristic"}:
+                    # For now, 'adaptive_pivot' is driven by late-pivot/task-update presence (is_pivot_task),
+                    # which is visible to the model via the injected Ticket Update message.
+                    if bool(is_pivot_task):
+                        goc_unfold_max_nodes_used = int(goc_unfold_pivot_max_nodes_cfg)
+                        goc_unfold_hops_used = int(goc_unfold_pivot_hops_cfg)
+                    else:
+                        goc_unfold_max_nodes_used = int(goc_unfold_default_max_nodes_cfg)
+                        goc_unfold_hops_used = int(goc_unfold_default_hops_cfg)
                 if (
                     goc_unfold_budget_mode_cfg in {"hops_only", "nodes_and_hops"}
-                    and goc_unfold_hops_cfg > 0
+                    and goc_unfold_hops_used > 0
                     and anchor_ids
                 ):
+                    universe_clause_ids: List[str] | None = None
+                    try:
+                        clauses_map = getattr(world, "clauses", None)
+                        if isinstance(clauses_map, dict) and clauses_map:
+                            universe_clause_ids = list(clauses_map.keys())
+                    except Exception:
+                        universe_clause_ids = None
                     closure_ids = _expand_clause_dependency_closure(
                         anchor_ids,
-                        opened_history_ids,
+                        unfold_candidate_ids,
                         world,
-                        max_hops=goc_unfold_hops_cfg,
+                        max_hops=goc_unfold_hops_used,
+                        universe_clause_ids=universe_clause_ids,
                     )
                     if closure_ids:
                         unfold_candidate_ids = closure_ids
@@ -2300,7 +2437,7 @@ def _evaluate_method(
                 if goc_unfold_budget_mode_cfg == "hops_only":
                     max_selected = max(1, len(unfold_candidate_ids))
                 else:
-                    max_selected = int(goc_unfold_max_nodes_cfg) if goc_unfold_max_nodes_cfg > 0 else 4
+                    max_selected = int(goc_unfold_max_nodes_used) if goc_unfold_max_nodes_used > 0 else 4
 
                 context_clause_ids, reason_map, goc_selection_debug = _select_goc_unfold_clause_ids(
                     unfold_candidate_ids,
@@ -2316,8 +2453,61 @@ def _evaluate_method(
                     include_debug=include_activity_debug,
                 )
                 goc_closure_candidate_count = int(len(unfold_candidate_ids))
-                goc_unfolded_node_count = int(len(unfold_candidate_ids))
-                goc_unfolded_node_ids = list(unfold_candidate_ids)
+                # closure candidates (after hop expansion) vs unfolded nodes (actually opened/used)
+                goc_unfolded_node_count = int(len(context_clause_ids))
+                goc_unfolded_node_ids = list(context_clause_ids)
+                # Optional: emit a task-local dependency graph snapshot (for debugging & analysis).
+                if log_graph and world is not None and episode_id == 3:
+                    try:
+                        clauses_map = getattr(world, "clauses", None)
+                        clause_lookup = clauses_map if isinstance(clauses_map, dict) else {}
+                        # Use the closure candidate set as the node set for the dependency snapshot.
+                        dep_nodes = _unique_strs(unfold_candidate_ids)
+                        dep_node_set = set(dep_nodes)
+                        dep_neighbors = _build_clause_dependency_neighbors(dep_nodes, world)
+                        dep_edges: Dict[str, List[str]] = {}
+                        dep_edge_pairs = 0
+                        for u in dep_nodes:
+                            vs = sorted(v for v in dep_neighbors.get(u, set()) if v in dep_node_set and v != u)
+                            if vs:
+                                dep_edges[str(u)] = [str(v) for v in vs]
+                                dep_edge_pairs += len(vs)
+
+                        dep_node_meta: Dict[str, Dict[str, Any]] = {}
+                        for cid in dep_nodes:
+                            clause = clause_lookup.get(cid)
+                            if clause is None:
+                                continue
+                            dep_node_meta[str(cid)] = {
+                                "doc_id": str(getattr(clause, "doc_id", "") or ""),
+                                "kind": str(getattr(clause, "kind", "") or ""),
+                                "slot": str(getattr(clause, "slot", "") or ""),
+                                "published_at": str(getattr(clause, "published_at", "") or ""),
+                                "text_preview": str(getattr(clause, "text", "") or "")[:220],
+                            }
+
+                        goc_policyops_dep_graph_snapshot = {
+                            "snapshot_kind": "policyops_dependency_graph",
+                            "episode_id": int(episode_id),
+                            "pivot_type": str(pivot_type or ""),
+                            "goc_K": int(goc_unfold_max_nodes_used) if goc_unfold_max_nodes_used is not None else None,
+                            "goc_H": int(goc_unfold_hops_used) if goc_unfold_hops_used is not None else None,
+                            "candidate_pool_clause_ids": list(goc_candidate_pool_ids_preclosure or []),
+                            "closure_clause_ids": dep_nodes,
+                            "unfolded_clause_ids": list(context_clause_ids),
+                            "anchor_clause_ids": list(anchor_ids or []),
+                            "depends_edge_pairs": int(dep_edge_pairs),
+                            "nodes": dep_node_meta,
+                            "edges": {
+                                "depends": dep_edges,
+                                "depends_llm": {},
+                                "doc_ref": {},
+                                "seq": {},
+                            },
+                        }
+                    except Exception:
+                        goc_policyops_dep_graph_snapshot = None
+
                 goc_selected_node_ids = list(context_clause_ids)
                 goc_folded_episode_count = 2
             context_budget = int(getattr(args, "thread_context_budget_chars", 8000))
@@ -2479,9 +2669,12 @@ def _evaluate_method(
                                 "episode_id": episode_id,
                                 "clause_ids": e3_context_clause_ids,
                                 "reason": goc_unfold_reason,
-                                "goc_unfold_max_nodes": goc_unfold_max_nodes_cfg,
-                                "goc_unfold_hops": goc_unfold_hops_cfg,
+                                "goc_unfold_max_nodes": goc_unfold_max_nodes_used,
+                                "goc_unfold_hops": goc_unfold_hops_used,
                                 "closure_candidate_count": goc_closure_candidate_count,
+                                "candidate_pool_count": goc_candidate_pool_count,
+                                "candidate_pool_added_count": goc_candidate_pool_added_count,
+                                "candidate_pool_size": int(getattr(args, "goc_candidate_pool_size", 0) or 0),
                                 "unfolded_node_count": goc_unfolded_node_count,
                                 "selected_node_ids": goc_selected_node_ids,
                                 "unfolded_node_ids": goc_unfolded_node_ids,
@@ -2527,12 +2720,20 @@ def _evaluate_method(
                 "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
                 "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
                 "goc_unfold_reason": goc_unfold_reason,
-                "goc_unfold_max_nodes": goc_unfold_max_nodes_cfg if method == "goc" else None,
-                "goc_unfold_hops": goc_unfold_hops_cfg if method == "goc" else None,
+            "goc_candidate_pool_count": goc_candidate_pool_count,
+            "goc_candidate_pool_added_count": goc_candidate_pool_added_count,
+            "goc_candidate_pool_size": int(getattr(args, "goc_candidate_pool_size", 0) or 0)
+            if method == "goc"
+            else None,
+                "goc_unfold_max_nodes": goc_unfold_max_nodes_used if method == "goc" else None,
+                "goc_unfold_hops": goc_unfold_hops_used if method == "goc" else None,
                 "goc_unfold_budget_mode": (
                     goc_unfold_budget_mode_cfg if method == "goc" else None
                 ),
                 "closure_candidate_count": goc_closure_candidate_count,
+                                "candidate_pool_count": goc_candidate_pool_count,
+                                "candidate_pool_added_count": goc_candidate_pool_added_count,
+                                "candidate_pool_size": int(getattr(args, "goc_candidate_pool_size", 0) or 0),
                 "unfolded_node_count": goc_unfolded_node_count,
                 "selected_node_ids": list(goc_selected_node_ids),
                 "unfolded_node_ids": list(goc_unfolded_node_ids),
@@ -3177,8 +3378,8 @@ def _evaluate_method(
             "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
             "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
             "goc_unfold_reason": goc_unfold_reason,
-            "goc_unfold_max_nodes": goc_unfold_max_nodes_cfg if method == "goc" else None,
-            "goc_unfold_hops": goc_unfold_hops_cfg if method == "goc" else None,
+            "goc_unfold_max_nodes": goc_unfold_max_nodes_used if method == "goc" else None,
+            "goc_unfold_hops": goc_unfold_hops_used if method == "goc" else None,
             "goc_unfold_budget_mode": goc_unfold_budget_mode_cfg if method == "goc" else None,
             "goc_closure_candidate_count": goc_closure_candidate_count,
             "goc_unfolded_node_count": goc_unfolded_node_count,
@@ -4147,6 +4348,8 @@ def _evaluate_method(
             if goc_graph_task_path:
                 record["goc_graph_jsonl_path"] = str(goc_graph_task_path)
             if method == "goc" and goc_internal_graph_task_path:
+                if isinstance(goc_policyops_dep_graph_snapshot, dict):
+                    goc_internal_snapshots.append(goc_policyops_dep_graph_snapshot)
                 snapshots = [s for s in (goc_internal_snapshots or []) if isinstance(s, dict)]
                 if not snapshots:
                     try:
@@ -4635,6 +4838,16 @@ def _evaluate_method(
         "goc_unfold_budget_mode": (
             str(goc_unfold_budget_mode_cfg) if method in {"goc", "goc_base"} else None
         ),
+
+        "goc_unfold_policy": str(goc_unfold_policy) if method in {"goc", "goc_base"} else None,
+        "goc_unfold_default_max_nodes": int(goc_unfold_default_max_nodes_cfg)
+        if method in {"goc", "goc_base"}
+        else None,
+        "goc_unfold_default_hops": int(goc_unfold_default_hops_cfg) if method in {"goc", "goc_base"} else None,
+        "goc_unfold_pivot_max_nodes": int(goc_unfold_pivot_max_nodes_cfg)
+        if method in {"goc", "goc_base"}
+        else None,
+        "goc_unfold_pivot_hops": int(goc_unfold_pivot_hops_cfg) if method in {"goc", "goc_base"} else None,
     }
     if controller_policy == "rerank" and isinstance(controller, RerankController):
         report["rerank_weights"] = dict(controller.weights)
@@ -4657,6 +4870,10 @@ def cmd_generate(args: argparse.Namespace) -> None:
         n_tasks=args.n_tasks,
         n_threads=getattr(args, "n_threads", None),
         exception_chain_depth=args.exception_chain_depth,
+        definition_dependency_depth=getattr(args, "definition_dependency_depth", 1),
+        definition_dependency_extra_terms=getattr(args, "definition_dependency_extra_terms", 0),
+        force_exception_chain_depth=getattr(args, "force_exception_chain_depth", 0),
+        force_exception_chain_all_apply=bool(getattr(args, "force_exception_chain_all_apply", False)),
         update_rate=args.update_rate,
         definition_density=args.definition_density,
         distractor_strength=args.distractor_strength,
@@ -5393,6 +5610,12 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "goc_unfold_budget_mode": str(
             getattr(args, "goc_unfold_budget_mode", "nodes_and_hops") or "nodes_and_hops"
         ),
+
+        "goc_unfold_policy": str(getattr(args, "goc_unfold_policy", "fixed") or "fixed"),
+        "goc_unfold_default_max_nodes": int(getattr(args, "goc_unfold_default_max_nodes", 0) or 0),
+        "goc_unfold_default_hops": int(getattr(args, "goc_unfold_default_hops", 0) or 0),
+        "goc_unfold_pivot_max_nodes": int(getattr(args, "goc_unfold_pivot_max_nodes", 0) or 0),
+        "goc_unfold_pivot_hops": int(getattr(args, "goc_unfold_pivot_hops", 0) or 0),
         "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
         "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
         "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
@@ -6167,6 +6390,29 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--clauses_per_doc", type=int, default=None)
     gen.add_argument("--n_tasks", type=int, default=200)
     gen.add_argument("--exception_chain_depth", type=int, default=2)
+    gen.add_argument(
+        "--definition_dependency_depth",
+        type=int,
+        default=1,
+        help="Max hop depth for recursive definition evidence used by symbolic judge (default=1)",
+    )
+    gen.add_argument(
+        "--definition_dependency_extra_terms",
+        type=int,
+        default=0,
+        help="Extra dependency terms added to each definition clause (creates multi-hop definition chains)",
+    )
+    gen.add_argument(
+        "--force_exception_chain_depth",
+        type=int,
+        default=0,
+        help="If >0, overrides exception_chain_depth to force a longer exception override chain",
+    )
+    gen.add_argument(
+        "--force_exception_chain_all_apply",
+        action="store_true",
+        help="Force all exception-chain clauses to share the base rule's applies_if so full chain applies",
+    )
     gen.add_argument("--update_rate", type=float, default=0.3)
     gen.add_argument("--definition_density", type=float, default=0.4)
     gen.add_argument("--distractor_strength", type=float, default=0.3)
@@ -6389,6 +6635,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--goc_unfold_budget_mode",
         choices=["nodes_only", "hops_only", "nodes_and_hops"],
         default="nodes_and_hops",
+    )
+
+    cmp.add_argument(
+        "--goc_unfold_policy",
+        choices=["fixed", "adaptive_pivot", "adaptive_heuristic"],
+        default="fixed",
+        help="GoC unfold control policy. 'fixed' uses (--goc_unfold_max_nodes, --goc_unfold_hops). "
+             "'adaptive_pivot' switches between default/pivot knobs when a ticket update is present.",
+    )
+    cmp.add_argument(
+        "--goc_unfold_default_max_nodes",
+        type=int,
+        default=0,
+        help="(Adaptive) default max nodes for non-pivot tasks (0 falls back to --goc_unfold_max_nodes).",
+    )
+    cmp.add_argument(
+        "--goc_unfold_default_hops",
+        type=int,
+        default=0,
+        help="(Adaptive) default hop depth for non-pivot tasks (0 falls back to --goc_unfold_hops).",
+    )
+    cmp.add_argument(
+        "--goc_unfold_pivot_max_nodes",
+        type=int,
+        default=0,
+        help="(Adaptive) max nodes for pivot/update tasks (0 falls back to --goc_unfold_max_nodes).",
+    )
+    cmp.add_argument(
+        "--goc_unfold_pivot_hops",
+        type=int,
+        default=0,
+        help="(Adaptive) hop depth for pivot/update tasks (0 falls back to --goc_unfold_hops).",
+    )
+    cmp.add_argument(
+        "--goc_candidate_pool_size",
+        type=int,
+        default=0,
+        help="If >0, expands GoC unfold candidate pool with top-N clause search results (improves K/H meaning)",
     )
     cmp.add_argument("--goc_activity_filter", action="store_true", default=False)
     cmp.add_argument("--goc_activity_filter_fallback", action="store_true", default=True)

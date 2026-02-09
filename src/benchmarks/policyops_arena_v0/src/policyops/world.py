@@ -140,12 +140,31 @@ def evaluate_context(
             if priority_ids[0] not in evidence:
                 evidence.append(priority_ids[0])
 
-    # Include definition clauses for terms used.
-    term_definitions = world.meta.get("term_definitions", {})
-    for term_id in winning.terms_used:
+    # Include definition clauses for terms used (optionally recursive).
+    term_definitions = world.meta.get("term_definitions", {}) or {}
+    max_depth = int(world.meta.get("definition_dependency_depth", 1) or 1)
+    visited_terms: set[str] = set()
+
+    def _add_term_definition(term_id: str, depth_left: int) -> None:
+        if not term_id or term_id in visited_terms or depth_left <= 0:
+            return
+        visited_terms.add(term_id)
         def_clause_id = term_definitions.get(term_id)
         if def_clause_id and def_clause_id not in evidence:
             evidence.append(def_clause_id)
+        if depth_left <= 1 or not def_clause_id:
+            return
+        clause = world.clauses.get(def_clause_id)
+        if not clause:
+            return
+        for next_term in getattr(clause, "terms_used", []) or []:
+            if next_term == term_id:
+                continue
+            _add_term_definition(str(next_term), depth_left - 1)
+
+    if max_depth > 0:
+        for term_id in getattr(winning, "terms_used", []) or []:
+            _add_term_definition(str(term_id), max_depth)
 
     return decision, conditions, evidence, debug
 

@@ -565,6 +565,10 @@ def generate_world(
     n_docs: int = 30,
     clauses_per_doc: int = 5,
     exception_chain_depth: int = 2,
+    definition_dependency_depth: int = 1,
+    definition_dependency_extra_terms: int = 0,
+    force_exception_chain_depth: int = 0,
+    force_exception_chain_all_apply: bool = False,
     update_rate: float = 0.3,
     definition_density: float = 0.4,
     distractor_strength: float = 0.3,
@@ -693,23 +697,34 @@ def generate_world(
 
     # Exception chains.
     available = total_slots - len(clauses)
-    max_chain = min(exception_chain_depth, max(0, available // max(1, len(SLOTS))))
+    chain_depth = (
+        int(force_exception_chain_depth)
+        if int(force_exception_chain_depth) > 0
+        else int(exception_chain_depth)
+    )
+    max_chain = min(chain_depth, max(0, available // max(1, len(SLOTS))))
     for slot in SLOTS:
         prev = base_clauses[slot]
+        chain_applies_if = (
+            dict(getattr(prev, "applies_if", {}) or {}) if force_exception_chain_all_apply else None
+        )
         for _ in range(max_chain):
             clause_id = _next_clause_id(clause_counter)
             clause_counter += 1
-            applies_if = _make_applies_if(
-                rng,
-                regions,
-                products,
-                tiers,
-                data_types,
-                purposes,
-                min_keys=2,
-                max_keys=3,
-                retention_buckets=retention_buckets,
-            )
+            if force_exception_chain_all_apply:
+                applies_if = dict(chain_applies_if or {})
+            else:
+                applies_if = _make_applies_if(
+                    rng,
+                    regions,
+                    products,
+                    tiers,
+                    data_types,
+                    purposes,
+                    min_keys=2,
+                    max_keys=3,
+                    retention_buckets=retention_buckets,
+                )
             decision = _invert_decision(prev.effect["decision"])
             clause = _build_clause(
                 clause_id=clause_id,
@@ -750,10 +765,22 @@ def generate_world(
     term_cycle = list(TERM_LIBRARY)
     rng.shuffle(term_cycle)
     term_definitions: Dict[str, str] = {}
+    created_definition_terms: List[str] = []
     for idx in range(defs_to_add):
         term_id, label, definition = term_cycle[idx % len(term_cycle)]
         clause_id = _next_clause_id(clause_counter)
         clause_counter += 1
+        extra_terms: List[str] = []
+        if int(definition_dependency_extra_terms) > 0 and created_definition_terms:
+            # Create explicit definition dependencies (multi-hop definition evidence).
+            extra_terms.append(created_definition_terms[-1])
+            remaining = max(0, int(definition_dependency_extra_terms) - 1)
+            if remaining > 0 and len(created_definition_terms) > 1:
+                pool = created_definition_terms[:-1]
+                take = min(remaining, len(pool))
+                if take > 0:
+                    extra_terms.extend(rng.sample(pool, k=take))
+        terms_used = [term_id] + extra_terms
         clause = _build_clause(
             clause_id=clause_id,
             kind="definition",
@@ -761,13 +788,14 @@ def generate_world(
             applies_if={},
             decision="needs_more_info",
             conditions=[],
-            terms_used=[term_id],
+            terms_used=terms_used,
             targets={"overrides": [], "revokes": [], "defines": [term_id]},
             term_label=label,
             term_definition=definition,
         )
         clauses.append(clause)
         term_definitions[term_id] = clause_id
+        created_definition_terms.append(term_id)
 
     # Fill remaining slots.
     remaining = total_slots - len(clauses)
@@ -1018,6 +1046,10 @@ def generate_world(
 
     meta = {
         "term_definitions": term_definitions,
+        "definition_dependency_depth": int(definition_dependency_depth),
+        "definition_dependency_extra_terms": int(definition_dependency_extra_terms),
+        "force_exception_chain_depth": int(force_exception_chain_depth),
+        "force_exception_chain_all_apply": bool(force_exception_chain_all_apply),
         "priority_clause_ids": priority_clause_ids,
         "authority_priority": {"security": 0, "legal": 1, "product": 2, "support": 3},
         "scenario_mode": scenario_mode,
@@ -2287,6 +2319,10 @@ def generate_world_and_tasks(
     clauses_per_doc: int = 5,
     n_tasks: int = 200,
     exception_chain_depth: int = 2,
+    definition_dependency_depth: int = 1,
+    definition_dependency_extra_terms: int = 0,
+    force_exception_chain_depth: int = 0,
+    force_exception_chain_all_apply: bool = False,
     update_rate: float = 0.3,
     definition_density: float = 0.4,
     distractor_strength: float = 0.3,
@@ -2330,6 +2366,10 @@ def generate_world_and_tasks(
         n_docs=n_docs,
         clauses_per_doc=clauses_per_doc,
         exception_chain_depth=exception_chain_depth,
+        definition_dependency_depth=definition_dependency_depth,
+        definition_dependency_extra_terms=definition_dependency_extra_terms,
+        force_exception_chain_depth=force_exception_chain_depth,
+        force_exception_chain_all_apply=force_exception_chain_all_apply,
         update_rate=update_rate,
         definition_density=definition_density,
         distractor_strength=distractor_strength,
