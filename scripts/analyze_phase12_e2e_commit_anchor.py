@@ -135,19 +135,15 @@ def _avoided_node_injected_rate(task_recs: List[Dict[str, Any]]) -> float:
     for r in task_recs:
         if int(r.get("episode_id") or 0) != 3:
             continue
-        should_avoid = bool(r.get("goc_avoids_edge_injected"))
         avoid_ids = r.get("goc_avoid_target_clause_ids") or []
-        if (not should_avoid) and isinstance(avoid_ids, list) and avoid_ids:
-            should_avoid = True
-        if not should_avoid:
+        if not isinstance(avoid_ids, list) or not avoid_ids:
             continue
         injected = r.get("goc_avoided_node_injected")
         if isinstance(injected, bool):
             vals.append(1.0 if injected else 0.0)
             continue
-        if isinstance(avoid_ids, list):
-            e3_ids = set(map(str, r.get("e3_context_clause_ids") or []))
-            vals.append(1.0 if (set(map(str, avoid_ids)) & e3_ids) else 0.0)
+        e3_ids = set(map(str, r.get("e3_context_clause_ids") or []))
+        vals.append(1.0 if (set(map(str, avoid_ids)) & e3_ids) else 0.0)
     return float(np.mean(vals)) if vals else float("nan")
 
 

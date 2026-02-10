@@ -4,11 +4,13 @@ This repo now supports two new controls for PolicyOps threaded pivot runs:
 
 - `--pivot_message_style {transcript,banner}`
 - `--goc_enable_avoids` / `--no_goc_enable_avoids`
+- `--goc_avoids_mode {applicability,legacy_commit,off}`
 
 Defaults:
 
 - `pivot_message_style=transcript`
 - `goc_enable_avoids=true`
+- `goc_avoids_mode=applicability`
 
 ## Full bundle run (Phase 13 entrypoint)
 
@@ -17,7 +19,8 @@ python scripts/run_phase13_e2e_universe_frontier_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style transcript \
-  --goc_enable_avoids
+  --goc_enable_avoids \
+  --goc_avoids_mode applicability
 ```
 
 To reproduce legacy pivot prompt behavior:
@@ -27,7 +30,8 @@ python scripts/run_phase13_e2e_universe_frontier_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style banner \
-  --goc_enable_avoids
+  --goc_enable_avoids \
+  --goc_avoids_mode applicability
 ```
 
 To disable avoids filtering:
@@ -37,7 +41,8 @@ python scripts/run_phase13_e2e_universe_frontier_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style transcript \
-  --no_goc_enable_avoids
+  --no_goc_enable_avoids \
+  --goc_avoids_mode off
 ```
 
 ## Direct compare run (manual)
@@ -51,6 +56,7 @@ python -m policyops.run compare \
   --judge symbolic_packed \
   --pivot_message_style transcript \
   --goc_enable_avoids \
+  --goc_avoids_mode applicability \
   --out_dir runs/phase14_compare \
   --dotenv .env
 ```

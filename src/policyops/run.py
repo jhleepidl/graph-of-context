@@ -634,6 +634,178 @@ def _extract_retention_days_from_text(text: str) -> int | None:
         return None
 
 
+_CONTEXT_OVERRIDE_KEYS: Set[str] = {
+    "slot",
+    "region",
+    "product",
+    "tier",
+    "purpose",
+    "data_type",
+    "retention_days",
+    "retention_bucket",
+    "require_condition",
+}
+
+
+def _normalize_goc_avoids_mode(mode: Any) -> str:
+    value = str(mode or "").strip().lower()
+    return value if value in {"legacy_commit", "applicability", "off"} else ""
+
+
+def _resolve_goc_avoids_mode(args: Any) -> str:
+    explicit = _normalize_goc_avoids_mode(getattr(args, "goc_avoids_mode", None))
+    if explicit:
+        return explicit
+    return "applicability" if bool(getattr(args, "goc_enable_avoids", True)) else "off"
+
+
+def _parse_context_overrides_from_text(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    overrides: Dict[str, Any] = {}
+    for match in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^\s,;()]+)", str(text)):
+        key = str(match.group(1) or "").strip().lower()
+        if key not in _CONTEXT_OVERRIDE_KEYS:
+            continue
+        value_raw = str(match.group(2) or "").strip().strip(".,;:!?)\"'")
+        if not value_raw:
+            continue
+        if key == "retention_days":
+            try:
+                overrides[key] = int(value_raw)
+            except Exception:
+                continue
+        else:
+            overrides[key] = value_raw
+    if isinstance(overrides.get("retention_days"), int) and not overrides.get("retention_bucket"):
+        days = int(overrides["retention_days"])
+        overrides["retention_bucket"] = "le_30" if days <= 30 else "gt_30"
+    return overrides
+
+
+def _compute_effective_context(
+    task: Any,
+    episode_id: int,
+    *,
+    threaded_mode: bool,
+    thread_state: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    del threaded_mode, thread_state
+    base = dict(getattr(task, "context", None) or {})
+    if int(episode_id or 0) != 3:
+        return base
+    ticket_updated = str(getattr(task, "ticket_updated", None) or "").strip()
+    if not ticket_updated:
+        return base
+    updated_days = _extract_retention_days_from_text(ticket_updated)
+    if updated_days is not None:
+        base["retention_days"] = int(updated_days)
+        base["retention_bucket"] = "le_30" if updated_days <= 30 else "gt_30"
+    kv_overrides = _parse_context_overrides_from_text(ticket_updated)
+    if kv_overrides:
+        base.update(kv_overrides)
+        if isinstance(base.get("retention_days"), int):
+            days = int(base.get("retention_days"))
+            base["retention_bucket"] = "le_30" if days <= 30 else "gt_30"
+    return base
+
+
+def _compute_context_delta(
+    initial_context: Dict[str, Any],
+    effective_context: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    delta: Dict[str, Dict[str, Any]] = {}
+    keys = sorted(set(initial_context.keys()) | set(effective_context.keys()))
+    for key in keys:
+        before = initial_context.get(key)
+        after = effective_context.get(key)
+        if before != after:
+            delta[str(key)] = {"before": before, "after": after}
+    return delta
+
+
+def _state_node_id(episode: int, key: str, value: Any) -> str:
+    raw = str(value if value is not None else "null")
+    safe = re.sub(r"\s+", "_", raw)
+    safe = re.sub(r"[^a-zA-Z0-9_.:/=-]", "_", safe)
+    return f"state:e{int(episode)}:{key}={safe}"
+
+
+def _build_state_node_maps(context: Dict[str, Any], episode: int) -> tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+    by_key: Dict[str, str] = {}
+    node_meta: Dict[str, Dict[str, Any]] = {}
+    for key in sorted(context.keys()):
+        value = context.get(key)
+        if isinstance(value, (dict, list, tuple, set)):
+            continue
+        skey = str(key)
+        node_id = _state_node_id(episode, skey, value)
+        by_key[skey] = node_id
+        node_meta[node_id] = {
+            "kind": "state",
+            "key": skey,
+            "value": value,
+            "episode": int(episode),
+        }
+    return by_key, node_meta
+
+
+def _append_unique_edge(edges: List[Dict[str, str]], edge_type: str, u: str, v: str) -> None:
+    if not edge_type or not u or not v:
+        return
+    for edge in edges:
+        if edge.get("type") == edge_type and edge.get("u") == u and edge.get("v") == v:
+            return
+    edges.append({"type": edge_type, "u": u, "v": v})
+
+
+def _clause_applies_to_context(clause: Any, ctx: Dict[str, Any]) -> bool:
+    applies_if = getattr(clause, "applies_if", None) or {}
+    if not isinstance(applies_if, dict):
+        return True
+    for key, values in applies_if.items():
+        if not isinstance(values, list) or not values:
+            continue
+        if ctx.get(key) not in values:
+            return False
+    return True
+
+
+def _compute_goc_avoid_clause_ids(
+    *,
+    mode: str,
+    is_pivot_task: bool,
+    opened_history_ids: List[str],
+    world: Any,
+    effective_context: Dict[str, Any],
+    commit1: Dict[str, Any] | None = None,
+    commit2: Dict[str, Any] | None = None,
+) -> tuple[List[str], List[str]]:
+    normalized_mode = _normalize_goc_avoids_mode(mode) or "applicability"
+    opened_ids = _unique_strs(opened_history_ids)
+    inapplicable: List[str] = []
+    for cid in opened_ids:
+        clause = world.clauses.get(cid) if world is not None else None
+        if clause is None:
+            continue
+        if not _clause_applies_to_context(clause, effective_context):
+            inapplicable.append(cid)
+    inapplicable = _unique_strs(inapplicable)
+    if not is_pivot_task or normalized_mode == "off":
+        return [], inapplicable
+    if normalized_mode == "legacy_commit":
+        c1 = commit1 or {}
+        c2 = commit2 or {}
+        legacy = _unique_strs(
+            list(c1.get("anchor_clause_ids") or [])
+            + list(c1.get("supporting_clause_ids") or [])
+            + list(c2.get("anchor_clause_ids") or [])
+            + list(c2.get("supporting_clause_ids") or [])
+        )
+        return legacy, inapplicable
+    return list(inapplicable), inapplicable
+
+
 def _compute_pivot_compliance(
     *,
     ticket_initial: str,
@@ -2243,6 +2415,11 @@ def _evaluate_method(
                     "initial_ticket_node_id": None,
                     "pivot_ticket_node_ids": [],
                     "avoids_edges": [],
+                    "initial_context": None,
+                    "state_nodes": {},
+                    "state_edges": [],
+                    "pivot_context_delta": {},
+                    "pivot_override_keys": [],
                 },
             )
         search_score_mode = getattr(args, "search_score_mode", "bm25_plus_bridge_bonus")
@@ -2299,11 +2476,48 @@ def _evaluate_method(
             getattr(args, "pivot_message_style", "transcript")
         )
         goc_enable_avoids = bool(getattr(args, "goc_enable_avoids", True))
+        goc_avoids_mode = _resolve_goc_avoids_mode(args) if method == "goc" else "off"
         goc_avoids_edge_injected = False
         goc_initial_ticket_node_id: str | None = None
         goc_pivot_ticket_node_id: str | None = None
         goc_avoid_target_clause_ids: List[str] = []
         goc_avoided_node_injected: bool | None = None
+        goc_inapplicable_clause_ids: List[str] = []
+        pivot_override_keys: List[str] = []
+        pivot_context_delta: Dict[str, Dict[str, Any]] = {}
+        critical_coverage_e3: float | None = None
+        critical_missing_ids: List[str] = []
+        inapplicable_injected_rate_e3: float | None = None
+        inapplicable_injected_clause_ids: List[str] = []
+        goc_effective_context = _compute_effective_context(
+            task,
+            int(episode_id or 0),
+            threaded_mode=bool(threaded_mode),
+            thread_state=thread_state,
+        )
+        goc_initial_context = dict(getattr(task, "context", None) or {})
+        state_nodes_e1_by_key: Dict[str, str] = {}
+        state_node_meta_e1: Dict[str, Dict[str, Any]] = {}
+        state_nodes_e3_by_key: Dict[str, str] = {}
+        state_node_meta_e3: Dict[str, Dict[str, Any]] = {}
+        if threaded_mode and thread_state is not None:
+            if not isinstance(thread_state.get("initial_context"), dict):
+                thread_state["initial_context"] = dict(getattr(task, "context", None) or {})
+            goc_initial_context = dict(thread_state.get("initial_context") or {})
+            if int(episode_id or 0) == 1:
+                state_nodes_e1_by_key, state_node_meta_e1 = _build_state_node_maps(goc_initial_context, 1)
+                ts_nodes = thread_state.setdefault("state_nodes", {})
+                if isinstance(ts_nodes, dict):
+                    ts_nodes.update(state_node_meta_e1)
+            if int(episode_id or 0) == 3 and is_pivot_task:
+                state_nodes_e3_by_key, state_node_meta_e3 = _build_state_node_maps(goc_effective_context, 3)
+                ts_nodes = thread_state.setdefault("state_nodes", {})
+                if isinstance(ts_nodes, dict):
+                    ts_nodes.update(state_node_meta_e3)
+                pivot_context_delta = _compute_context_delta(goc_initial_context, goc_effective_context)
+                pivot_override_keys = sorted(pivot_context_delta.keys())
+                thread_state["pivot_context_delta"] = dict(pivot_context_delta)
+                thread_state["pivot_override_keys"] = list(pivot_override_keys)
         if ticket_initial and ticket_initial != str(getattr(task, "user_ticket", "") or ""):
             task_for_run = copy.deepcopy(task)
             task_for_run.user_ticket = ticket_initial
@@ -2378,6 +2592,11 @@ def _evaluate_method(
             if not thread_state.get("initial_ticket_node_id"):
                 thread_state["initial_ticket_node_id"] = f"ticket_initial:{thread_id}"
             goc_initial_ticket_node_id = str(thread_state.get("initial_ticket_node_id") or "")
+            if int(episode_id or 0) == 1 and state_nodes_e1_by_key:
+                state_edges = thread_state.setdefault("state_edges", [])
+                if isinstance(state_edges, list):
+                    for node_id in state_nodes_e1_by_key.values():
+                        _append_unique_edge(state_edges, "ctx_dep", goc_initial_ticket_node_id, str(node_id))
 
         if threaded_mode and episode_id and int(episode_id) >= 3 and is_pivot_task:
             if task_for_run is task:
@@ -2388,7 +2607,7 @@ def _evaluate_method(
                 assistant_summary=commit_refs or None,
                 pivot_message_style=pivot_message_style,
             )
-            if thread_state is not None and goc_enable_avoids:
+            if thread_state is not None and goc_avoids_mode != "off":
                 if not thread_state.get("initial_ticket_node_id"):
                     thread_state["initial_ticket_node_id"] = f"ticket_initial:{thread_id}"
                 goc_initial_ticket_node_id = str(thread_state.get("initial_ticket_node_id") or "")
@@ -2402,6 +2621,29 @@ def _evaluate_method(
                     thread_state.setdefault("pivot_ticket_node_ids", []).append(goc_pivot_ticket_node_id)
                     thread_state.setdefault("avoids_edges", []).append(edge)
                     goc_avoids_edge_injected = True
+            if thread_state is not None:
+                if not goc_pivot_ticket_node_id:
+                    goc_pivot_ticket_node_id = f"ticket_pivot:{task.task_id}"
+                if state_nodes_e3_by_key:
+                    state_edges = thread_state.setdefault("state_edges", [])
+                    if isinstance(state_edges, list):
+                        for node_id in state_nodes_e3_by_key.values():
+                            _append_unique_edge(state_edges, "ctx_dep", goc_pivot_ticket_node_id, str(node_id))
+                        for key in pivot_override_keys:
+                            new_node = state_nodes_e3_by_key.get(key)
+                            old_node = state_nodes_e1_by_key.get(key)
+                            if not old_node and isinstance(thread_state.get("state_nodes"), dict):
+                                for node_id, meta in thread_state.get("state_nodes", {}).items():
+                                    if (
+                                        isinstance(meta, dict)
+                                        and str(meta.get("kind")) == "state"
+                                        and int(meta.get("episode", 0) or 0) == 1
+                                        and str(meta.get("key", "")) == str(key)
+                                    ):
+                                        old_node = str(node_id)
+                                        break
+                            if new_node and old_node and new_node != old_node:
+                                _append_unique_edge(state_edges, "overrides", str(new_node), str(old_node))
         elif (not threaded_mode) and is_pivot_task:
             if task_for_run is task:
                 task_for_run = copy.deepcopy(task)
@@ -2496,16 +2738,38 @@ def _evaluate_method(
                 )
             elif method == "goc":
                 compose_strategy = "goc_fold_unfold"
-                clause_objs = [world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)]
-                summary_text = summarize_clause_history(clause_objs, max_items=6)
+                avoid_clause_ids, goc_inapplicable_clause_ids = _compute_goc_avoid_clause_ids(
+                    mode=goc_avoids_mode,
+                    is_pivot_task=bool(is_pivot_task),
+                    opened_history_ids=opened_history_ids,
+                    world=world,
+                    effective_context=goc_effective_context,
+                    commit1=commit1,
+                    commit2=commit2,
+                )
+                goc_avoid_target_clause_ids = list(avoid_clause_ids)
+                selection_commit_clause_ids = (
+                    list(commit_clause_ids)
+                    if _normalize_goc_avoids_mode(goc_avoids_mode) == "legacy_commit"
+                    else []
+                )
+                if avoid_clause_ids:
+                    avoid_set = set(avoid_clause_ids)
+                    clause_objs_for_summary = [
+                        world.clauses.get(cid)
+                        for cid in opened_history_ids
+                        if world.clauses.get(cid) and cid not in avoid_set
+                    ]
+                else:
+                    clause_objs_for_summary = [
+                        world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)
+                    ]
+                summary_text = (
+                    summarize_clause_history(clause_objs_for_summary, max_items=6)
+                    if clause_objs_for_summary
+                    else ""
+                )
                 critical_clause_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
-                avoid_clause_ids: List[str] = []
-                if goc_enable_avoids and bool(is_pivot_task):
-                    avoid_clause_ids = _unique_strs(
-                        list(commit1.get("anchor_clause_ids") or [])
-                        + list(commit1.get("supporting_clause_ids") or [])
-                    )
-                    goc_avoid_target_clause_ids = list(avoid_clause_ids)
                 activity_filter = bool(getattr(args, "goc_activity_filter", False))
                 activity_filter_fallback = bool(
                     getattr(args, "goc_activity_filter_fallback", True)
@@ -2519,7 +2783,7 @@ def _evaluate_method(
                 # First pass chooses anchor seeds from full opened history.
                 anchor_ids, _anchor_reason_map, _anchor_debug = _select_goc_unfold_clause_ids(
                     opened_history_ids,
-                    commit_clause_ids,
+                    selection_commit_clause_ids,
                     critical_clause_ids,
                     task_for_run.user_ticket,
                     world,
@@ -2531,10 +2795,11 @@ def _evaluate_method(
                     avoid_clause_ids=avoid_clause_ids,
                     include_debug=False,
                 )
+                fallback_seed_ids = [cid for cid in opened_history_ids if cid not in set(avoid_clause_ids)]
                 anchor_ids = _unique_strs(
                     list(anchor_ids[: max(1, min(4, len(anchor_ids)))])
                     if anchor_ids
-                    else list(commit_clause_ids[:2]) + list(critical_clause_ids[:2]) + list(opened_history_ids[:2])
+                    else list(fallback_seed_ids[: max(1, min(4, len(fallback_seed_ids)))])
                 )
 
                 candidate_pool_size = int(getattr(args, "goc_candidate_pool_size", 0) or 0)
@@ -2622,7 +2887,7 @@ def _evaluate_method(
 
                 context_clause_ids, reason_map, goc_selection_debug = _select_goc_unfold_clause_ids(
                     unfold_candidate_ids,
-                    commit_clause_ids,
+                    selection_commit_clause_ids,
                     critical_clause_ids,
                     task_for_run.user_ticket,
                     world,
@@ -2667,6 +2932,91 @@ def _evaluate_method(
                                 "published_at": str(getattr(clause, "published_at", "") or ""),
                                 "text_preview": str(getattr(clause, "text", "") or "")[:220],
                             }
+                        state_node_meta: Dict[str, Dict[str, Any]] = {}
+                        if isinstance(thread_state, dict):
+                            ts_nodes = thread_state.get("state_nodes")
+                            if isinstance(ts_nodes, dict):
+                                for node_id, meta in ts_nodes.items():
+                                    if isinstance(meta, dict) and str(meta.get("kind", "")) == "state":
+                                        state_node_meta[str(node_id)] = dict(meta)
+                        if state_node_meta:
+                            dep_node_meta.update(state_node_meta)
+                        if goc_initial_ticket_node_id:
+                            dep_node_meta.setdefault(
+                                str(goc_initial_ticket_node_id),
+                                {"kind": "ticket_initial", "thread_id": thread_id},
+                            )
+                        if goc_pivot_ticket_node_id:
+                            dep_node_meta.setdefault(
+                                str(goc_pivot_ticket_node_id),
+                                {"kind": "ticket_pivot", "thread_id": thread_id},
+                            )
+                        ctx_dep_edges: Dict[str, List[str]] = {}
+                        override_edges: Dict[str, List[str]] = {}
+                        if isinstance(thread_state, dict):
+                            ts_edges = thread_state.get("state_edges")
+                            if isinstance(ts_edges, list):
+                                for edge in ts_edges:
+                                    if not isinstance(edge, dict):
+                                        continue
+                                    edge_type = str(edge.get("type") or "")
+                                    u = str(edge.get("u") or "")
+                                    v = str(edge.get("v") or "")
+                                    if not u or not v:
+                                        continue
+                                    if edge_type == "ctx_dep":
+                                        ctx_dep_edges.setdefault(u, [])
+                                        if v not in ctx_dep_edges[u]:
+                                            ctx_dep_edges[u].append(v)
+                                    elif edge_type == "overrides":
+                                        override_edges.setdefault(u, [])
+                                        if v not in override_edges[u]:
+                                            override_edges[u].append(v)
+
+                        def _find_state_node(key: str, value: Any) -> str:
+                            preferred = ""
+                            for node_id, meta in state_node_meta.items():
+                                if not isinstance(meta, dict):
+                                    continue
+                                if str(meta.get("key", "")) != str(key):
+                                    continue
+                                if str(meta.get("value", "")) != str(value):
+                                    continue
+                                if int(meta.get("episode", 0) or 0) == 3:
+                                    return str(node_id)
+                                if not preferred:
+                                    preferred = str(node_id)
+                            return preferred
+
+                        for cid in dep_nodes:
+                            clause = clause_lookup.get(cid)
+                            if clause is None:
+                                continue
+                            applies_if = getattr(clause, "applies_if", None) or {}
+                            if not isinstance(applies_if, dict):
+                                continue
+                            for key, values in applies_if.items():
+                                if not isinstance(values, list) or not values:
+                                    continue
+                                for value in values:
+                                    state_node_id = _find_state_node(str(key), value)
+                                    if not state_node_id:
+                                        state_node_id = _state_node_id(int(episode_id), str(key), value)
+                                        state_node_meta[state_node_id] = {
+                                            "kind": "state",
+                                            "key": str(key),
+                                            "value": value,
+                                            "episode": int(episode_id),
+                                        }
+                                        dep_node_meta[state_node_id] = dict(state_node_meta[state_node_id])
+                                    ctx_dep_edges.setdefault(str(cid), [])
+                                    if state_node_id not in ctx_dep_edges[str(cid)]:
+                                        ctx_dep_edges[str(cid)].append(state_node_id)
+                        for edge_map in (dep_edges, ctx_dep_edges, override_edges):
+                            for key in list(edge_map.keys()):
+                                edge_map[key] = sorted(set(edge_map[key]))
+                        ctx_dep_pairs = sum(len(vs) for vs in ctx_dep_edges.values())
+                        override_pairs = sum(len(vs) for vs in override_edges.values())
 
                         goc_policyops_dep_graph_snapshot = {
                             "snapshot_kind": "policyops_dependency_graph",
@@ -2679,9 +3029,17 @@ def _evaluate_method(
                             "unfolded_clause_ids": list(context_clause_ids),
                             "anchor_clause_ids": list(anchor_ids or []),
                             "depends_edge_pairs": int(dep_edge_pairs),
+                            "ctx_dep_edge_pairs": int(ctx_dep_pairs),
+                            "override_edge_pairs": int(override_pairs),
+                            "effective_context": dict(goc_effective_context),
+                            "initial_context": dict(goc_initial_context),
+                            "pivot_override_keys": list(pivot_override_keys),
+                            "pivot_context_delta": dict(pivot_context_delta),
                             "nodes": dep_node_meta,
                             "edges": {
                                 "depends": dep_edges,
+                                "ctx_dep": ctx_dep_edges,
+                                "overrides": override_edges,
                                 "depends_llm": {},
                                 "doc_ref": {},
                                 "seq": {},
@@ -2723,6 +3081,26 @@ def _evaluate_method(
             if goc_avoid_target_clause_ids:
                 avoid_set = set(_unique_strs(goc_avoid_target_clause_ids))
                 goc_avoided_node_injected = bool(avoid_set & set(e3_context_clause_ids))
+            if method == "goc":
+                critical_ids = set(_unique_strs(getattr(task, "critical_core_clause_ids", None) or []))
+                if critical_ids:
+                    critical_present = critical_ids & set(e3_context_clause_ids)
+                    critical_missing_ids = sorted(critical_ids - critical_present)
+                    critical_coverage_e3 = float(len(critical_present)) / float(len(critical_ids))
+                injected_ids_for_applicability: List[str] = []
+                for cid in e3_context_clause_ids:
+                    clause = world.clauses.get(cid) if world else None
+                    if clause is None:
+                        continue
+                    if not _clause_applies_to_context(clause, goc_effective_context):
+                        injected_ids_for_applicability.append(cid)
+                inapplicable_injected_clause_ids = list(_unique_strs(injected_ids_for_applicability))
+                if e3_context_clause_ids:
+                    inapplicable_injected_rate_e3 = float(len(inapplicable_injected_clause_ids)) / float(
+                        len(e3_context_clause_ids)
+                    )
+                else:
+                    inapplicable_injected_rate_e3 = None
             full_episode_clause_ids = list(
                 dict.fromkeys(e12_opened_clause_ids + e3_packed_clause_ids)
             )
@@ -2923,11 +3301,17 @@ def _evaluate_method(
                 "unfolded_node_ids": list(goc_unfolded_node_ids),
                 "pivot_message_style": pivot_message_style,
                 "goc_enable_avoids": bool(goc_enable_avoids),
+                "goc_avoids_mode": str(goc_avoids_mode),
                 "goc_initial_ticket_node_id": goc_initial_ticket_node_id,
                 "goc_pivot_ticket_node_id": goc_pivot_ticket_node_id,
                 "goc_avoids_edge_injected": bool(goc_avoids_edge_injected),
                 "goc_avoid_target_clause_ids": list(goc_avoid_target_clause_ids),
                 "goc_avoided_node_injected": goc_avoided_node_injected,
+                "goc_inapplicable_clause_ids": list(goc_inapplicable_clause_ids),
+                "goc_effective_context": dict(goc_effective_context),
+                "goc_initial_context": dict(goc_initial_context),
+                "pivot_override_keys": list(pivot_override_keys),
+                "pivot_context_delta": dict(pivot_context_delta),
             }
             if bool(getattr(args, "goc_activity_debug_in_snapshot", False)) and goc_selection_debug:
                 diag["goc_activity_debug"] = goc_selection_debug
@@ -3653,11 +4037,21 @@ def _evaluate_method(
             "goc_selected_node_ids": list(goc_selected_node_ids),
             "goc_unfolded_node_ids": list(goc_unfolded_node_ids),
             "goc_enable_avoids": bool(goc_enable_avoids) if method == "goc" else None,
+            "goc_avoids_mode": str(goc_avoids_mode) if method == "goc" else None,
             "goc_initial_ticket_node_id": goc_initial_ticket_node_id,
             "goc_pivot_ticket_node_id": goc_pivot_ticket_node_id,
             "goc_avoids_edge_injected": bool(goc_avoids_edge_injected) if method == "goc" else None,
             "goc_avoid_target_clause_ids": list(goc_avoid_target_clause_ids),
             "goc_avoided_node_injected": goc_avoided_node_injected,
+            "goc_inapplicable_clause_ids": list(goc_inapplicable_clause_ids),
+            "goc_effective_context": dict(goc_effective_context),
+            "goc_initial_context": dict(goc_initial_context),
+            "pivot_override_keys": list(pivot_override_keys),
+            "pivot_context_delta": dict(pivot_context_delta),
+            "critical_coverage_e3": critical_coverage_e3,
+            "critical_missing_ids": list(critical_missing_ids),
+            "inapplicable_injected_rate_e3": inapplicable_injected_rate_e3,
+            "inapplicable_injected_clause_ids_e3": list(inapplicable_injected_clause_ids),
             "opened_evidence_clause_ids": opened_evidence_clause_ids,
             "opened_evidence_doc_ids": opened_evidence_doc_ids,
             "active_context_node_ids": active_context_node_ids,
@@ -4992,7 +5386,8 @@ def _evaluate_method(
     avoids_eval_records = [
         r
         for r in e3_records
-        if bool(r.get("goc_avoids_edge_injected"))
+        if isinstance(r.get("goc_avoid_target_clause_ids"), list)
+        and len(r.get("goc_avoid_target_clause_ids")) > 0
     ]
     avoids_injected_vals = [
         1.0 if r.get("goc_avoided_node_injected") else 0.0
@@ -5191,6 +5586,9 @@ def _evaluate_method(
             getattr(args, "pivot_message_style", "transcript")
         ),
         "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True))
+        if method in {"goc", "goc_base"}
+        else None,
+        "goc_avoids_mode": _resolve_goc_avoids_mode(args)
         if method in {"goc", "goc_base"}
         else None,
     }
@@ -5972,6 +6370,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
             getattr(args, "pivot_message_style", "transcript")
         ),
         "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True)),
+        "goc_avoids_mode": _resolve_goc_avoids_mode(args),
         "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
         "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
         "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
@@ -6891,6 +7290,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--goc_enable_avoids", action="store_true", default=True)
     ev.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
+    ev.add_argument(
+        "--goc_avoids_mode",
+        choices=["legacy_commit", "applicability", "off"],
+        default=None,
+        help=(
+            "GoC E3 avoid filtering mode: "
+            "legacy_commit=commit-anchor based, applicability=applies_if mismatch based, off=disabled. "
+            "When unset, default behavior is applicability via --goc_enable_avoids alias."
+        ),
+    )
     ev.add_argument("--thread_context_budget_chars", type=int, default=8000)
     ev.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     ev.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
@@ -7090,6 +7499,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cmp.add_argument("--goc_enable_avoids", action="store_true", default=True)
     cmp.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
+    cmp.add_argument(
+        "--goc_avoids_mode",
+        choices=["legacy_commit", "applicability", "off"],
+        default=None,
+        help=(
+            "GoC E3 avoid filtering mode: "
+            "legacy_commit=commit-anchor based, applicability=applies_if mismatch based, off=disabled. "
+            "When unset, default behavior is applicability via --goc_enable_avoids alias."
+        ),
+    )
     cmp.add_argument("--thread_context_budget_chars", type=int, default=8000)
     cmp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     cmp.add_argument("--thread_context_budget_sweep", type=str, default="")
@@ -7223,6 +7642,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     swp.add_argument("--goc_enable_avoids", action="store_true", default=True)
     swp.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
+    swp.add_argument(
+        "--goc_avoids_mode",
+        choices=["legacy_commit", "applicability", "off"],
+        default=None,
+        help=(
+            "GoC E3 avoid filtering mode: "
+            "legacy_commit=commit-anchor based, applicability=applies_if mismatch based, off=disabled. "
+            "When unset, default behavior is applicability via --goc_enable_avoids alias."
+        ),
+    )
     swp.add_argument("--thread_context_budget_chars", type=int, default=8000)
     swp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     swp.add_argument("--e3_clause_jitter_max_chars", type=int, default=0)
@@ -7354,6 +7783,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     abl.add_argument("--goc_enable_avoids", action="store_true", default=True)
     abl.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
+    abl.add_argument(
+        "--goc_avoids_mode",
+        choices=["legacy_commit", "applicability", "off"],
+        default=None,
+        help=(
+            "GoC E3 avoid filtering mode: "
+            "legacy_commit=commit-anchor based, applicability=applies_if mismatch based, off=disabled. "
+            "When unset, default behavior is applicability via --goc_enable_avoids alias."
+        ),
+    )
     abl.add_argument("--dotenv", type=str, default=".env")
     abl.add_argument("--out_dir", type=Path, default=None)
     abl.add_argument(

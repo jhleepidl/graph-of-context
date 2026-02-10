@@ -104,6 +104,7 @@ class RunEntry:
     goc_enable_avoids: bool
     report_json: str
     compare_root: str
+    goc_avoids_mode: str = "applicability"
     # optional knobs for goc
     policy: str = ""
     fixed_k: int = 0
@@ -165,6 +166,11 @@ def main() -> None:
     ap.add_argument("--pivot_message_style", choices=["banner", "transcript"], default="transcript")
     ap.add_argument("--goc_enable_avoids", action="store_true", default=True)
     ap.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
+    ap.add_argument(
+        "--goc_avoids_mode",
+        choices=["legacy_commit", "applicability", "off"],
+        default="applicability",
+    )
 
     # Optional ablations
     ap.add_argument("--include_ablations", action="store_true", help="Run extra GoC ablations (frontier off / universe=world)")
@@ -232,6 +238,7 @@ def main() -> None:
         "goc_graph_frontier_score_frac": args.goc_graph_frontier_score_frac,
         "pivot_message_style": args.pivot_message_style,
         "goc_enable_avoids": bool(args.goc_enable_avoids),
+        "goc_avoids_mode": str(args.goc_avoids_mode),
         "runs": [],
     }
 
@@ -259,6 +266,7 @@ def main() -> None:
         "--event_trace_sample_rate", str(args.event_trace_sample_rate),
     ] + _commit_anchor_flags()
     base_compare_flags.append("--goc_enable_avoids" if args.goc_enable_avoids else "--no_goc_enable_avoids")
+    base_compare_flags += ["--goc_avoids_mode", str(args.goc_avoids_mode)]
 
     if args.save_goc_graph:
         base_compare_flags += [
@@ -338,6 +346,7 @@ def main() -> None:
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
             goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
             report_json=str(rep_base.relative_to(phase13_root)),
             compare_root=str(out_base.relative_to(phase13_root)),
         )))
@@ -383,6 +392,7 @@ def main() -> None:
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
             goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
             policy="fixed",
             fixed_k=4,
             fixed_h=2,
@@ -415,6 +425,7 @@ def main() -> None:
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
             goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
             policy="fixed",
             fixed_k=16,
             fixed_h=3,
@@ -449,6 +460,7 @@ def main() -> None:
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
             goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
             policy="adaptive_pivot",
             default_k=4,
             default_h=2,
@@ -486,6 +498,7 @@ def main() -> None:
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
             goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
             policy="adaptive_pivot",
             default_k=4,
             default_h=2,
@@ -525,6 +538,7 @@ def main() -> None:
                 goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
                 pivot_message_style=str(args.pivot_message_style),
                 goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
                 policy="adaptive_pivot",
                 default_k=4,
                 default_h=2,
@@ -563,6 +577,7 @@ def main() -> None:
                 goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
                 pivot_message_style=str(args.pivot_message_style),
                 goc_enable_avoids=bool(args.goc_enable_avoids),
+            goc_avoids_mode=str(args.goc_avoids_mode),
                 policy="adaptive_pivot",
                 default_k=4,
                 default_h=2,
@@ -606,7 +621,9 @@ def main() -> None:
     )
     idx_lines.append(
         "- "
-        + f"pivot_message_style={args.pivot_message_style} goc_enable_avoids={bool(args.goc_enable_avoids)}"
+        + f"pivot_message_style={args.pivot_message_style} "
+        + f"goc_enable_avoids={bool(args.goc_enable_avoids)} "
+        + f"goc_avoids_mode={args.goc_avoids_mode}"
     )
     idx_lines.append(f"- pivot_rate(retention_flip)={args.pivot_rate_retention_flip} pivot_rate(other)={args.pivot_rate}")
     idx_lines.append("\n## Outputs")
