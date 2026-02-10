@@ -182,6 +182,17 @@ def _avoided_node_injected_rate(task_recs: List[Dict[str, Any]]) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
+def _e3_bool_rate(task_recs: List[Dict[str, Any]], key: str) -> float:
+    vals: List[float] = []
+    for r in task_recs:
+        if int(r.get("episode_id") or 0) != 3:
+            continue
+        v = r.get(key)
+        if isinstance(v, bool):
+            vals.append(1.0 if v else 0.0)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def _critical_coverage_pivot(task_recs: List[Dict[str, Any]]) -> float:
     vals: List[float] = []
     for r in task_recs:
@@ -273,7 +284,10 @@ def main() -> None:
             thread_recs = list(mr.get("thread_records") or [])
             task_recs = list(mr.get("records") or [])
 
-            final_correct = [bool(t.get("thread_judge_correct")) for t in thread_recs]
+            final_key = "thread_judge_correct_pivot"
+            if not any(t.get(final_key) is not None for t in thread_recs):
+                final_key = "thread_judge_correct"
+            final_correct = [bool(t.get(final_key)) for t in thread_recs]
             c1 = [bool(t.get("commit1_correct")) for t in thread_recs]
             c2 = [bool(t.get("commit2_correct")) for t in thread_recs]
             both = [a and b for a, b in zip(c1, c2)]
@@ -291,8 +305,8 @@ def main() -> None:
             pivot_threads = [t for t, is_p in zip(thread_recs, pivot_flags) if is_p]
             nonpivot_threads = [t for t, is_p in zip(thread_recs, pivot_flags) if not is_p]
 
-            pivot_final_correct = [bool(t.get("thread_judge_correct")) for t in pivot_threads]
-            nonpivot_final_correct = [bool(t.get("thread_judge_correct")) for t in nonpivot_threads]
+            pivot_final_correct = [bool(t.get(final_key)) for t in pivot_threads]
+            nonpivot_final_correct = [bool(t.get(final_key)) for t in nonpivot_threads]
 
             tok_mp = _thread_tokens(task_recs)
             total_tok = [tok_mp.get(t.get("thread_id"), {}).get("total", float("nan")) for t in thread_recs]
@@ -310,6 +324,8 @@ def main() -> None:
             avoided_injected_rate = _avoided_node_injected_rate(task_recs)
             critical_coverage_pivot_rate = _critical_coverage_pivot(task_recs)
             inapplicable_injected_rate_pivot = _inapplicable_injected_rate_pivot(task_recs)
+            e3_evidence_valid_in_context_rate = _e3_bool_rate(task_recs, "e3_evidence_valid_in_context")
+            e3_evidence_valid_in_commits_rate = _e3_bool_rate(task_recs, "e3_evidence_valid_in_commits")
 
             # Frontier graph attribution (best-effort, GoC only)
             frontier_rates: List[float] = []
@@ -328,6 +344,12 @@ def main() -> None:
                 frontier_first_seen_rate = float("nan")
 
             row: Dict[str, Any] = dict(run)
+            if not row.get("pivot_gold_mode"):
+                row["pivot_gold_mode"] = (
+                    (report.get("scenario_params") or {}).get("pivot_gold_mode")
+                    if isinstance(report.get("scenario_params"), dict)
+                    else None
+                )
             row.update(
                 {
                     "method": method_name,
@@ -358,6 +380,8 @@ def main() -> None:
                     "avoided_node_injected_rate": avoided_injected_rate,
                     "critical_coverage_pivot_rate": critical_coverage_pivot_rate,
                     "inapplicable_injected_rate_pivot": inapplicable_injected_rate_pivot,
+                    "e3_evidence_valid_in_context_rate": e3_evidence_valid_in_context_rate,
+                    "e3_evidence_valid_in_commits_rate": e3_evidence_valid_in_commits_rate,
                     "frontier_first_seen_rate": frontier_first_seen_rate,
                 }
             )
@@ -377,10 +401,12 @@ def main() -> None:
     md_lines.append("- stale_evidence_pivot_rate (pivot robustness)\n")
     md_lines.append("- avoided_node_injected_rate (pivot avoids integrity)\n")
     md_lines.append("- critical_coverage_pivot_rate, inapplicable_injected_rate_pivot (dependency quality)\n")
+    md_lines.append("- e3_evidence_valid_in_context_rate / e3_evidence_valid_in_commits_rate\n")
     md_lines.append("- frontier_first_seen_rate (if GoC graphs were saved)\n")
 
     show_cols = [
         "pivot_type",
+        "pivot_gold_mode",
         "label",
         "final_accuracy",
         "strict_e2e_accuracy",
@@ -394,6 +420,8 @@ def main() -> None:
         "avoided_node_injected_rate",
         "critical_coverage_pivot_rate",
         "inapplicable_injected_rate_pivot",
+        "e3_evidence_valid_in_context_rate",
+        "e3_evidence_valid_in_commits_rate",
         "frontier_first_seen_rate",
     ]
 

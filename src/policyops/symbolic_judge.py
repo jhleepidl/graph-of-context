@@ -7,7 +7,11 @@ from .world import evaluate_context
 
 
 def judge_from_opened_clauses(
-    task: Any, opened_clause_ids: List[str], world: World
+    task: Any,
+    opened_clause_ids: List[str],
+    world: World,
+    *,
+    context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     clauses: Dict[str, Clause] = {}
     for cid in opened_clause_ids:
@@ -27,7 +31,8 @@ def judge_from_opened_clauses(
         clauses=clauses,
         meta=world.meta,
     )
-    decision, conditions, evidence, _ = evaluate_context(partial_world, task.context)
+    ctx = context if isinstance(context, dict) else task.context
+    decision, conditions, evidence, _ = evaluate_context(partial_world, ctx)
     evidence = [cid for cid in evidence if cid in opened_clause_ids]
     return {
         "decision": decision,
@@ -42,5 +47,7 @@ def judge_threaded_final(
     task: Any,
     commit_clause_ids: List[str],
     world: World,
+    *,
+    context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    return judge_from_opened_clauses(task, commit_clause_ids, world)
+    return judge_from_opened_clauses(task, commit_clause_ids, world, context=context)

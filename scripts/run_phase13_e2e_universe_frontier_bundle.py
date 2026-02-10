@@ -101,6 +101,7 @@ class RunEntry:
     goc_graph_frontier_seed_top_n: int
     goc_graph_frontier_score_frac: float
     pivot_message_style: str
+    pivot_gold_mode: str
     goc_enable_avoids: bool
     report_json: str
     compare_root: str
@@ -164,6 +165,11 @@ def main() -> None:
     ap.add_argument("--goc_graph_frontier_seed_top_n", type=int, default=6)
     ap.add_argument("--goc_graph_frontier_score_frac", type=float, default=0.7)
     ap.add_argument("--pivot_message_style", choices=["banner", "transcript"], default="transcript")
+    ap.add_argument(
+        "--pivot_gold_mode",
+        choices=["original", "respect_ticket_updated", "both"],
+        default="respect_ticket_updated",
+    )
     ap.add_argument("--goc_enable_avoids", action="store_true", default=True)
     ap.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     ap.add_argument(
@@ -237,6 +243,7 @@ def main() -> None:
         "goc_graph_frontier_seed_top_n": args.goc_graph_frontier_seed_top_n,
         "goc_graph_frontier_score_frac": args.goc_graph_frontier_score_frac,
         "pivot_message_style": args.pivot_message_style,
+        "pivot_gold_mode": args.pivot_gold_mode,
         "goc_enable_avoids": bool(args.goc_enable_avoids),
         "goc_avoids_mode": str(args.goc_avoids_mode),
         "runs": [],
@@ -257,6 +264,7 @@ def main() -> None:
         "--model", args.model,
         "--judge", "symbolic_packed",
         "--pivot_message_style", args.pivot_message_style,
+        "--pivot_gold_mode", args.pivot_gold_mode,
         "--thread_context_budget_sweep", str(args.budget),
         "--parallel_workers", str(args.parallel_workers),
         "--n_threads", str(n_threads),
@@ -345,6 +353,7 @@ def main() -> None:
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
+            pivot_gold_mode=str(args.pivot_gold_mode),
             goc_enable_avoids=bool(args.goc_enable_avoids),
             goc_avoids_mode=str(args.goc_avoids_mode),
             report_json=str(rep_base.relative_to(phase13_root)),
@@ -391,6 +400,7 @@ def main() -> None:
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
+            pivot_gold_mode=str(args.pivot_gold_mode),
             goc_enable_avoids=bool(args.goc_enable_avoids),
             goc_avoids_mode=str(args.goc_avoids_mode),
             policy="fixed",
@@ -424,6 +434,7 @@ def main() -> None:
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
+            pivot_gold_mode=str(args.pivot_gold_mode),
             goc_enable_avoids=bool(args.goc_enable_avoids),
             goc_avoids_mode=str(args.goc_avoids_mode),
             policy="fixed",
@@ -459,6 +470,7 @@ def main() -> None:
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
+            pivot_gold_mode=str(args.pivot_gold_mode),
             goc_enable_avoids=bool(args.goc_enable_avoids),
             goc_avoids_mode=str(args.goc_avoids_mode),
             policy="adaptive_pivot",
@@ -497,6 +509,7 @@ def main() -> None:
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
             pivot_message_style=str(args.pivot_message_style),
+            pivot_gold_mode=str(args.pivot_gold_mode),
             goc_enable_avoids=bool(args.goc_enable_avoids),
             goc_avoids_mode=str(args.goc_avoids_mode),
             policy="adaptive_pivot",
@@ -537,8 +550,9 @@ def main() -> None:
                 goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
                 goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
                 pivot_message_style=str(args.pivot_message_style),
+                pivot_gold_mode=str(args.pivot_gold_mode),
                 goc_enable_avoids=bool(args.goc_enable_avoids),
-            goc_avoids_mode=str(args.goc_avoids_mode),
+                goc_avoids_mode=str(args.goc_avoids_mode),
                 policy="adaptive_pivot",
                 default_k=4,
                 default_h=2,
@@ -576,8 +590,9 @@ def main() -> None:
                 goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
                 goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
                 pivot_message_style=str(args.pivot_message_style),
+                pivot_gold_mode=str(args.pivot_gold_mode),
                 goc_enable_avoids=bool(args.goc_enable_avoids),
-            goc_avoids_mode=str(args.goc_avoids_mode),
+                goc_avoids_mode=str(args.goc_avoids_mode),
                 policy="adaptive_pivot",
                 default_k=4,
                 default_h=2,
@@ -622,6 +637,7 @@ def main() -> None:
     idx_lines.append(
         "- "
         + f"pivot_message_style={args.pivot_message_style} "
+        + f"pivot_gold_mode={args.pivot_gold_mode} "
         + f"goc_enable_avoids={bool(args.goc_enable_avoids)} "
         + f"goc_avoids_mode={args.goc_avoids_mode}"
     )

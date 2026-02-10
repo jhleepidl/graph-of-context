@@ -44,6 +44,7 @@ from .analysis import (
     analyze_bundle,
 )
 from .bridged_ab import compute_bridged_ab_slices
+from .schemas import Gold
 
 
 def _find_src_dir_for_import(start: Path) -> Path | None:
@@ -85,7 +86,7 @@ except ModuleNotFoundError:
 from .env import PolicyOpsEnv
 from .eval import aggregate_metrics, evaluate_prediction, gold_decision_distribution, save_report
 from .generator import generate_world_and_tasks
-from .world import load_tasks, load_world
+from .world import evaluate_context, load_tasks, load_world
 
 CALIB_PRESET_N8 = "bridged_v1_1_calib_n8_exclcore"
 CALIB_PRESET_N10 = "bridged_v1_1_calib_n10_exclcore"
@@ -657,6 +658,35 @@ def _resolve_goc_avoids_mode(args: Any) -> str:
     if explicit:
         return explicit
     return "applicability" if bool(getattr(args, "goc_enable_avoids", True)) else "off"
+
+
+def _normalize_pivot_gold_mode(mode: Any) -> str:
+    value = str(mode or "respect_ticket_updated").strip().lower()
+    if value in {"original", "respect_ticket_updated", "both"}:
+        return value
+    return "respect_ticket_updated"
+
+
+def _build_gold_from_context(world: Any, context: Dict[str, Any]) -> Gold:
+    decision, conditions, evidence, _ = evaluate_context(world, context)
+    evidence_ids = _unique_strs(list(evidence or []))
+    meta_ids = [
+        cid
+        for cid in evidence_ids
+        if world is not None
+        and getattr(getattr(world, "clauses", {}), "get", None)
+        and world.clauses.get(cid) is not None
+        and str(getattr(world.clauses.get(cid), "kind", "") or "") == "priority"
+    ]
+    meta_set = set(meta_ids)
+    core_ids = [cid for cid in evidence_ids if cid not in meta_set]
+    return Gold(
+        decision=str(decision or "needs_more_info"),
+        conditions=list(conditions or []),
+        gold_evidence=evidence_ids,
+        gold_evidence_core=core_ids,
+        gold_evidence_meta=meta_ids,
+    )
 
 
 def _parse_context_overrides_from_text(text: str) -> Dict[str, Any]:
@@ -2472,6 +2502,9 @@ def _evaluate_method(
         ticket_updated = str(getattr(task, "ticket_updated", None) or "").strip()
         pivot_type = str(getattr(task, "pivot_type", None) or "")
         is_pivot_task = bool(ticket_updated)
+        pivot_gold_mode = _normalize_pivot_gold_mode(
+            getattr(args, "pivot_gold_mode", "respect_ticket_updated")
+        )
         pivot_message_style = _normalize_pivot_message_style(
             getattr(args, "pivot_message_style", "transcript")
         )
@@ -2487,6 +2520,7 @@ def _evaluate_method(
         pivot_context_delta: Dict[str, Dict[str, Any]] = {}
         critical_coverage_e3: float | None = None
         critical_missing_ids: List[str] = []
+        eval_critical_core_clause_ids: List[str] = []
         inapplicable_injected_rate_e3: float | None = None
         inapplicable_injected_clause_ids: List[str] = []
         goc_effective_context = _compute_effective_context(
@@ -2496,6 +2530,22 @@ def _evaluate_method(
             thread_state=thread_state,
         )
         goc_initial_context = dict(getattr(task, "context", None) or {})
+        eval_gold: Gold = task.gold
+        pivot_gold: Gold | None = None
+        eval_gold_is_pivot = False
+        use_pivot_gold_eval = bool(
+            int(episode_id or 0) == 3
+            and bool(is_pivot_task)
+            and pivot_gold_mode in {"respect_ticket_updated", "both"}
+        )
+        eval_context_for_judge = (
+            dict(goc_effective_context)
+            if use_pivot_gold_eval and isinstance(goc_effective_context, dict)
+            else (dict(getattr(task, "context", None) or {}) if isinstance(getattr(task, "context", None), dict) else {})
+        )
+        orig_task_metrics: Dict[str, float] | None = None
+        e3_evidence_valid_in_context: bool | None = None
+        e3_evidence_valid_in_commits: bool | None = None
         state_nodes_e1_by_key: Dict[str, str] = {}
         state_node_meta_e1: Dict[str, Dict[str, Any]] = {}
         state_nodes_e3_by_key: Dict[str, str] = {}
@@ -3254,7 +3304,7 @@ def _evaluate_method(
             )
             raw_output = client.generate(prompt)
             pred = _parse_prediction(raw_output)
-            opened_ids = []
+            opened_ids = list(e3_context_clause_ids)
             diag = {
                 "compose_strategy": compose_strategy,
                 "commit_clause_ids": commit_clause_ids,
@@ -3300,6 +3350,7 @@ def _evaluate_method(
                 "selected_node_ids": list(goc_selected_node_ids),
                 "unfolded_node_ids": list(goc_unfolded_node_ids),
                 "pivot_message_style": pivot_message_style,
+                "pivot_gold_mode": pivot_gold_mode,
                 "goc_enable_avoids": bool(goc_enable_avoids),
                 "goc_avoids_mode": str(goc_avoids_mode),
                 "goc_initial_ticket_node_id": goc_initial_ticket_node_id,
@@ -3459,7 +3510,6 @@ def _evaluate_method(
         commit_supporting_clause_ids: List[str] | None = None
         commit_short_fact: Dict[str, Any] | None = None
         commit_correct: bool | None = None
-        e3_evidence_valid: bool | None = None
         thread_judge_correct: bool | None = None
         commit_clause_ids: List[str] | None = None
         commit_anchor_clause_ids: List[str] | None = None
@@ -3561,13 +3611,25 @@ def _evaluate_method(
                 full_episode_clause_ids = list(
                     dict.fromkeys(e12_opened_clause_ids + e3_packed_clause_ids)
                 )
+        if use_pivot_gold_eval:
+            try:
+                pivot_gold = _build_gold_from_context(world, eval_context_for_judge)
+                eval_gold = pivot_gold
+                eval_gold_is_pivot = True
+            except Exception:
+                pivot_gold = None
+                eval_gold = task.gold
+                eval_gold_is_pivot = False
+        else:
+            eval_gold = task.gold
+            eval_gold_is_pivot = False
         primary_results = diag.get("primary_search_results", []) if isinstance(diag, dict) else []
         gold_core_ids = list(
-            getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
+            getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
         )
         retrieval_diag = compute_retrieval_diagnostics(
             opened_ids=opened_ids,
-            gold_ids=list(task.gold.gold_evidence or []),
+            gold_ids=list(eval_gold.gold_evidence or []),
             search_results=primary_results,
             top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
             if isinstance(diag, dict)
@@ -3605,7 +3667,7 @@ def _evaluate_method(
         union_results = merge_search_results_union(hop1_results, hop2_results)
         hop1_diag = compute_retrieval_diagnostics(
             opened_ids=opened_ids,
-            gold_ids=list(task.gold.gold_evidence or []),
+            gold_ids=list(eval_gold.gold_evidence or []),
             search_results=hop1_results,
             top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
             if isinstance(diag, dict)
@@ -3614,7 +3676,7 @@ def _evaluate_method(
         )
         hop2_diag = compute_retrieval_diagnostics(
             opened_ids=opened_ids,
-            gold_ids=list(task.gold.gold_evidence or []),
+            gold_ids=list(eval_gold.gold_evidence or []),
             search_results=hop2_results,
             top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
             if isinstance(diag, dict)
@@ -3623,14 +3685,29 @@ def _evaluate_method(
         )
         union_diag = compute_retrieval_diagnostics(
             opened_ids=opened_ids,
-            gold_ids=list(task.gold.gold_evidence or []),
+            gold_ids=list(eval_gold.gold_evidence or []),
             search_results=union_results,
             top_k_used=diag.get("primary_search_top_k", args.primary_search_top_k)
             if isinstance(diag, dict)
             else args.primary_search_top_k,
             save_snapshot=False,
         )
-        winning_clause_id = (task.gold.gold_evidence or [None])[0]
+        winning_clause_id = (eval_gold.gold_evidence or [None])[0]
+        if eval_gold_is_pivot:
+            eval_critical_core_clause_ids = list(
+                getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
+            )
+        else:
+            eval_critical_core_clause_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
+        if method == "goc" and threaded_mode and episode_id == 3:
+            eval_critical_ids_set = set(_unique_strs(eval_critical_core_clause_ids))
+            if eval_critical_ids_set:
+                eval_present = eval_critical_ids_set & set(e3_context_clause_ids)
+                critical_missing_ids = sorted(eval_critical_ids_set - eval_present)
+                critical_coverage_e3 = float(len(eval_present)) / float(len(eval_critical_ids_set))
+                goc_unfolded_critical_clause_count = sum(
+                    1 for cid in eval_critical_ids_set if cid in set(e3_packed_clause_ids)
+                )
         min_gold_core_rank_hop2 = _min_rank(hop2_results, gold_core_ids)
         min_gold_core_rank_union = _min_rank(union_results, gold_core_ids)
         min_gold_winning_rank_hop2 = _min_rank(
@@ -3655,7 +3732,13 @@ def _evaluate_method(
         stale_evidence: bool | None = None
         pivot_old_days: int | None = None
         pivot_updated_days: int | None = None
+        judge_correct_with_pivot_compliance: bool | None = None
         judge_mode = getattr(args, "judge", "llm")
+        judge_context_override = (
+            dict(eval_context_for_judge)
+            if int(episode_id or 0) == 3 and bool(is_pivot_task) and eval_gold_is_pivot
+            else None
+        )
         if judge_mode in {
             "symbolic",
             "symbolic_packed",
@@ -3663,15 +3746,35 @@ def _evaluate_method(
             "symbolic_full_episode",
         }:
             if judge_mode in {"symbolic_packed", "symbolic_packed_allcritical"} and threaded_mode and episode_id == 3:
-                judge_pred = judge_from_opened_clauses(task, e3_packed_clause_ids, world)
+                judge_pred = judge_from_opened_clauses(
+                    task,
+                    e3_packed_clause_ids,
+                    world,
+                    context=judge_context_override,
+                )
             elif judge_mode == "symbolic_full_episode" and threaded_mode and episode_id == 3:
-                judge_pred = judge_from_opened_clauses(task, full_episode_clause_ids, world)
+                judge_pred = judge_from_opened_clauses(
+                    task,
+                    full_episode_clause_ids,
+                    world,
+                    context=judge_context_override,
+                )
             elif judge_mode == "symbolic" and threaded_mode and episode_id == 3 and commit_clause_ids is not None:
-                judge_pred = judge_threaded_final(task, commit_clause_ids, world)
+                judge_pred = judge_threaded_final(
+                    task,
+                    commit_clause_ids,
+                    world,
+                    context=judge_context_override,
+                )
             else:
-                judge_pred = judge_from_opened_clauses(task, opened_ids, world)
+                judge_pred = judge_from_opened_clauses(
+                    task,
+                    opened_ids,
+                    world,
+                    context=judge_context_override,
+                )
             judge_decision = judge_pred.get("decision")
-            judge_correct = judge_decision == task.gold.decision
+            judge_correct = judge_decision == eval_gold.decision
             judge_supporting_clause_ids = list(
                 judge_pred.get("supporting_clause_ids") or []
             )
@@ -3700,14 +3803,17 @@ def _evaluate_method(
             commit2_correct = commit2.get("commit_correct")
             if episode_id == 3 and commit_clause_ids is not None:
                 commit_correct = bool(commit1_correct is True and commit2_correct is True)
-                e3_evidence_valid = all(
+                e3_evidence_valid_in_context = all(
+                    cid in set(opened_ids) for cid in (evidence_after or [])
+                )
+                e3_evidence_valid_in_commits = all(
                     cid in set(commit_clause_ids) for cid in (evidence_after or [])
                 )
                 thread_judge_correct = bool(
                     judge_correct
                     and commit1_correct is True
                     and commit2_correct is True
-                    and e3_evidence_valid
+                    and e3_evidence_valid_in_context
                 )
                 judge_correct = thread_judge_correct
                 if judge_mode == "symbolic_full_episode":
@@ -3761,15 +3867,11 @@ def _evaluate_method(
                 raw_output=raw_output,
             )
             if isinstance(judge_correct, bool) and isinstance(pivot_compliant, bool):
-                # Pilot rule: final-stage correctness must also satisfy updated ticket intent.
-                judge_correct = bool(judge_correct and pivot_compliant)
-                if judge_mode == "symbolic_full_episode":
-                    judge_correct_full_episode = judge_correct
-                if isinstance(judge_correct, bool):
-                    judge_correct_packed_allcritical = bool(
-                        judge_correct and e3_packed_all_critical is True
-                    )
-        task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
+                # Keep pivot_compliant as a sanity diagnostic; do not override main correctness.
+                judge_correct_with_pivot_compliance = bool(judge_correct and pivot_compliant)
+        task_metrics = evaluate_prediction(pred_for_eval, eval_gold, world)
+        if pivot_gold_mode == "both":
+            orig_task_metrics = evaluate_prediction(pred_for_eval, task.gold, world)
         metrics.append(task_metrics)
         tool_calls.append(env.tool_call_count)
         open_calls.append(env.open_count)
@@ -3789,7 +3891,7 @@ def _evaluate_method(
         action_opened_gold_coverage = None
         reward_breakdown = None
         if method == "goc" and controller_mode == "train":
-            winning_clause = task.gold.gold_evidence[0] if task.gold.gold_evidence else None
+            winning_clause = eval_gold.gold_evidence[0] if eval_gold.gold_evidence else None
             action_opened_has_winning = (
                 bool(winning_clause and winning_clause in opened_ids)
                 if opened_ids
@@ -3922,10 +4024,27 @@ def _evaluate_method(
             "decision_before_normalize": decision_before_norm,
             "decision_after_normalize": decision_after_norm,
             "normalize_reason": normalize_reason,
-            "gold_decision": task.gold.decision,
-            "decision_correct": pred_decision == task.gold.decision,
+            "gold_decision": eval_gold.decision,
+            "decision_correct": pred_decision == eval_gold.decision,
+            "gold_decision_original": task.gold.decision,
+            "decision_correct_original": pred_decision == task.gold.decision,
+            "pivot_gold_mode": pivot_gold_mode,
+            "eval_gold_is_pivot": bool(eval_gold_is_pivot),
+            "pivot_gold_decision": pivot_gold.decision if pivot_gold is not None else None,
+            "pivot_gold_evidence_ids": list(pivot_gold.gold_evidence or []) if pivot_gold is not None else [],
+            "pivot_gold_evidence_core_ids": (
+                list(getattr(pivot_gold, "gold_evidence_core", None) or pivot_gold.gold_evidence or [])
+                if pivot_gold is not None
+                else []
+            ),
+            "pivot_gold_evidence_meta_ids": (
+                list(getattr(pivot_gold, "gold_evidence_meta", None) or [])
+                if pivot_gold is not None
+                else []
+            ),
             "judge_decision": judge_decision,
             "judge_correct": judge_correct,
+            "judge_correct_with_pivot_compliance": judge_correct_with_pivot_compliance,
             "judge_correct_packed_allcritical": judge_correct_packed_allcritical,
             "judge_correct_full_episode": judge_correct_full_episode,
             "judge_supporting_clause_ids": judge_supporting_clause_ids,
@@ -3953,21 +4072,50 @@ def _evaluate_method(
             else False,
             "update_found_when_needed": update_found_when_needed,
             "winning_rank_exists": winning_rank_exists,
+            "decision_accuracy": task_metrics.get("decision_accuracy"),
+            "condition_f1": task_metrics.get("condition_f1"),
             "evidence_precision": task_metrics.get("evidence_precision"),
             "evidence_recall": task_metrics.get("evidence_recall"),
             "evidence_precision_core": task_metrics.get("evidence_precision_core"),
             "evidence_recall_core": task_metrics.get("evidence_recall_core"),
             "critical_evidence_hit": task_metrics.get("critical_evidence_hit"),
+            "orig_decision_accuracy": (
+                orig_task_metrics.get("decision_accuracy") if isinstance(orig_task_metrics, dict) else None
+            ),
+            "orig_condition_f1": (
+                orig_task_metrics.get("condition_f1") if isinstance(orig_task_metrics, dict) else None
+            ),
+            "orig_evidence_precision": (
+                orig_task_metrics.get("evidence_precision") if isinstance(orig_task_metrics, dict) else None
+            ),
+            "orig_evidence_recall": (
+                orig_task_metrics.get("evidence_recall") if isinstance(orig_task_metrics, dict) else None
+            ),
+            "orig_evidence_precision_core": (
+                orig_task_metrics.get("evidence_precision_core") if isinstance(orig_task_metrics, dict) else None
+            ),
+            "orig_evidence_recall_core": (
+                orig_task_metrics.get("evidence_recall_core") if isinstance(orig_task_metrics, dict) else None
+            ),
+            "orig_critical_evidence_hit": (
+                orig_task_metrics.get("critical_evidence_hit") if isinstance(orig_task_metrics, dict) else None
+            ),
             "pred_evidence_count": len(pred_for_record.get("evidence", []) or []),
-            "gold_evidence_count": len(task.gold.gold_evidence or []),
-            "gold_evidence_ids": list(task.gold.gold_evidence or []),
+            "gold_evidence_count": len(eval_gold.gold_evidence or []),
+            "gold_evidence_count_original": len(task.gold.gold_evidence or []),
+            "gold_evidence_ids": list(eval_gold.gold_evidence or []),
             "gold_evidence_core_ids": list(
+                getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
+            ),
+            "gold_evidence_meta_ids": list(getattr(eval_gold, "gold_evidence_meta", None) or []),
+            "gold_evidence_ids_original": list(task.gold.gold_evidence or []),
+            "gold_evidence_core_ids_original": list(
                 getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
             ),
-            "gold_evidence_meta_ids": list(getattr(task.gold, "gold_evidence_meta", None) or []),
-            "meta_evidence_present": bool(getattr(task.gold, "gold_evidence_meta", None)),
+            "gold_evidence_meta_ids_original": list(getattr(task.gold, "gold_evidence_meta", None) or []),
+            "meta_evidence_present": bool(getattr(eval_gold, "gold_evidence_meta", None)),
             "core_evidence_size": len(
-                getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
+                getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
             ),
             "evidence_before_pad": evidence_before,
             "evidence_after_pad": evidence_after,
@@ -3986,11 +4134,14 @@ def _evaluate_method(
             "commit_short_fact": commit_short_fact,
             "commit_correct": commit_correct,
             "commit_clause_ids": commit_clause_ids,
-            "e3_evidence_valid": e3_evidence_valid,
+            "e3_evidence_valid": e3_evidence_valid_in_context,
+            "e3_evidence_valid_in_context": e3_evidence_valid_in_context,
+            "e3_evidence_valid_in_commits": e3_evidence_valid_in_commits,
             "thread_judge_correct": thread_judge_correct,
             "critical_clause_id_e1": getattr(task, "critical_clause_id_e1", None),
             "critical_clause_id_e2": getattr(task, "critical_clause_id_e2", None),
             "critical_core_clause_ids": list(getattr(task, "critical_core_clause_ids", None) or []),
+            "eval_critical_core_clause_ids": list(eval_critical_core_clause_ids),
             "e3_context_budget_chars": e3_context_budget_chars,
             "e3_context_chars_used": e3_context_chars_used,
             "e3_context_clause_count": e3_context_clause_count,
@@ -4198,7 +4349,7 @@ def _evaluate_method(
         union_ids = {
             item.get("clause_id") for item in (union_results or []) if item.get("clause_id")
         }
-        winning_clause = (task.gold.gold_evidence or [None])[0]
+        winning_clause = ((record.get("gold_evidence_ids") or [None])[0] if isinstance(record, dict) else None)
         core_id_set = set(record.get("gold_evidence_core_ids") or [])
         winning_in_union = bool(
             (winning_clause and winning_clause in union_ids) or (union_ids & core_id_set)
@@ -4479,10 +4630,14 @@ def _evaluate_method(
                         "thread_id": thread_id,
                         "method": method,
                         "thread_judge_correct": record.get("thread_judge_correct"),
+                        "thread_judge_correct_pivot": record.get("thread_judge_correct"),
                         "thread_decision_correct": record.get("decision_correct"),
                         "commit1_correct": commit1.get("commit_correct"),
                         "commit2_correct": commit2.get("commit_correct"),
                         "e3_evidence_valid": record.get("e3_evidence_valid"),
+                        "e3_evidence_valid_in_context": record.get("e3_evidence_valid_in_context"),
+                        "e3_evidence_valid_in_commits": record.get("e3_evidence_valid_in_commits"),
+                        "pivot_gold_mode": record.get("pivot_gold_mode"),
                         "open_calls_total": sum(
                             int(r.get("open_calls") or 0)
                             for r in thread_state.get("episode_records", {}).values()
@@ -4605,8 +4760,15 @@ def _evaluate_method(
                 )
 
             gold_node = f"gold:{task.task_id}"
-            goc_graph.add_node(gold_node, "gold", decision=task.gold.decision, step=goc_graph.step)
-            for cid in task.gold.gold_evidence or []:
+            goc_graph.add_node(
+                gold_node,
+                "gold",
+                decision=record.get("gold_decision"),
+                decision_original=record.get("gold_decision_original"),
+                pivot_gold_mode=record.get("pivot_gold_mode"),
+                step=goc_graph.step,
+            )
+            for cid in record.get("gold_evidence_ids") or []:
                 doc_id = f"doc:{cid}"
                 goc_graph.add_node(doc_id, "doc_ref", clause_id=cid)
                 goc_graph.add_edge(f"gold:{task.task_id}:{cid}", gold_node, doc_id, "gold_evidence")
@@ -5452,6 +5614,24 @@ def _evaluate_method(
         aggregate["thread_decision_accuracy"] = (
             sum(thread_decision_vals) / len(thread_decision_vals) if thread_decision_vals else None
         )
+        e3_valid_ctx_vals = [
+            1.0 if r.get("e3_evidence_valid_in_context") else 0.0
+            for r in thread_records
+            if r.get("e3_evidence_valid_in_context") is not None
+        ]
+        e3_valid_commits_vals = [
+            1.0 if r.get("e3_evidence_valid_in_commits") else 0.0
+            for r in thread_records
+            if r.get("e3_evidence_valid_in_commits") is not None
+        ]
+        aggregate["e3_evidence_valid_in_context_rate"] = (
+            sum(e3_valid_ctx_vals) / len(e3_valid_ctx_vals) if e3_valid_ctx_vals else None
+        )
+        aggregate["e3_evidence_valid_in_commits_rate"] = (
+            sum(e3_valid_commits_vals) / len(e3_valid_commits_vals)
+            if e3_valid_commits_vals
+            else None
+        )
         for ep_id in (1, 2, 3):
             judge_vals = episode_judge.get(ep_id, [])
             commit_vals = episode_commit.get(ep_id, [])
@@ -5584,6 +5764,9 @@ def _evaluate_method(
         "goc_unfold_pivot_hops": int(goc_unfold_pivot_hops_cfg) if method in {"goc", "goc_base"} else None,
         "pivot_message_style": _normalize_pivot_message_style(
             getattr(args, "pivot_message_style", "transcript")
+        ),
+        "pivot_gold_mode": _normalize_pivot_gold_mode(
+            getattr(args, "pivot_gold_mode", "respect_ticket_updated")
         ),
         "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True))
         if method in {"goc", "goc_base"}
@@ -6368,6 +6551,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "goc_unfold_pivot_hops": int(getattr(args, "goc_unfold_pivot_hops", 0) or 0),
         "pivot_message_style": _normalize_pivot_message_style(
             getattr(args, "pivot_message_style", "transcript")
+        ),
+        "pivot_gold_mode": _normalize_pivot_gold_mode(
+            getattr(args, "pivot_gold_mode", "respect_ticket_updated")
         ),
         "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True)),
         "goc_avoids_mode": _resolve_goc_avoids_mode(args),
@@ -7288,6 +7474,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="transcript",
         help="How pivot updates are rendered for episode-3 tasks.",
     )
+    ev.add_argument(
+        "--pivot_gold_mode",
+        choices=["original", "respect_ticket_updated", "both"],
+        default="respect_ticket_updated",
+        help=(
+            "Gold evaluation mode for episode-3 pivot tasks: "
+            "original=task.context/task.gold, "
+            "respect_ticket_updated=effective_context-derived pivot gold, "
+            "both=compute both metrics but final correctness uses pivot gold."
+        ),
+    )
     ev.add_argument("--goc_enable_avoids", action="store_true", default=True)
     ev.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     ev.add_argument(
@@ -7497,6 +7694,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="transcript",
         help="How pivot updates are rendered for episode-3 tasks.",
     )
+    cmp.add_argument(
+        "--pivot_gold_mode",
+        choices=["original", "respect_ticket_updated", "both"],
+        default="respect_ticket_updated",
+        help=(
+            "Gold evaluation mode for episode-3 pivot tasks: "
+            "original=task.context/task.gold, "
+            "respect_ticket_updated=effective_context-derived pivot gold, "
+            "both=compute both metrics but final correctness uses pivot gold."
+        ),
+    )
     cmp.add_argument("--goc_enable_avoids", action="store_true", default=True)
     cmp.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     cmp.add_argument(
@@ -7640,6 +7848,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="transcript",
         help="How pivot updates are rendered for episode-3 tasks.",
     )
+    swp.add_argument(
+        "--pivot_gold_mode",
+        choices=["original", "respect_ticket_updated", "both"],
+        default="respect_ticket_updated",
+        help=(
+            "Gold evaluation mode for episode-3 pivot tasks: "
+            "original=task.context/task.gold, "
+            "respect_ticket_updated=effective_context-derived pivot gold, "
+            "both=compute both metrics but final correctness uses pivot gold."
+        ),
+    )
     swp.add_argument("--goc_enable_avoids", action="store_true", default=True)
     swp.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     swp.add_argument(
@@ -7780,6 +7999,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["banner", "transcript"],
         default="transcript",
         help="How pivot updates are rendered for episode-3 tasks.",
+    )
+    abl.add_argument(
+        "--pivot_gold_mode",
+        choices=["original", "respect_ticket_updated", "both"],
+        default="respect_ticket_updated",
+        help=(
+            "Gold evaluation mode for episode-3 pivot tasks: "
+            "original=task.context/task.gold, "
+            "respect_ticket_updated=effective_context-derived pivot gold, "
+            "both=compute both metrics but final correctness uses pivot gold."
+        ),
     )
     abl.add_argument("--goc_enable_avoids", action="store_true", default=True)
     abl.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")

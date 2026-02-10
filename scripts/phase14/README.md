@@ -3,12 +3,14 @@
 This repo now supports two new controls for PolicyOps threaded pivot runs:
 
 - `--pivot_message_style {transcript,banner}`
+- `--pivot_gold_mode {respect_ticket_updated,original,both}`
 - `--goc_enable_avoids` / `--no_goc_enable_avoids`
 - `--goc_avoids_mode {applicability,legacy_commit,off}`
 
 Defaults:
 
 - `pivot_message_style=transcript`
+- `pivot_gold_mode=respect_ticket_updated`
 - `goc_enable_avoids=true`
 - `goc_avoids_mode=applicability`
 
@@ -19,6 +21,7 @@ python scripts/run_phase13_e2e_universe_frontier_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style transcript \
+  --pivot_gold_mode respect_ticket_updated \
   --goc_enable_avoids \
   --goc_avoids_mode applicability
 ```
@@ -30,6 +33,7 @@ python scripts/run_phase13_e2e_universe_frontier_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style banner \
+  --pivot_gold_mode respect_ticket_updated \
   --goc_enable_avoids \
   --goc_avoids_mode applicability
 ```
@@ -41,6 +45,7 @@ python scripts/run_phase13_e2e_universe_frontier_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style transcript \
+  --pivot_gold_mode respect_ticket_updated \
   --no_goc_enable_avoids \
   --goc_avoids_mode off
 ```
@@ -55,6 +60,7 @@ python -m policyops.run compare \
   --model gpt-4.1-mini \
   --judge symbolic_packed \
   --pivot_message_style transcript \
+  --pivot_gold_mode respect_ticket_updated \
   --goc_enable_avoids \
   --goc_avoids_mode applicability \
   --out_dir runs/phase14_compare \
