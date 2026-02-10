@@ -12,13 +12,24 @@ def judge_from_opened_clauses(
     world: World,
     *,
     context: Dict[str, Any] | None = None,
+    constraint_updates: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    updates = constraint_updates if isinstance(constraint_updates, dict) else {}
+    require_condition_value = str(updates.get("require_condition") or "").strip()
     clauses: Dict[str, Clause] = {}
     for cid in opened_clause_ids:
         clause = world.clauses.get(cid)
         if clause:
             clauses[cid] = Clause(**model_dump(clause))
     if not clauses:
+        if require_condition_value:
+            return {
+                "decision": "require_condition",
+                "conditions": [require_condition_value],
+                "evidence": [],
+                "supporting_clause_ids": [],
+                "customer_message": "",
+            }
         return {
             "decision": "needs_more_info",
             "conditions": [],
@@ -33,6 +44,9 @@ def judge_from_opened_clauses(
     )
     ctx = context if isinstance(context, dict) else task.context
     decision, conditions, evidence, _ = evaluate_context(partial_world, ctx)
+    if require_condition_value:
+        conditions = [require_condition_value]
+        decision = "require_condition"
     evidence = [cid for cid in evidence if cid in opened_clause_ids]
     return {
         "decision": decision,
@@ -49,5 +63,12 @@ def judge_threaded_final(
     world: World,
     *,
     context: Dict[str, Any] | None = None,
+    constraint_updates: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    return judge_from_opened_clauses(task, commit_clause_ids, world, context=context)
+    return judge_from_opened_clauses(
+        task,
+        commit_clause_ids,
+        world,
+        context=context,
+        constraint_updates=constraint_updates,
+    )

@@ -137,6 +137,12 @@ def main() -> None:
     ap.add_argument("--total_tasks", type=int, default=120)
     ap.add_argument("--pivot_rate", type=float, default=0.2, help="pivot rate for non-retention_flip")
     ap.add_argument("--pivot_rate_retention_flip", type=float, default=0.5)
+    ap.add_argument(
+        "--pivot_types",
+        type=str,
+        default="retention_flip,entity_switch,constraint_add",
+        help="comma-separated pivot types to run",
+    )
     ap.add_argument("--parallel_workers", type=int, default=12)
     ap.add_argument("--event_trace_sample_rate", type=float, default=0.2)
     ap.add_argument("--save_goc_graph", action="store_true", default=True)
@@ -217,7 +223,13 @@ def main() -> None:
         n_threads = min(8, n_threads)
         total_tasks = min(24, total_tasks)
 
-    pivot_types = ["retention_flip", "entity_switch", "constraint_add"]
+    valid_pivot_types = {"retention_flip", "entity_switch", "constraint_add"}
+    pivot_types = [p.strip() for p in str(args.pivot_types).split(",") if p.strip()]
+    if not pivot_types:
+        raise ValueError("pivot_types must contain at least one pivot type")
+    invalid = [p for p in pivot_types if p not in valid_pivot_types]
+    if invalid:
+        raise ValueError(f"invalid pivot_types={invalid}; valid={sorted(valid_pivot_types)}")
 
     manifest: Dict[str, Any] = {
         "bundle_name": bundle_name,
@@ -246,6 +258,7 @@ def main() -> None:
         "pivot_gold_mode": args.pivot_gold_mode,
         "goc_enable_avoids": bool(args.goc_enable_avoids),
         "goc_avoids_mode": str(args.goc_avoids_mode),
+        "pivot_types": pivot_types,
         "runs": [],
     }
 
@@ -642,6 +655,7 @@ def main() -> None:
         + f"goc_avoids_mode={args.goc_avoids_mode}"
     )
     idx_lines.append(f"- pivot_rate(retention_flip)={args.pivot_rate_retention_flip} pivot_rate(other)={args.pivot_rate}")
+    idx_lines.append(f"- pivot_types={','.join(pivot_types)}")
     idx_lines.append("\n## Outputs")
     idx_lines.append(f"- phase13_root: {phase13_root}")
     idx_lines.append(f"- manifest: {phase13_root / 'run_manifest.json'}")

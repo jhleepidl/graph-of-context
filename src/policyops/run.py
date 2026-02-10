@@ -644,7 +644,6 @@ _CONTEXT_OVERRIDE_KEYS: Set[str] = {
     "data_type",
     "retention_days",
     "retention_bucket",
-    "require_condition",
 }
 
 
@@ -689,6 +688,91 @@ def _build_gold_from_context(world: Any, context: Dict[str, Any]) -> Gold:
     )
 
 
+def _apply_constraint_updates_to_gold(
+    gold: Gold,
+    *,
+    pivot_type: str,
+    constraint_updates: Dict[str, Any] | None,
+) -> tuple[Gold, bool]:
+    updates = constraint_updates if isinstance(constraint_updates, dict) else {}
+    require_condition_value = str(updates.get("require_condition") or "").strip()
+    if str(pivot_type or "") != "constraint_add" or not require_condition_value:
+        return gold, False
+    overridden = Gold(
+        decision="require_condition",
+        conditions=[require_condition_value],
+        gold_evidence=list(gold.gold_evidence or []),
+        gold_evidence_core=list(getattr(gold, "gold_evidence_core", None) or gold.gold_evidence or []),
+        gold_evidence_meta=list(getattr(gold, "gold_evidence_meta", None) or []),
+    )
+    return overridden, True
+
+
+def _compute_commit_quality(
+    *,
+    anchor_clause_ids: List[str] | None,
+    supporting_clause_ids: List[str] | None,
+    eval_core_clause_ids: List[str] | None,
+) -> Dict[str, Any]:
+    core_set = set(_unique_strs(list(eval_core_clause_ids or [])))
+    anchor_set = set(_unique_strs(list(anchor_clause_ids or [])))
+    supporting_set = set(_unique_strs(list(supporting_clause_ids or [])))
+    union_set = anchor_set | supporting_set
+    supporting_core_hits = sorted(core_set & supporting_set)
+    if not core_set:
+        return {
+            "correct_anchor": None,
+            "correct_union": None,
+            "anchor_promotion_needed": None,
+            "supporting_core_hits": supporting_core_hits,
+        }
+    correct_anchor = bool(core_set & anchor_set)
+    correct_union = bool(core_set & union_set)
+    anchor_promotion_needed = bool(
+        correct_union and not correct_anchor and bool(supporting_core_hits)
+    )
+    return {
+        "correct_anchor": correct_anchor,
+        "correct_union": correct_union,
+        "anchor_promotion_needed": anchor_promotion_needed,
+        "supporting_core_hits": supporting_core_hits,
+    }
+
+
+def _compute_thread_e3_correctness(
+    *,
+    judge_correct: bool | None,
+    commit1_correct: bool | None,
+    commit2_correct: bool | None,
+    evidence_after: List[str] | None,
+    opened_ids: List[str] | None,
+    commit_clause_ids: List[str] | None,
+    e3_answer_correct: bool | None,
+) -> Dict[str, Any]:
+    evidence_list = list(evidence_after or [])
+    opened_set = set(_unique_strs(list(opened_ids or [])))
+    commit_set = set(_unique_strs(list(commit_clause_ids or [])))
+    evidence_valid_in_context = all(cid in opened_set for cid in evidence_list)
+    evidence_valid_in_commits = all(cid in commit_set for cid in evidence_list)
+    strict_correct: bool | None = None
+    if isinstance(judge_correct, bool):
+        strict_correct = bool(
+            judge_correct
+            and commit1_correct is True
+            and commit2_correct is True
+            and evidence_valid_in_context
+        )
+    e3_only_correct: bool | None = None
+    if isinstance(e3_answer_correct, bool):
+        e3_only_correct = bool(e3_answer_correct and evidence_valid_in_context)
+    return {
+        "evidence_valid_in_context": evidence_valid_in_context,
+        "evidence_valid_in_commits": evidence_valid_in_commits,
+        "strict_correct": strict_correct,
+        "e3_only_correct": e3_only_correct,
+    }
+
+
 def _parse_context_overrides_from_text(text: str) -> Dict[str, Any]:
     if not text:
         return {}
@@ -711,6 +795,54 @@ def _parse_context_overrides_from_text(text: str) -> Dict[str, Any]:
         days = int(overrides["retention_days"])
         overrides["retention_bucket"] = "le_30" if days <= 30 else "gt_30"
     return overrides
+
+
+def _parse_constraint_updates(text: str) -> Dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    match = re.search(
+        r"\brequire_condition\s*[:=]\s*([^\s,;()]+)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return {}
+    value = str(match.group(1) or "").strip().strip(".,;:!?)\"'")
+    if not value:
+        return {}
+    return {"require_condition": value}
+
+
+def _constraint_key_value(
+    constraint_updates: Dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    updates = constraint_updates if isinstance(constraint_updates, dict) else {}
+    value = str(updates.get("require_condition") or "").strip()
+    if not value:
+        return None, None
+    return "require_condition", value
+
+
+def _compute_effective_context_with_constraint_updates(
+    task: Any,
+    episode_id: int,
+    *,
+    threaded_mode: bool,
+    thread_state: Dict[str, Any] | None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    effective_context = _compute_effective_context(
+        task,
+        episode_id,
+        threaded_mode=threaded_mode,
+        thread_state=thread_state,
+    )
+    if int(episode_id or 0) != 3:
+        return effective_context, {}
+    ticket_updated = str(getattr(task, "ticket_updated", None) or "").strip()
+    if not ticket_updated:
+        return effective_context, {}
+    return effective_context, _parse_constraint_updates(ticket_updated)
 
 
 def _compute_effective_context(
@@ -2185,6 +2317,78 @@ def _split_tasks(
     cut = int(len(shuffled) * train_ratio)
     return shuffled[:cut], shuffled[cut:]
 
+
+def _extract_first_json_object(text: str) -> Dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    candidates: List[str] = [raw]
+    lines = raw.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        end_idx: int | None = None
+        for i in range(len(lines) - 1, 0, -1):
+            if lines[i].strip().startswith("```"):
+                end_idx = i
+                break
+        if end_idx is not None and end_idx > 0:
+            inner = "\n".join(lines[1:end_idx]).strip()
+            if inner:
+                candidates.append(inner)
+    no_fence_lines = [line for line in lines if not line.strip().startswith("```")]
+    if no_fence_lines:
+        without_fences = "\n".join(no_fence_lines).strip()
+        if without_fences:
+            candidates.append(without_fences)
+
+    decoder = json.JSONDecoder()
+    seen: Set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        for idx, ch in enumerate(candidate):
+            if ch != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(candidate[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return None
+
+
+def _parse_prediction_for_answer_metrics(
+    raw_output: str,
+) -> tuple[Dict[str, Any], bool]:
+    extracted = _extract_first_json_object(raw_output)
+    if isinstance(extracted, dict):
+        return _parse_prediction(json.dumps(extracted, ensure_ascii=False)), False
+
+    raw = str(raw_output or "").strip()
+    fallback_obj: Dict[str, Any] | None = None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            fallback_obj = parsed
+    except Exception:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end >= start:
+            try:
+                parsed = json.loads(raw[start : end + 1])
+                if isinstance(parsed, dict):
+                    fallback_obj = parsed
+            except Exception:
+                fallback_obj = None
+
+    if isinstance(fallback_obj, dict):
+        return _parse_prediction(json.dumps(fallback_obj, ensure_ascii=False)), False
+
+    # Preserve legacy behavior for downstream fields while exposing parse failure.
+    return _parse_prediction(raw_output), True
+
 def apply_evidence_padding(
     pred: Dict[str, Any],
     opened_ids: List[str],
@@ -2523,15 +2727,22 @@ def _evaluate_method(
         eval_critical_core_clause_ids: List[str] = []
         inapplicable_injected_rate_e3: float | None = None
         inapplicable_injected_clause_ids: List[str] = []
-        goc_effective_context = _compute_effective_context(
+        goc_effective_context, pivot_constraint_updates = _compute_effective_context_with_constraint_updates(
             task,
             int(episode_id or 0),
             threaded_mode=bool(threaded_mode),
             thread_state=thread_state,
         )
+        pivot_constraint_key, pivot_constraint_value = _constraint_key_value(
+            pivot_constraint_updates
+        )
+        pivot_constraint_keys = sorted(
+            [str(k) for k in (pivot_constraint_updates or {}).keys()]
+        )
         goc_initial_context = dict(getattr(task, "context", None) or {})
         eval_gold: Gold = task.gold
         pivot_gold: Gold | None = None
+        pivot_gold_constraint_applied = False
         eval_gold_is_pivot = False
         use_pivot_gold_eval = bool(
             int(episode_id or 0) == 3
@@ -2568,6 +2779,10 @@ def _evaluate_method(
                 pivot_override_keys = sorted(pivot_context_delta.keys())
                 thread_state["pivot_context_delta"] = dict(pivot_context_delta)
                 thread_state["pivot_override_keys"] = list(pivot_override_keys)
+                thread_state["pivot_constraint_updates"] = dict(pivot_constraint_updates)
+                thread_state["pivot_constraint_keys"] = list(pivot_constraint_keys)
+                thread_state["pivot_constraint_key"] = pivot_constraint_key
+                thread_state["pivot_constraint_value"] = pivot_constraint_value
         if ticket_initial and ticket_initial != str(getattr(task, "user_ticket", "") or ""):
             task_for_run = copy.deepcopy(task)
             task_for_run.user_ticket = ticket_initial
@@ -3363,6 +3578,10 @@ def _evaluate_method(
                 "goc_initial_context": dict(goc_initial_context),
                 "pivot_override_keys": list(pivot_override_keys),
                 "pivot_context_delta": dict(pivot_context_delta),
+                "pivot_constraint_updates": dict(pivot_constraint_updates),
+                "pivot_constraint_keys": list(pivot_constraint_keys),
+                "pivot_constraint_key": pivot_constraint_key,
+                "pivot_constraint_value": pivot_constraint_value,
             }
             if bool(getattr(args, "goc_activity_debug_in_snapshot", False)) and goc_selection_debug:
                 diag["goc_activity_debug"] = goc_selection_debug
@@ -3507,9 +3726,27 @@ def _evaluate_method(
         else:
             raise ValueError(f"Unknown method: {method}")
 
+        answer_parse_failed: bool | None = None
+        if isinstance(raw_output, str) and method != "engine":
+            pred, answer_parse_failed = _parse_prediction_for_answer_metrics(raw_output)
+
         commit_supporting_clause_ids: List[str] | None = None
         commit_short_fact: Dict[str, Any] | None = None
         commit_correct: bool | None = None
+        commit_correct_anchor: bool | None = None
+        commit_correct_union: bool | None = None
+        commit_anchor_promotion_needed: bool | None = None
+        commit_supporting_core_hits: List[str] = []
+        commit1_correct_anchor: bool | None = None
+        commit1_correct_union: bool | None = None
+        commit1_anchor_promotion_needed: bool | None = None
+        commit1_supporting_core_hits: List[str] = []
+        commit2_correct_anchor: bool | None = None
+        commit2_correct_union: bool | None = None
+        commit2_anchor_promotion_needed: bool | None = None
+        commit2_supporting_core_hits: List[str] = []
+        thread_strict_correct: bool | None = None
+        thread_e3_only_correct: bool | None = None
         thread_judge_correct: bool | None = None
         commit_clause_ids: List[str] | None = None
         commit_anchor_clause_ids: List[str] | None = None
@@ -3558,9 +3795,16 @@ def _evaluate_method(
             core_ids = list(
                 getattr(task.gold, "gold_evidence_core", None) or task.gold.gold_evidence or []
             )
-            commit_correct = bool(commit_anchor_clause_ids) and any(
-                cid in set(commit_anchor_clause_ids) for cid in core_ids
+            commit_quality = _compute_commit_quality(
+                anchor_clause_ids=commit_anchor_clause_ids,
+                supporting_clause_ids=commit_supporting_clause_ids,
+                eval_core_clause_ids=core_ids,
             )
+            commit_correct_anchor = commit_quality.get("correct_anchor")
+            commit_correct_union = commit_quality.get("correct_union")
+            commit_anchor_promotion_needed = commit_quality.get("anchor_promotion_needed")
+            commit_supporting_core_hits = list(commit_quality.get("supporting_core_hits") or [])
+            commit_correct = commit_correct_anchor
             if episode_id == 1:
                 thread_state["commit1"] = {
                     "supporting_clause_ids": commit_supporting_clause_ids,
@@ -3568,7 +3812,11 @@ def _evaluate_method(
                     "model_evidence_clause_ids": model_evidence_clause_ids,
                     "anchor_source": commit_anchor_source_used_local,
                     "short_fact": commit_short_fact or {},
-                    "commit_correct": commit_correct,
+                    "commit_correct": commit_correct_anchor,
+                    "commit_correct_anchor": commit_correct_anchor,
+                    "commit_correct_union": commit_correct_union,
+                    "commit_anchor_promotion_needed": commit_anchor_promotion_needed,
+                    "commit_supporting_core_hits": list(commit_supporting_core_hits),
                 }
             elif episode_id == 2:
                 thread_state["commit2"] = {
@@ -3577,7 +3825,11 @@ def _evaluate_method(
                     "model_evidence_clause_ids": model_evidence_clause_ids,
                     "anchor_source": commit_anchor_source_used_local,
                     "short_fact": commit_short_fact or {},
-                    "commit_correct": commit_correct,
+                    "commit_correct": commit_correct_anchor,
+                    "commit_correct_anchor": commit_correct_anchor,
+                    "commit_correct_union": commit_correct_union,
+                    "commit_anchor_promotion_needed": commit_anchor_promotion_needed,
+                    "commit_supporting_core_hits": list(commit_supporting_core_hits),
                 }
             history_source = opened_ids
             if isinstance(diag, dict) and diag.get("opened_total_clause_ids"):
@@ -3614,15 +3866,22 @@ def _evaluate_method(
         if use_pivot_gold_eval:
             try:
                 pivot_gold = _build_gold_from_context(world, eval_context_for_judge)
+                pivot_gold, pivot_gold_constraint_applied = _apply_constraint_updates_to_gold(
+                    pivot_gold,
+                    pivot_type=pivot_type,
+                    constraint_updates=pivot_constraint_updates,
+                )
                 eval_gold = pivot_gold
                 eval_gold_is_pivot = True
             except Exception:
                 pivot_gold = None
                 eval_gold = task.gold
                 eval_gold_is_pivot = False
+                pivot_gold_constraint_applied = False
         else:
             eval_gold = task.gold
             eval_gold_is_pivot = False
+            pivot_gold_constraint_applied = False
         primary_results = diag.get("primary_search_results", []) if isinstance(diag, dict) else []
         gold_core_ids = list(
             getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
@@ -3693,11 +3952,10 @@ def _evaluate_method(
             save_snapshot=False,
         )
         winning_clause_id = (eval_gold.gold_evidence or [None])[0]
-        if eval_gold_is_pivot:
-            eval_critical_core_clause_ids = list(
-                getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
-            )
-        else:
+        eval_critical_core_clause_ids = list(
+            getattr(eval_gold, "gold_evidence_core", None) or eval_gold.gold_evidence or []
+        )
+        if not eval_critical_core_clause_ids:
             eval_critical_core_clause_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
         if method == "goc" and threaded_mode and episode_id == 3:
             eval_critical_ids_set = set(_unique_strs(eval_critical_core_clause_ids))
@@ -3708,6 +3966,27 @@ def _evaluate_method(
                 goc_unfolded_critical_clause_count = sum(
                     1 for cid in eval_critical_ids_set if cid in set(e3_packed_clause_ids)
                 )
+        if threaded_mode and thread_state:
+            _c1 = thread_state.get("commit1") or {}
+            _c2 = thread_state.get("commit2") or {}
+            commit1_quality = _compute_commit_quality(
+                anchor_clause_ids=list(_c1.get("anchor_clause_ids") or []),
+                supporting_clause_ids=list(_c1.get("supporting_clause_ids") or []),
+                eval_core_clause_ids=eval_critical_core_clause_ids,
+            )
+            commit2_quality = _compute_commit_quality(
+                anchor_clause_ids=list(_c2.get("anchor_clause_ids") or []),
+                supporting_clause_ids=list(_c2.get("supporting_clause_ids") or []),
+                eval_core_clause_ids=eval_critical_core_clause_ids,
+            )
+            commit1_correct_anchor = commit1_quality.get("correct_anchor")
+            commit1_correct_union = commit1_quality.get("correct_union")
+            commit1_anchor_promotion_needed = commit1_quality.get("anchor_promotion_needed")
+            commit1_supporting_core_hits = list(commit1_quality.get("supporting_core_hits") or [])
+            commit2_correct_anchor = commit2_quality.get("correct_anchor")
+            commit2_correct_union = commit2_quality.get("correct_union")
+            commit2_anchor_promotion_needed = commit2_quality.get("anchor_promotion_needed")
+            commit2_supporting_core_hits = list(commit2_quality.get("supporting_core_hits") or [])
         min_gold_core_rank_hop2 = _min_rank(hop2_results, gold_core_ids)
         min_gold_core_rank_union = _min_rank(union_results, gold_core_ids)
         min_gold_winning_rank_hop2 = _min_rank(
@@ -3739,6 +4018,11 @@ def _evaluate_method(
             if int(episode_id or 0) == 3 and bool(is_pivot_task) and eval_gold_is_pivot
             else None
         )
+        judge_constraint_updates = (
+            dict(pivot_constraint_updates)
+            if int(episode_id or 0) == 3 and bool(is_pivot_task) and eval_gold_is_pivot
+            else None
+        )
         if judge_mode in {
             "symbolic",
             "symbolic_packed",
@@ -3751,6 +4035,7 @@ def _evaluate_method(
                     e3_packed_clause_ids,
                     world,
                     context=judge_context_override,
+                    constraint_updates=judge_constraint_updates,
                 )
             elif judge_mode == "symbolic_full_episode" and threaded_mode and episode_id == 3:
                 judge_pred = judge_from_opened_clauses(
@@ -3758,6 +4043,7 @@ def _evaluate_method(
                     full_episode_clause_ids,
                     world,
                     context=judge_context_override,
+                    constraint_updates=judge_constraint_updates,
                 )
             elif judge_mode == "symbolic" and threaded_mode and episode_id == 3 and commit_clause_ids is not None:
                 judge_pred = judge_threaded_final(
@@ -3765,6 +4051,7 @@ def _evaluate_method(
                     commit_clause_ids,
                     world,
                     context=judge_context_override,
+                    constraint_updates=judge_constraint_updates,
                 )
             else:
                 judge_pred = judge_from_opened_clauses(
@@ -3772,6 +4059,7 @@ def _evaluate_method(
                     opened_ids,
                     world,
                     context=judge_context_override,
+                    constraint_updates=judge_constraint_updates,
                 )
             judge_decision = judge_pred.get("decision")
             judge_correct = judge_decision == eval_gold.decision
@@ -3794,6 +4082,32 @@ def _evaluate_method(
             mode=args.evidence_padding_mode,
             min_count=args.min_evidence_count,
         )
+        pred_decision_eval = pred_for_eval.get("decision")
+        episode_decision_correct = (
+            bool(pred_decision_eval == eval_gold.decision)
+            if eval_gold is not None
+            else None
+        )
+        pred_conditions_eval_raw = pred_for_eval.get("conditions", [])
+        pred_conditions_eval = (
+            list(pred_conditions_eval_raw) if isinstance(pred_conditions_eval_raw, list) else []
+        )
+        gold_conditions_eval = list(getattr(eval_gold, "conditions", None) or [])
+        episode_conditions_correct = bool(
+            set(map(str, pred_conditions_eval)) == set(map(str, gold_conditions_eval))
+        )
+        episode_answer_correct = bool(
+            bool(episode_decision_correct)
+            and (bool(episode_conditions_correct) if episode_conditions_correct is not None else True)
+        )
+        gold_mode_used = "original"
+        if int(episode_id or 0) == 3 and bool(is_pivot_task):
+            if pivot_gold_mode == "respect_ticket_updated":
+                gold_mode_used = "pivot"
+            elif pivot_gold_mode == "both":
+                gold_mode_used = "both"
+            else:
+                gold_mode_used = "original"
         commit1_correct = None
         commit2_correct = None
         if threaded_mode and thread_state:
@@ -3803,19 +4117,22 @@ def _evaluate_method(
             commit2_correct = commit2.get("commit_correct")
             if episode_id == 3 and commit_clause_ids is not None:
                 commit_correct = bool(commit1_correct is True and commit2_correct is True)
-                e3_evidence_valid_in_context = all(
-                    cid in set(opened_ids) for cid in (evidence_after or [])
+                thread_e3_payload = _compute_thread_e3_correctness(
+                    judge_correct=judge_correct,
+                    commit1_correct=commit1_correct,
+                    commit2_correct=commit2_correct,
+                    evidence_after=list(evidence_after or []),
+                    opened_ids=list(opened_ids or []),
+                    commit_clause_ids=list(commit_clause_ids or []),
+                    e3_answer_correct=episode_answer_correct,
                 )
-                e3_evidence_valid_in_commits = all(
-                    cid in set(commit_clause_ids) for cid in (evidence_after or [])
-                )
-                thread_judge_correct = bool(
-                    judge_correct
-                    and commit1_correct is True
-                    and commit2_correct is True
-                    and e3_evidence_valid_in_context
-                )
-                judge_correct = thread_judge_correct
+                e3_evidence_valid_in_context = thread_e3_payload.get("evidence_valid_in_context")
+                e3_evidence_valid_in_commits = thread_e3_payload.get("evidence_valid_in_commits")
+                thread_strict_correct = thread_e3_payload.get("strict_correct")
+                thread_e3_only_correct = thread_e3_payload.get("e3_only_correct")
+                thread_judge_correct = thread_strict_correct
+                if isinstance(thread_strict_correct, bool):
+                    judge_correct = thread_strict_correct
                 if judge_mode == "symbolic_full_episode":
                     judge_correct_full_episode = judge_correct
                 if isinstance(judge_correct, bool):
@@ -3830,6 +4147,49 @@ def _evaluate_method(
             )
             if judge_mode == "symbolic_full_episode":
                 judge_correct_full_episode = judge_correct
+        if threaded_mode and episode_id == 3:
+            if e3_evidence_valid_in_context is None:
+                e3_evidence_valid_in_context = all(cid in set(opened_ids or []) for cid in (evidence_after or []))
+            if e3_evidence_valid_in_commits is None and commit_clause_ids is not None:
+                e3_evidence_valid_in_commits = all(
+                    cid in set(commit_clause_ids or []) for cid in (evidence_after or [])
+                )
+            if thread_e3_only_correct is None and isinstance(episode_answer_correct, bool):
+                thread_e3_only_correct = bool(episode_answer_correct and bool(e3_evidence_valid_in_context))
+        if threaded_mode:
+            if int(episode_id or 0) == 1:
+                commit_correct_anchor = commit1_correct_anchor
+                commit_correct_union = commit1_correct_union
+                commit_anchor_promotion_needed = commit1_anchor_promotion_needed
+                commit_supporting_core_hits = list(commit1_supporting_core_hits)
+                if isinstance(commit_correct_anchor, bool):
+                    commit_correct = commit_correct_anchor
+            elif int(episode_id or 0) == 2:
+                commit_correct_anchor = commit2_correct_anchor
+                commit_correct_union = commit2_correct_union
+                commit_anchor_promotion_needed = commit2_anchor_promotion_needed
+                commit_supporting_core_hits = list(commit2_supporting_core_hits)
+                if isinstance(commit_correct_anchor, bool):
+                    commit_correct = commit_correct_anchor
+            elif int(episode_id or 0) == 3:
+                if commit1_correct_anchor is not None and commit2_correct_anchor is not None:
+                    commit_correct_anchor = bool(
+                        commit1_correct_anchor is True and commit2_correct_anchor is True
+                    )
+                if commit1_correct_union is not None and commit2_correct_union is not None:
+                    commit_correct_union = bool(
+                        commit1_correct_union is True and commit2_correct_union is True
+                    )
+                if commit1_anchor_promotion_needed is not None or commit2_anchor_promotion_needed is not None:
+                    commit_anchor_promotion_needed = bool(
+                        bool(commit1_anchor_promotion_needed)
+                        or bool(commit2_anchor_promotion_needed)
+                    )
+                commit_supporting_core_hits = sorted(
+                    set(commit1_supporting_core_hits) | set(commit2_supporting_core_hits)
+                )
+                if isinstance(commit_correct_anchor, bool):
+                    commit_correct = commit_correct_anchor
         if threaded_mode and episode_id == 3:
             if e3_context_chars_used is None:
                 e3_context_chars_used = 0
@@ -4026,11 +4386,19 @@ def _evaluate_method(
             "normalize_reason": normalize_reason,
             "gold_decision": eval_gold.decision,
             "decision_correct": pred_decision == eval_gold.decision,
+            "conditions_correct": episode_conditions_correct,
+            "answer_correct": episode_answer_correct,
+            "gold_mode_used": gold_mode_used,
             "gold_decision_original": task.gold.decision,
             "decision_correct_original": pred_decision == task.gold.decision,
             "pivot_gold_mode": pivot_gold_mode,
             "eval_gold_is_pivot": bool(eval_gold_is_pivot),
             "pivot_gold_decision": pivot_gold.decision if pivot_gold is not None else None,
+            "pivot_gold_conditions": (
+                list(getattr(pivot_gold, "conditions", None) or [])
+                if pivot_gold is not None
+                else []
+            ),
             "pivot_gold_evidence_ids": list(pivot_gold.gold_evidence or []) if pivot_gold is not None else [],
             "pivot_gold_evidence_core_ids": (
                 list(getattr(pivot_gold, "gold_evidence_core", None) or pivot_gold.gold_evidence or [])
@@ -4042,6 +4410,12 @@ def _evaluate_method(
                 if pivot_gold is not None
                 else []
             ),
+            "pivot_gold_constraint_applied": bool(pivot_gold_constraint_applied),
+            "pivot_constraint_updates": dict(pivot_constraint_updates),
+            "pivot_constraint_keys": list(pivot_constraint_keys),
+            "pivot_constraint_key": pivot_constraint_key,
+            "pivot_constraint_value": pivot_constraint_value,
+            "answer_parse_failed": answer_parse_failed,
             "judge_decision": judge_decision,
             "judge_correct": judge_correct,
             "judge_correct_with_pivot_compliance": judge_correct_with_pivot_compliance,
@@ -4133,10 +4507,24 @@ def _evaluate_method(
             "commit_model_evidence_clause_ids": commit_model_evidence_clause_ids,
             "commit_short_fact": commit_short_fact,
             "commit_correct": commit_correct,
+            "commit_correct_anchor": commit_correct_anchor,
+            "commit_correct_union": commit_correct_union,
+            "commit_anchor_promotion_needed": commit_anchor_promotion_needed,
+            "commit_supporting_core_hits": list(commit_supporting_core_hits),
+            "commit1_correct_anchor": commit1_correct_anchor,
+            "commit1_correct_union": commit1_correct_union,
+            "commit1_anchor_promotion_needed": commit1_anchor_promotion_needed,
+            "commit1_supporting_core_hits": list(commit1_supporting_core_hits),
+            "commit2_correct_anchor": commit2_correct_anchor,
+            "commit2_correct_union": commit2_correct_union,
+            "commit2_anchor_promotion_needed": commit2_anchor_promotion_needed,
+            "commit2_supporting_core_hits": list(commit2_supporting_core_hits),
             "commit_clause_ids": commit_clause_ids,
             "e3_evidence_valid": e3_evidence_valid_in_context,
             "e3_evidence_valid_in_context": e3_evidence_valid_in_context,
             "e3_evidence_valid_in_commits": e3_evidence_valid_in_commits,
+            "thread_strict_correct": thread_strict_correct,
+            "thread_e3_only_correct": thread_e3_only_correct,
             "thread_judge_correct": thread_judge_correct,
             "critical_clause_id_e1": getattr(task, "critical_clause_id_e1", None),
             "critical_clause_id_e2": getattr(task, "critical_clause_id_e2", None),
@@ -4220,6 +4608,14 @@ def _evaluate_method(
             "min_gold_winning_rank_union": min_gold_winning_rank_union,
             "deep_rank_core_flag": deep_rank_core_flag,
         }
+        episode_num = int(episode_id or 0)
+        if episode_num in {1, 2, 3}:
+            ep_key = f"e{episode_num}"
+            record[f"{ep_key}_decision_correct"] = episode_decision_correct
+            record[f"{ep_key}_conditions_correct"] = episode_conditions_correct
+            record[f"{ep_key}_answer_correct"] = episode_answer_correct
+            if episode_num == 3:
+                record["e3_answer_correct"] = episode_answer_correct
         if isinstance(diag, dict):
             record.update(diag)
         record.setdefault("shared_open_policy_applied", False)
@@ -4629,11 +5025,22 @@ def _evaluate_method(
                     {
                         "thread_id": thread_id,
                         "method": method,
+                        "is_pivot_task": bool(record.get("is_pivot_task")),
+                        "thread_strict_correct": record.get("thread_strict_correct"),
+                        "thread_e3_only_correct": record.get("thread_e3_only_correct"),
                         "thread_judge_correct": record.get("thread_judge_correct"),
                         "thread_judge_correct_pivot": record.get("thread_judge_correct"),
                         "thread_decision_correct": record.get("decision_correct"),
                         "commit1_correct": commit1.get("commit_correct"),
                         "commit2_correct": commit2.get("commit_correct"),
+                        "commit1_correct_anchor": commit1.get("commit_correct_anchor"),
+                        "commit1_correct_union": commit1.get("commit_correct_union"),
+                        "commit1_anchor_promotion_needed": commit1.get("commit_anchor_promotion_needed"),
+                        "commit2_correct_anchor": commit2.get("commit_correct_anchor"),
+                        "commit2_correct_union": commit2.get("commit_correct_union"),
+                        "commit2_anchor_promotion_needed": commit2.get("commit_anchor_promotion_needed"),
+                        "e3_answer_correct": record.get("e3_answer_correct"),
+                        "e3_decision_correct": record.get("e3_decision_correct"),
                         "e3_evidence_valid": record.get("e3_evidence_valid"),
                         "e3_evidence_valid_in_context": record.get("e3_evidence_valid_in_context"),
                         "e3_evidence_valid_in_commits": record.get("e3_evidence_valid_in_commits"),
@@ -5584,6 +5991,58 @@ def _evaluate_method(
         if (pivot_acc is not None and nonpivot_acc is not None)
         else None
     )
+    for ep_id in (1, 2, 3):
+        ep_records = [r for r in records if int(r.get("episode_id") or 0) == ep_id]
+        ep_decision_vals = [
+            1.0 if r.get("decision_correct") else 0.0
+            for r in ep_records
+            if isinstance(r.get("decision_correct"), bool)
+        ]
+        ep_conditions_vals = [
+            1.0 if r.get("conditions_correct") else 0.0
+            for r in ep_records
+            if isinstance(r.get("conditions_correct"), bool)
+        ]
+        ep_answer_vals = [
+            1.0 if r.get("answer_correct") else 0.0
+            for r in ep_records
+            if isinstance(r.get("answer_correct"), bool)
+        ]
+        aggregate[f"e{ep_id}_decision_accuracy"] = (
+            sum(ep_decision_vals) / len(ep_decision_vals) if ep_decision_vals else None
+        )
+        aggregate[f"e{ep_id}_conditions_accuracy"] = (
+            sum(ep_conditions_vals) / len(ep_conditions_vals) if ep_conditions_vals else None
+        )
+        aggregate[f"e{ep_id}_answer_accuracy"] = (
+            sum(ep_answer_vals) / len(ep_answer_vals) if ep_answer_vals else None
+        )
+    e3_pivot_records = [
+        r for r in records if int(r.get("episode_id") or 0) == 3 and bool(r.get("is_pivot_task"))
+    ]
+    e3_nonpivot_records = [
+        r for r in records if int(r.get("episode_id") or 0) == 3 and not bool(r.get("is_pivot_task"))
+    ]
+    e3_pivot_decision_vals = [
+        1.0 if r.get("decision_correct") else 0.0
+        for r in e3_pivot_records
+        if isinstance(r.get("decision_correct"), bool)
+    ]
+    e3_nonpivot_decision_vals = [
+        1.0 if r.get("decision_correct") else 0.0
+        for r in e3_nonpivot_records
+        if isinstance(r.get("decision_correct"), bool)
+    ]
+    aggregate["e3_pivot_decision_accuracy"] = (
+        sum(e3_pivot_decision_vals) / len(e3_pivot_decision_vals)
+        if e3_pivot_decision_vals
+        else None
+    )
+    aggregate["e3_nonpivot_decision_accuracy"] = (
+        sum(e3_nonpivot_decision_vals) / len(e3_nonpivot_decision_vals)
+        if e3_nonpivot_decision_vals
+        else None
+    )
     aggregate["judge_accuracy_packed_allcritical"] = _mean_metric(
         "judge_correct_packed_allcritical",
         default=None,
@@ -5598,6 +6057,14 @@ def _evaluate_method(
     aggregate["min_gold_core_rank_union_median"] = core_rank_summary.get("median")
     aggregate["min_gold_core_rank_union_p90"] = core_rank_summary.get("p90")
     if thread_records:
+        def _mean_thread_bool(key: str, rows: List[Dict[str, Any]]) -> float | None:
+            vals = [
+                1.0 if rec.get(key) else 0.0
+                for rec in rows
+                if isinstance(rec.get(key), bool)
+            ]
+            return (sum(vals) / len(vals)) if vals else None
+
         thread_judge_vals = [
             1.0 if r.get("thread_judge_correct") else 0.0
             for r in thread_records
@@ -5613,6 +6080,80 @@ def _evaluate_method(
         )
         aggregate["thread_decision_accuracy"] = (
             sum(thread_decision_vals) / len(thread_decision_vals) if thread_decision_vals else None
+        )
+        aggregate["thread_strict_accuracy"] = _mean_thread_bool(
+            "thread_strict_correct",
+            thread_records,
+        )
+        aggregate["thread_e3_only_accuracy"] = _mean_thread_bool(
+            "thread_e3_only_correct",
+            thread_records,
+        )
+        pivot_thread_records = [r for r in thread_records if bool(r.get("is_pivot_task"))]
+        nonpivot_thread_records = [r for r in thread_records if not bool(r.get("is_pivot_task"))]
+        aggregate["strict_final_pivot_accuracy"] = _mean_thread_bool(
+            "thread_strict_correct",
+            pivot_thread_records,
+        )
+        aggregate["strict_final_nonpivot_accuracy"] = _mean_thread_bool(
+            "thread_strict_correct",
+            nonpivot_thread_records,
+        )
+        aggregate["e3_pivot_e3_only_accuracy"] = _mean_thread_bool(
+            "thread_e3_only_correct",
+            pivot_thread_records,
+        )
+        aggregate["e3_nonpivot_e3_only_accuracy"] = _mean_thread_bool(
+            "thread_e3_only_correct",
+            nonpivot_thread_records,
+        )
+        aggregate["commit1_anchor_accuracy"] = _mean_thread_bool(
+            "commit1_correct_anchor",
+            thread_records,
+        )
+        aggregate["commit1_union_accuracy"] = _mean_thread_bool(
+            "commit1_correct_union",
+            thread_records,
+        )
+        aggregate["commit1_anchor_promotion_needed_rate"] = _mean_thread_bool(
+            "commit1_anchor_promotion_needed",
+            thread_records,
+        )
+        aggregate["commit2_anchor_accuracy"] = _mean_thread_bool(
+            "commit2_correct_anchor",
+            thread_records,
+        )
+        aggregate["commit2_union_accuracy"] = _mean_thread_bool(
+            "commit2_correct_union",
+            thread_records,
+        )
+        aggregate["commit2_anchor_promotion_needed_rate"] = _mean_thread_bool(
+            "commit2_anchor_promotion_needed",
+            thread_records,
+        )
+        aggregate["commit1_anchor_accuracy_pivot"] = _mean_thread_bool(
+            "commit1_correct_anchor",
+            pivot_thread_records,
+        )
+        aggregate["commit1_union_accuracy_pivot"] = _mean_thread_bool(
+            "commit1_correct_union",
+            pivot_thread_records,
+        )
+        aggregate["commit1_anchor_promotion_needed_rate_pivot"] = _mean_thread_bool(
+            "commit1_anchor_promotion_needed",
+            pivot_thread_records,
+        )
+        aggregate["commit2_anchor_accuracy_pivot"] = _mean_thread_bool(
+            "commit2_correct_anchor",
+            pivot_thread_records,
+        )
+        aggregate["commit2_union_accuracy_pivot"] = _mean_thread_bool(
+            "commit2_correct_union",
+            pivot_thread_records,
+        )
+        aggregate["commit2_anchor_promotion_needed_rate_pivot"] = _mean_thread_bool(
+            "commit2_anchor_promotion_needed",
+            pivot_thread_records,
         )
         e3_valid_ctx_vals = [
             1.0 if r.get("e3_evidence_valid_in_context") else 0.0

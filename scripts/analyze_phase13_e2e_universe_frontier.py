@@ -193,6 +193,25 @@ def _e3_bool_rate(task_recs: List[Dict[str, Any]], key: str) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
+def _episode_bool_rate(
+    task_recs: List[Dict[str, Any]],
+    *,
+    episode_id: int,
+    key: str,
+    is_pivot_task: Optional[bool] = None,
+) -> float:
+    vals: List[float] = []
+    for r in task_recs:
+        if int(r.get("episode_id") or 0) != int(episode_id):
+            continue
+        if is_pivot_task is not None and bool(r.get("is_pivot_task")) != bool(is_pivot_task):
+            continue
+        v = r.get(key)
+        if isinstance(v, bool):
+            vals.append(1.0 if v else 0.0)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def _critical_coverage_pivot(task_recs: List[Dict[str, Any]]) -> float:
     vals: List[float] = []
     for r in task_recs:
@@ -284,10 +303,44 @@ def main() -> None:
             thread_recs = list(mr.get("thread_records") or [])
             task_recs = list(mr.get("records") or [])
 
-            final_key = "thread_judge_correct_pivot"
-            if not any(t.get(final_key) is not None for t in thread_recs):
-                final_key = "thread_judge_correct"
-            final_correct = [bool(t.get(final_key)) for t in thread_recs]
+            strict_key = "thread_strict_correct"
+            if not any(t.get(strict_key) is not None for t in thread_recs):
+                strict_key = "thread_judge_correct_pivot"
+            if not any(t.get(strict_key) is not None for t in thread_recs):
+                strict_key = "thread_judge_correct"
+            final_correct = [bool(t.get(strict_key)) for t in thread_recs]
+            e3_only_correct = [bool(t.get("thread_e3_only_correct")) for t in thread_recs]
+
+            c1_anchor_vals: List[bool] = []
+            c2_anchor_vals: List[bool] = []
+            c1_union_vals: List[bool] = []
+            c2_union_vals: List[bool] = []
+            c1_promo_vals: List[bool] = []
+            c2_promo_vals: List[bool] = []
+            for t in thread_recs:
+                c1_anchor = t.get("commit1_correct_anchor")
+                if not isinstance(c1_anchor, bool):
+                    c1_anchor = t.get("commit1_correct")
+                c2_anchor = t.get("commit2_correct_anchor")
+                if not isinstance(c2_anchor, bool):
+                    c2_anchor = t.get("commit2_correct")
+                c1_union = t.get("commit1_correct_union")
+                c2_union = t.get("commit2_correct_union")
+                c1_promo = t.get("commit1_anchor_promotion_needed")
+                c2_promo = t.get("commit2_anchor_promotion_needed")
+                if isinstance(c1_anchor, bool):
+                    c1_anchor_vals.append(bool(c1_anchor))
+                if isinstance(c2_anchor, bool):
+                    c2_anchor_vals.append(bool(c2_anchor))
+                if isinstance(c1_union, bool):
+                    c1_union_vals.append(bool(c1_union))
+                if isinstance(c2_union, bool):
+                    c2_union_vals.append(bool(c2_union))
+                if isinstance(c1_promo, bool):
+                    c1_promo_vals.append(bool(c1_promo))
+                if isinstance(c2_promo, bool):
+                    c2_promo_vals.append(bool(c2_promo))
+
             c1 = [bool(t.get("commit1_correct")) for t in thread_recs]
             c2 = [bool(t.get("commit2_correct")) for t in thread_recs]
             both = [a and b for a, b in zip(c1, c2)]
@@ -305,8 +358,56 @@ def main() -> None:
             pivot_threads = [t for t, is_p in zip(thread_recs, pivot_flags) if is_p]
             nonpivot_threads = [t for t, is_p in zip(thread_recs, pivot_flags) if not is_p]
 
-            pivot_final_correct = [bool(t.get(final_key)) for t in pivot_threads]
-            nonpivot_final_correct = [bool(t.get(final_key)) for t in nonpivot_threads]
+            pivot_final_correct = [bool(t.get(strict_key)) for t in pivot_threads]
+            nonpivot_final_correct = [bool(t.get(strict_key)) for t in nonpivot_threads]
+            pivot_e3_only_correct = [bool(t.get("thread_e3_only_correct")) for t in pivot_threads]
+            nonpivot_e3_only_correct = [bool(t.get("thread_e3_only_correct")) for t in nonpivot_threads]
+
+            c1_anchor_pivot_vals: List[bool] = []
+            c2_anchor_pivot_vals: List[bool] = []
+            c1_union_pivot_vals: List[bool] = []
+            c2_union_pivot_vals: List[bool] = []
+            c1_promo_pivot_vals: List[bool] = []
+            c2_promo_pivot_vals: List[bool] = []
+            for t in pivot_threads:
+                c1_anchor = t.get("commit1_correct_anchor")
+                if not isinstance(c1_anchor, bool):
+                    c1_anchor = t.get("commit1_correct")
+                c2_anchor = t.get("commit2_correct_anchor")
+                if not isinstance(c2_anchor, bool):
+                    c2_anchor = t.get("commit2_correct")
+                c1_union = t.get("commit1_correct_union")
+                c2_union = t.get("commit2_correct_union")
+                c1_promo = t.get("commit1_anchor_promotion_needed")
+                c2_promo = t.get("commit2_anchor_promotion_needed")
+                if isinstance(c1_anchor, bool):
+                    c1_anchor_pivot_vals.append(bool(c1_anchor))
+                if isinstance(c2_anchor, bool):
+                    c2_anchor_pivot_vals.append(bool(c2_anchor))
+                if isinstance(c1_union, bool):
+                    c1_union_pivot_vals.append(bool(c1_union))
+                if isinstance(c2_union, bool):
+                    c2_union_pivot_vals.append(bool(c2_union))
+                if isinstance(c1_promo, bool):
+                    c1_promo_pivot_vals.append(bool(c1_promo))
+                if isinstance(c2_promo, bool):
+                    c2_promo_pivot_vals.append(bool(c2_promo))
+
+            e1_decision_accuracy = _episode_bool_rate(task_recs, episode_id=1, key="decision_correct")
+            e2_decision_accuracy = _episode_bool_rate(task_recs, episode_id=2, key="decision_correct")
+            e3_decision_accuracy = _episode_bool_rate(task_recs, episode_id=3, key="decision_correct")
+            e3_pivot_decision_accuracy = _episode_bool_rate(
+                task_recs,
+                episode_id=3,
+                key="decision_correct",
+                is_pivot_task=True,
+            )
+            e3_nonpivot_decision_accuracy = _episode_bool_rate(
+                task_recs,
+                episode_id=3,
+                key="decision_correct",
+                is_pivot_task=False,
+            )
 
             tok_mp = _thread_tokens(task_recs)
             total_tok = [tok_mp.get(t.get("thread_id"), {}).get("total", float("nan")) for t in thread_recs]
@@ -358,10 +459,31 @@ def main() -> None:
                     "pivot_threads": int(sum(bool(x) for x in pivot_flags)),
                     "pivot_rate_final": float(np.mean([1.0 if x else 0.0 for x in pivot_flags])) if pivot_flags else float("nan"),
                     "final_accuracy": _safe_mean_bool(final_correct),
-                    "final_pivot_accuracy": _safe_mean_bool(pivot_final_correct),
+                    "strict_final_pivot_accuracy": _safe_mean_bool(pivot_final_correct),
                     "final_nonpivot_accuracy": _safe_mean_bool(nonpivot_final_correct),
+                    "final_pivot_accuracy": _safe_mean_bool(pivot_final_correct),
+                    "e3_pivot_e3_only_accuracy": _safe_mean_bool(pivot_e3_only_correct),
+                    "e3_nonpivot_e3_only_accuracy": _safe_mean_bool(nonpivot_e3_only_correct),
+                    "thread_e3_only_accuracy": _safe_mean_bool(e3_only_correct),
+                    "e1_decision_accuracy": e1_decision_accuracy,
+                    "e2_decision_accuracy": e2_decision_accuracy,
+                    "e3_decision_accuracy": e3_decision_accuracy,
+                    "e3_pivot_decision_accuracy": e3_pivot_decision_accuracy,
+                    "e3_nonpivot_decision_accuracy": e3_nonpivot_decision_accuracy,
                     "commit1_accuracy": _safe_mean_bool(c1),
                     "commit2_accuracy": _safe_mean_bool(c2),
+                    "commit1_anchor_accuracy": _safe_mean_bool(c1_anchor_vals),
+                    "commit1_union_accuracy": _safe_mean_bool(c1_union_vals),
+                    "commit1_anchor_promotion_needed_rate": _safe_mean_bool(c1_promo_vals),
+                    "commit2_anchor_accuracy": _safe_mean_bool(c2_anchor_vals),
+                    "commit2_union_accuracy": _safe_mean_bool(c2_union_vals),
+                    "commit2_anchor_promotion_needed_rate": _safe_mean_bool(c2_promo_vals),
+                    "commit1_anchor_accuracy_pivot": _safe_mean_bool(c1_anchor_pivot_vals),
+                    "commit1_union_accuracy_pivot": _safe_mean_bool(c1_union_pivot_vals),
+                    "commit1_anchor_promotion_needed_rate_pivot": _safe_mean_bool(c1_promo_pivot_vals),
+                    "commit2_anchor_accuracy_pivot": _safe_mean_bool(c2_anchor_pivot_vals),
+                    "commit2_union_accuracy_pivot": _safe_mean_bool(c2_union_pivot_vals),
+                    "commit2_anchor_promotion_needed_rate_pivot": _safe_mean_bool(c2_promo_pivot_vals),
                     "commit_both_rate": commit_both_rate,
                     "p_final_given_commits": p_final_given_commits,
                     "strict_e2e_accuracy": _safe_mean_bool(strict),
@@ -402,14 +524,30 @@ def main() -> None:
     md_lines.append("- avoided_node_injected_rate (pivot avoids integrity)\n")
     md_lines.append("- critical_coverage_pivot_rate, inapplicable_injected_rate_pivot (dependency quality)\n")
     md_lines.append("- e3_evidence_valid_in_context_rate / e3_evidence_valid_in_commits_rate\n")
+    md_lines.append("- e1/e2/e3 decision accuracies + pivot/nonpivot E3 split\n")
+    md_lines.append("- e3_pivot_e3_only_accuracy (headline) + strict_final_pivot_accuracy (strict pipeline metric)\n")
+    md_lines.append("- commit anchor-vs-union diagnostics + anchor_promotion_needed rates\n")
     md_lines.append("- frontier_first_seen_rate (if GoC graphs were saved)\n")
 
     show_cols = [
         "pivot_type",
         "pivot_gold_mode",
         "label",
+        "e1_decision_accuracy",
+        "e2_decision_accuracy",
+        "e3_decision_accuracy",
+        "e3_pivot_decision_accuracy",
+        "e3_nonpivot_decision_accuracy",
+        "e3_pivot_e3_only_accuracy",
+        "strict_final_pivot_accuracy",
         "final_accuracy",
         "strict_e2e_accuracy",
+        "commit1_anchor_accuracy",
+        "commit1_union_accuracy",
+        "commit1_anchor_promotion_needed_rate",
+        "commit2_anchor_accuracy",
+        "commit2_union_accuracy",
+        "commit2_anchor_promotion_needed_rate",
         "commit_both_rate",
         "p_final_given_commits",
         "unseen_e3_rate",

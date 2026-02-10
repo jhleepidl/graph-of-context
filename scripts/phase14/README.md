@@ -14,6 +14,11 @@ Defaults:
 - `goc_enable_avoids=true`
 - `goc_avoids_mode=applicability`
 
+Metric note:
+
+- Primary late-pivot headline: `e3_pivot_e3_only_accuracy`
+- Secondary strict pipeline metric: `strict_final_pivot_accuracy`
+
 ## Full bundle run (Phase 13 entrypoint)
 
 ```bash
