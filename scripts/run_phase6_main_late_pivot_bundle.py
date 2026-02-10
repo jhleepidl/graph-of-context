@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from policyops_bundle_layout import build_bundle_quick_access
 
 
 PRESET = "threaded_v1_3_fu_decoy_calib_jitter_n10"
@@ -52,7 +53,7 @@ def _run_command(cmd: List[str], *, cwd: Path, log_path: Path) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     py_path = env.get("PYTHONPATH", "")
-    extra = "src/benchmarks/policyops_arena_v0/src:src"
+    extra = "src"
     env["PYTHONPATH"] = f"{extra}{os.pathsep}{py_path}" if py_path else extra
     env["PYTHONUNBUFFERED"] = "1"
     with log_path.open("w", encoding="utf-8") as logf:
@@ -467,6 +468,10 @@ def main() -> int:
     lines.append("")
     lines.append(f"- summary_rows: {len(summary_rows)}")
     index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    quick_access_dirs = build_bundle_quick_access(bundle_root)
+    for qd in quick_access_dirs:
+        print(f"Quick access: {qd}")
 
     zip_path = bundle_root.with_suffix(".zip")
     if zip_path.exists():

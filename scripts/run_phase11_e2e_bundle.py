@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from policyops_bundle_layout import build_bundle_quick_access
 
 try:
     from dotenv import load_dotenv
@@ -37,7 +38,7 @@ def _load_env(dotenv_path: Optional[str], repo_root: Path) -> Dict[str, str]:
         load_dotenv(dotenv_path, override=False)
         env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    env["PYTHONPATH"] = str(repo_root / "src/benchmarks/policyops_arena_v0/src") + os.pathsep + str(repo_root / "src")
+    env["PYTHONPATH"] = str(repo_root / "src")
     return env
 
 
@@ -351,6 +352,10 @@ def main() -> None:
     (bundle_root / "INDEX.md").write_text("\n".join(idx_lines) + "\n", encoding="utf-8")
 
     # Zip bundle folder
+    quick_access_dirs = build_bundle_quick_access(bundle_root)
+    for qd in quick_access_dirs:
+        print(f"Quick access: {qd}")
+
     zip_path = shutil.make_archive(str(bundle_root), "zip", root_dir=str(bundle_root.parent), base_dir=bundle_root.name)
     print(f"\nBundle folder: {bundle_root}")
     print(f"Zip path: {zip_path}")

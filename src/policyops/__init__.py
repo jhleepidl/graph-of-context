@@ -1,3 +1,13 @@
-from __future__ import annotations
+"""PolicyOps Arena v0 package."""
 
-# Shim package to allow `PYTHONPATH=src python -m policyops.*` entrypoints.
+__all__ = [
+    "schemas",
+    "generator",
+    "render",
+    "world",
+    "tools",
+    "env",
+    "baselines",
+    "eval",
+    "run",
+]

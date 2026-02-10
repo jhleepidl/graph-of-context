@@ -2,6 +2,10 @@
 
 Synthetic policy/notice/FAQ documents plus synthetic ticket tasks for tool-augmented policy reasoning.
 
+> Note: Canonical PolicyOps source now lives at `src/policyops` (repo root).  
+> `src/benchmarks/policyops_arena_v0/src/policyops` is kept as a compatibility path.
+> General GoC runtime components now live under `src/goc_*.py` and are reused by PolicyOps via adapter/override.
+
 ## Layout
 
 - `data/worlds/`: generated documents + clauses (`.jsonl`)

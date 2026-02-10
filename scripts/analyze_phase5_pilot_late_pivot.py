@@ -89,7 +89,7 @@ def _find_data_paths(run_dir: Path) -> Tuple[Path, Path]:
 
 def _load_policyops_runtime():
     repo_root = Path(__file__).resolve().parents[1]
-    policyops_src = repo_root / "src" / "benchmarks" / "policyops_arena_v0" / "src"
+    policyops_src = repo_root / "src"
     if str(policyops_src) not in sys.path:
         sys.path.insert(0, str(policyops_src))
     from policyops.judges import judge_output  # type: ignore

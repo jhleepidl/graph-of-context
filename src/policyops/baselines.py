@@ -7,9 +7,11 @@ import http.client
 import os
 import random
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .env import PolicyOpsEnv
@@ -18,7 +20,45 @@ from .tools import query_rewrite
 from .query_facets import extract_facets
 from .world import evaluate_context
 
+
+def _ensure_src_on_syspath() -> None:
+    src_root = Path(__file__).resolve().parents[1]
+    if str(src_root) not in sys.path:
+        sys.path.append(str(src_root))
+
+
+try:
+    from goc_runner import BaseGoCRunner, GoCRunContext
+    from goc_frontier import graph_frontier_candidates, merge_ranked_candidates
+except ModuleNotFoundError:
+    _ensure_src_on_syspath()
+    from goc_runner import BaseGoCRunner, GoCRunContext
+    from goc_frontier import graph_frontier_candidates, merge_ranked_candidates
+
+
 ALLOWED_DECISIONS = {"allow", "deny", "require_condition", "needs_more_info"}
+
+def _graph_frontier_candidates(
+    world: Any,
+    seed_clause_ids: List[str],
+    *,
+    max_hops: int = 2,
+    max_nodes: int = 50,
+) -> Tuple[List[str], Dict[str, int]]:
+    return graph_frontier_candidates(
+        world,
+        seed_clause_ids,
+        max_hops=max_hops,
+        max_nodes=max_nodes,
+    )
+
+
+def _merge_ranked_candidates(
+    primary: List[Dict[str, Any]],
+    secondary: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return merge_ranked_candidates(primary, secondary)
+
 
 
 class LLMClient:
@@ -886,7 +926,33 @@ def run_agent_fold(
     diag["baseline_mode"] = "agent_fold"
     return prediction, opened_ids, prompt, raw, diag
 
+
+class PolicyOpsGoCRunner(BaseGoCRunner):
+    """PolicyOps-specific GoC implementation plugged into the generic runner interface."""
+
+    def run(self, ctx: GoCRunContext) -> Any:
+        opts = dict(ctx.options or {})
+        return _run_goc_heuristic_policyops(
+            task=ctx.task,
+            env=ctx.env,
+            client=ctx.client,
+            **opts,
+        )
+
+
 def run_goc_heuristic(
+    task: Any,
+    env: PolicyOpsEnv,
+    client: LLMClient,
+    **kwargs: Any,
+) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
+    """Benchmark adapter entrypoint: run generic GoC runner with PolicyOps overrides."""
+    runner = PolicyOpsGoCRunner()
+    ctx = GoCRunContext(task=task, env=env, client=client, options=dict(kwargs or {}))
+    return runner.run(ctx)
+
+
+def _run_goc_heuristic_policyops(
     task: Any,
     env: PolicyOpsEnv,
     client: LLMClient,
@@ -915,6 +981,12 @@ def run_goc_heuristic(
     goc_mmr_lambda: float = 0.35,
     goc_anchor_top1_lexical: bool = True,
     goc_activity_debug_in_snapshot: bool = False,
+    history_seed_clause_ids: Optional[List[str]] = None,
+    goc_graph_frontier_enabled: bool = True,
+    goc_graph_frontier_hops: int = 2,
+    goc_graph_frontier_max_nodes: int = 50,
+    goc_graph_frontier_seed_top_n: int = 6,
+    goc_graph_frontier_score_frac: float = 0.7,
 ) -> Tuple[Dict[str, Any], List[str], str, str | None, str | None, str | None, Dict[str, Any]]:
     errors: List[str] = []
     fallback_prediction = {
@@ -1260,6 +1332,57 @@ def run_goc_heuristic(
         except Exception as exc:  # noqa: BLE001 - defensive
             expanded_results = []
             errors.append(f"search_error: {exc}")
+
+
+    # GoC commit retrieval improvement: add a graph-frontier candidate pool (union with global retriever).
+    graph_frontier_items: List[Dict[str, Any]] = []
+    if goc_graph_frontier_enabled and history_seed_clause_ids:
+        try:
+            seed_top_n = max(1, int(goc_graph_frontier_seed_top_n or 0))
+            seed_ids = list(dict.fromkeys([str(cid) for cid in history_seed_clause_ids if cid]))[:seed_top_n]
+            frontier_ids, frontier_dist = _graph_frontier_candidates(
+                env.world,
+                seed_ids,
+                max_hops=int(goc_graph_frontier_hops or 0),
+                max_nodes=int(goc_graph_frontier_max_nodes or 0),
+            )
+            if frontier_ids:
+                base_max_score = max(
+                    [float(it.get('score', 0.0) or 0.0) for it in (seed_results or [])] or [1.0]
+                )
+                frac = float(goc_graph_frontier_score_frac or 0.0)
+                if frac <= 0:
+                    frac = 0.7
+                for cid in frontier_ids:
+                    d = int(frontier_dist.get(cid, 1) or 1)
+                    score = base_max_score * frac * (0.95 ** max(0, d - 1))
+                    graph_frontier_items.append(
+                        {
+                            'clause_id': cid,
+                            'score': score,
+                            'source': 'graph_frontier',
+                            'frontier_distance': d,
+                        }
+                    )
+                seed_results = _merge_ranked_candidates(seed_results, graph_frontier_items)
+                if agent_query_policy != 'two_hop_bridge':
+                    hop1_results = list(seed_results)
+                search_variants.append(
+                    {
+                        'stage': 'graph_frontier',
+                        'query': 'graph_frontier',
+                        'results': list(graph_frontier_items),
+                        'query_meta': {
+                            'seed_top_n': seed_top_n,
+                            'seed_clause_ids': seed_ids,
+                            'frontier_hops': int(goc_graph_frontier_hops or 0),
+                            'frontier_max_nodes': int(goc_graph_frontier_max_nodes or 0),
+                            'frontier_score_frac': float(frac),
+                        },
+                    }
+                )
+        except Exception:
+            graph_frontier_items = []
 
     merged = {item["clause_id"]: item for item in seed_results}
     for item in expanded_results:

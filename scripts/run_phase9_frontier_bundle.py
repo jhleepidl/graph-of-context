@@ -43,6 +43,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from policyops_bundle_layout import build_bundle_quick_access
 
 
 DEFAULT_PRESET = "threaded_v1_3_fu_decoy_calib_jitter_n10"
@@ -193,7 +194,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONPATH"] = str(repo_root / "src/benchmarks/policyops_arena_v0/src") + os.pathsep + str(repo_root / "src")
+    env["PYTHONPATH"] = str(repo_root / "src")
 
     pivot_types = args.pivot_types.split()
     pool_sizes = [int(x) for x in args.pool_sizes.split()]
@@ -445,6 +446,10 @@ def main() -> None:
     (bundle_root / "INDEX.md").write_text("\n".join(idx_lines), encoding="utf-8")
 
     # zip bundle
+    quick_access_dirs = build_bundle_quick_access(bundle_root)
+    for qd in quick_access_dirs:
+        print(f"Quick access: {qd}")
+
     zip_path = bundle_root.with_suffix(".zip")
     _zip_folder(bundle_root, zip_path)
     print(f"\nBundle folder: {bundle_root}")

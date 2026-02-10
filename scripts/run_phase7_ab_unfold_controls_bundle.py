@@ -28,6 +28,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from policyops_bundle_layout import build_bundle_quick_access
 
 
 DEFAULT_PRESET = "threaded_v1_3_fu_decoy_calib_jitter_n10"
@@ -142,7 +143,7 @@ def _discover_compare_artifacts(out_dir: Path) -> Tuple[Optional[Path], Optional
 
 def _make_env(repo_root: Path) -> Dict[str, str]:
     env = os.environ.copy()
-    env["PYTHONPATH"] = f"{repo_root / 'src' / 'benchmarks' / 'policyops_arena_v0' / 'src'}:{repo_root / 'src'}"
+    env["PYTHONPATH"] = str(repo_root / "src")
     env["PYTHONUNBUFFERED"] = "1"
     return env
 
@@ -507,6 +508,10 @@ def main() -> None:
         raise RuntimeError(f"phase7 analyzer failed (see {analysis_root / 'analyze.log'})")
 
     # 4) zip bundle
+    quick_access_dirs = build_bundle_quick_access(bundle_root)
+    for qd in quick_access_dirs:
+        print(f"Quick access: {qd}")
+
     zip_path = bundle_root.with_suffix(".zip")
     print(f"\n=== ZIP -> {zip_path} ===")
     _zip_dir(bundle_root, zip_path)
