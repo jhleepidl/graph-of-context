@@ -130,6 +130,27 @@ def _pivot_threads(records: List[Dict[str, Any]]) -> Dict[str, bool]:
     return mp
 
 
+def _avoided_node_injected_rate(task_recs: List[Dict[str, Any]]) -> float:
+    vals: List[float] = []
+    for r in task_recs:
+        if int(r.get("episode_id") or 0) != 3:
+            continue
+        should_avoid = bool(r.get("goc_avoids_edge_injected"))
+        avoid_ids = r.get("goc_avoid_target_clause_ids") or []
+        if (not should_avoid) and isinstance(avoid_ids, list) and avoid_ids:
+            should_avoid = True
+        if not should_avoid:
+            continue
+        injected = r.get("goc_avoided_node_injected")
+        if isinstance(injected, bool):
+            vals.append(1.0 if injected else 0.0)
+            continue
+        if isinstance(avoid_ids, list):
+            e3_ids = set(map(str, r.get("e3_context_clause_ids") or []))
+            vals.append(1.0 if (set(map(str, avoid_ids)) & e3_ids) else 0.0)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase12_root", type=str, required=True)
@@ -190,6 +211,7 @@ def main() -> None:
             e3_tok_f = [float(x) for x in e3_tok if x == x]
             e1_tok_f = [float(x) for x in e1_tok if x == x]
             e2_tok_f = [float(x) for x in e2_tok if x == x]
+            avoided_injected_rate = _avoided_node_injected_rate(task_recs)
 
             row: Dict[str, Any] = dict(run)
             row.update(
@@ -214,6 +236,7 @@ def main() -> None:
                     "tokens_e3_p99": _pctl(e3_tok_f, 99),
                     "tokens_e1_mean": float(np.mean(e1_tok_f)) if e1_tok_f else float("nan"),
                     "tokens_e2_mean": float(np.mean(e2_tok_f)) if e2_tok_f else float("nan"),
+                    "avoided_node_injected_rate": avoided_injected_rate,
                 }
             )
             row["label"] = _label(row)
@@ -233,6 +256,7 @@ def main() -> None:
     md_lines.append("- strict_e2e_accuracy: commit1 & commit2 & final\n")
     md_lines.append("- commit_resilient_accuracy: (commit1|commit2) & final\n")
     md_lines.append("- tokens_total_*: sum of prompt_tokens across episodes 1..3 per thread\n")
+    md_lines.append("- avoided_node_injected_rate: avoid-target leakage in episode-3 context\n")
 
     show_cols = [
         "pivot_type",
@@ -244,6 +268,7 @@ def main() -> None:
         "tokens_total_p95",
         "tokens_e3_mean",
         "pivot_rate_final",
+        "avoided_node_injected_rate",
     ]
     if not df.empty:
         md_lines.append("## By pivot_type\n")

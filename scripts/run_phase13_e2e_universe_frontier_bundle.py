@@ -100,6 +100,8 @@ class RunEntry:
     goc_graph_frontier_max_nodes: int
     goc_graph_frontier_seed_top_n: int
     goc_graph_frontier_score_frac: float
+    pivot_message_style: str
+    goc_enable_avoids: bool
     report_json: str
     compare_root: str
     # optional knobs for goc
@@ -160,6 +162,9 @@ def main() -> None:
     ap.add_argument("--goc_graph_frontier_max_nodes", type=int, default=50)
     ap.add_argument("--goc_graph_frontier_seed_top_n", type=int, default=6)
     ap.add_argument("--goc_graph_frontier_score_frac", type=float, default=0.7)
+    ap.add_argument("--pivot_message_style", choices=["banner", "transcript"], default="transcript")
+    ap.add_argument("--goc_enable_avoids", action="store_true", default=True)
+    ap.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
 
     # Optional ablations
     ap.add_argument("--include_ablations", action="store_true", help="Run extra GoC ablations (frontier off / universe=world)")
@@ -225,6 +230,8 @@ def main() -> None:
         "goc_graph_frontier_max_nodes": args.goc_graph_frontier_max_nodes,
         "goc_graph_frontier_seed_top_n": args.goc_graph_frontier_seed_top_n,
         "goc_graph_frontier_score_frac": args.goc_graph_frontier_score_frac,
+        "pivot_message_style": args.pivot_message_style,
+        "goc_enable_avoids": bool(args.goc_enable_avoids),
         "runs": [],
     }
 
@@ -242,6 +249,7 @@ def main() -> None:
         "--llm", "openai",
         "--model", args.model,
         "--judge", "symbolic_packed",
+        "--pivot_message_style", args.pivot_message_style,
         "--thread_context_budget_sweep", str(args.budget),
         "--parallel_workers", str(args.parallel_workers),
         "--n_threads", str(n_threads),
@@ -250,6 +258,7 @@ def main() -> None:
         "--save_event_trace",
         "--event_trace_sample_rate", str(args.event_trace_sample_rate),
     ] + _commit_anchor_flags()
+    base_compare_flags.append("--goc_enable_avoids" if args.goc_enable_avoids else "--no_goc_enable_avoids")
 
     if args.save_goc_graph:
         base_compare_flags += [
@@ -327,6 +336,8 @@ def main() -> None:
             goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+            pivot_message_style=str(args.pivot_message_style),
+            goc_enable_avoids=bool(args.goc_enable_avoids),
             report_json=str(rep_base.relative_to(phase13_root)),
             compare_root=str(out_base.relative_to(phase13_root)),
         )))
@@ -370,6 +381,8 @@ def main() -> None:
             goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+            pivot_message_style=str(args.pivot_message_style),
+            goc_enable_avoids=bool(args.goc_enable_avoids),
             policy="fixed",
             fixed_k=4,
             fixed_h=2,
@@ -400,6 +413,8 @@ def main() -> None:
             goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+            pivot_message_style=str(args.pivot_message_style),
+            goc_enable_avoids=bool(args.goc_enable_avoids),
             policy="fixed",
             fixed_k=16,
             fixed_h=3,
@@ -432,6 +447,8 @@ def main() -> None:
             goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+            pivot_message_style=str(args.pivot_message_style),
+            goc_enable_avoids=bool(args.goc_enable_avoids),
             policy="adaptive_pivot",
             default_k=4,
             default_h=2,
@@ -467,6 +484,8 @@ def main() -> None:
             goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
             goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
             goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+            pivot_message_style=str(args.pivot_message_style),
+            goc_enable_avoids=bool(args.goc_enable_avoids),
             policy="adaptive_pivot",
             default_k=4,
             default_h=2,
@@ -504,6 +523,8 @@ def main() -> None:
                 goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
                 goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
                 goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+                pivot_message_style=str(args.pivot_message_style),
+                goc_enable_avoids=bool(args.goc_enable_avoids),
                 policy="adaptive_pivot",
                 default_k=4,
                 default_h=2,
@@ -540,6 +561,8 @@ def main() -> None:
                 goc_graph_frontier_max_nodes=int(args.goc_graph_frontier_max_nodes),
                 goc_graph_frontier_seed_top_n=int(args.goc_graph_frontier_seed_top_n),
                 goc_graph_frontier_score_frac=float(args.goc_graph_frontier_score_frac),
+                pivot_message_style=str(args.pivot_message_style),
+                goc_enable_avoids=bool(args.goc_enable_avoids),
                 policy="adaptive_pivot",
                 default_k=4,
                 default_h=2,
@@ -580,6 +603,10 @@ def main() -> None:
         + f"goc_graph_frontier={bool(args.goc_graph_frontier)} hops={args.goc_graph_frontier_hops} "
         + f"max_nodes={args.goc_graph_frontier_max_nodes} seed_top_n={args.goc_graph_frontier_seed_top_n} "
         + f"score_frac={args.goc_graph_frontier_score_frac}"
+    )
+    idx_lines.append(
+        "- "
+        + f"pivot_message_style={args.pivot_message_style} goc_enable_avoids={bool(args.goc_enable_avoids)}"
     )
     idx_lines.append(f"- pivot_rate(retention_flip)={args.pivot_rate_retention_flip} pivot_rate(other)={args.pivot_rate}")
     idx_lines.append("\n## Outputs")

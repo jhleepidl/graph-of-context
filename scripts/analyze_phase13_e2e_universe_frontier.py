@@ -164,6 +164,28 @@ def _stale_evidence_pivot(task_recs: List[Dict[str, Any]]) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
+def _avoided_node_injected_rate(task_recs: List[Dict[str, Any]]) -> float:
+    """Fraction of episode-3 tasks where avoid-target nodes were still injected."""
+    vals: List[float] = []
+    for r in task_recs:
+        if int(r.get("episode_id") or 0) != 3:
+            continue
+        should_avoid = bool(r.get("goc_avoids_edge_injected"))
+        avoid_ids = r.get("goc_avoid_target_clause_ids") or []
+        if (not should_avoid) and isinstance(avoid_ids, list) and avoid_ids:
+            should_avoid = True
+        if not should_avoid:
+            continue
+        injected = r.get("goc_avoided_node_injected")
+        if isinstance(injected, bool):
+            vals.append(1.0 if injected else 0.0)
+            continue
+        if isinstance(avoid_ids, list):
+            e3_ids = set(map(str, r.get("e3_context_clause_ids") or []))
+            vals.append(1.0 if (set(map(str, avoid_ids)) & e3_ids) else 0.0)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def _frontier_first_seen_rate_from_graph(graph_jsonl: Path) -> Optional[float]:
     """Best-effort: fraction of *doc nodes* whose first_seen_stage == 'graph_frontier'.
 
@@ -263,6 +285,7 @@ def main() -> None:
 
             unseen_rate, unseen_mean = _episode3_unseen_stats(task_recs)
             stale_pivot = _stale_evidence_pivot(task_recs)
+            avoided_injected_rate = _avoided_node_injected_rate(task_recs)
 
             # Frontier graph attribution (best-effort, GoC only)
             frontier_rates: List[float] = []
@@ -308,6 +331,7 @@ def main() -> None:
                     "unseen_e3_rate": unseen_rate,
                     "unseen_e3_mean_count": unseen_mean,
                     "stale_evidence_pivot_rate": stale_pivot,
+                    "avoided_node_injected_rate": avoided_injected_rate,
                     "frontier_first_seen_rate": frontier_first_seen_rate,
                 }
             )
@@ -325,6 +349,7 @@ def main() -> None:
     md_lines.append("- commit_both_rate, p_final_given_commits\n")
     md_lines.append("- unseen_e3_rate/unseen_e3_mean_count (closed-book integrity)\n")
     md_lines.append("- stale_evidence_pivot_rate (pivot robustness)\n")
+    md_lines.append("- avoided_node_injected_rate (pivot avoids integrity)\n")
     md_lines.append("- frontier_first_seen_rate (if GoC graphs were saved)\n")
 
     show_cols = [
@@ -339,6 +364,7 @@ def main() -> None:
         "tokens_total_p95",
         "tokens_e3_mean",
         "stale_evidence_pivot_rate",
+        "avoided_node_injected_rate",
         "frontier_first_seen_rate",
     ]
 

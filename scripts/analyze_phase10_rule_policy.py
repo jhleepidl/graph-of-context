@@ -89,6 +89,23 @@ def _compute_metrics(method_report: Dict[str, Any]) -> Dict[str, Any]:
         if stale_flags:
             piv_stale = _mean([1.0 if x else 0.0 for x in stale_flags])
 
+    avoids_eval = []
+    for r in final:
+        should_avoid = bool(r.get("goc_avoids_edge_injected"))
+        avoid_ids = r.get("goc_avoid_target_clause_ids") or []
+        if (not should_avoid) and isinstance(avoid_ids, list) and avoid_ids:
+            should_avoid = True
+        if not should_avoid:
+            continue
+        injected = r.get("goc_avoided_node_injected")
+        if _is_bool(injected):
+            avoids_eval.append(1.0 if injected else 0.0)
+            continue
+        if isinstance(avoid_ids, list):
+            ctx = set(map(str, r.get("e3_context_clause_ids") or []))
+            avoids_eval.append(1.0 if (set(map(str, avoid_ids)) & ctx) else 0.0)
+    avoided_node_injected_rate = _mean(avoids_eval) if avoids_eval else None
+
     # unfold usage (GoC only)
     def _mean_int(field: str, subset: List[Dict[str, Any]]) -> Optional[float]:
         vs = []
@@ -114,6 +131,7 @@ def _compute_metrics(method_report: Dict[str, Any]) -> Dict[str, Any]:
         "final_pivot_token_mean": tok_piv,
         "final_nonpivot_token_mean": tok_non,
         "final_pivot_stale_rate": piv_stale,
+        "avoided_node_injected_rate": avoided_node_injected_rate,
         "goc_K_mean_pivot": goc_K_mean_pivot,
         "goc_H_mean_pivot": goc_H_mean_pivot,
         "goc_K_mean_nonpivot": goc_K_mean_nonpivot,
@@ -213,6 +231,7 @@ def main() -> None:
             "final_token_mean",
             "final_pivot_token_mean",
             "final_nonpivot_token_mean",
+            "avoided_node_injected_rate",
             "pivot_rate_final",
         ]
         sub = sub.sort_values(["final_pivot_accuracy","final_accuracy","final_token_mean"], ascending=[False,False,True])

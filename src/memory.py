@@ -638,8 +638,9 @@ class GoCMemory(MemoryManagerBase):
     #   - depends_llm: model-declared dependencies (hybrid; potentially noisy)
     #   - doc_ref: shared docid/title/url references
     #   - seq: within-thread sequence edges
-    edges_out: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}})
-    edges_in: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}})
+    #   - avoids: hard exclusion edges used at unfold time
+    edges_out: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}, "avoids": {}})
+    edges_in: Dict[str, Dict[str, Set[str]]] = field(default_factory=lambda: {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}, "avoids": {}})
 
     _last_in_thread: Dict[str, str] = field(default_factory=dict)  # thread -> last node id
 
@@ -652,8 +653,8 @@ class GoCMemory(MemoryManagerBase):
         self._storage_buffer_retriever = None
         self._storage_indexed = set()
         self.docid_to_nodes = {}
-        self.edges_out = {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}}
-        self.edges_in = {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}}
+        self.edges_out = {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}, "avoids": {}}
+        self.edges_in = {"depends": {}, "depends_llm": {}, "doc_ref": {}, "seq": {}, "avoids": {}}
         self._last_in_thread = {}
         # PEF(URL) state
         self._pef_last_url = None
@@ -665,7 +666,7 @@ class GoCMemory(MemoryManagerBase):
 
     def snapshot(self) -> Dict[str, Any]:
         """Return a JSON-serializable snapshot of the GoC internal graph state."""
-        etypes = ("depends", "depends_llm", "doc_ref", "seq")
+        etypes = ("depends", "depends_llm", "doc_ref", "seq", "avoids")
 
         snap_nodes: Dict[str, Dict[str, Any]] = {}
         ordered_nodes = sorted(
@@ -744,11 +745,47 @@ class GoCMemory(MemoryManagerBase):
         self._add_edge(str(etype), u, v)
         return True
 
+    def add_avoids_edge(self, u: str, v: str) -> bool:
+        """Add a hard-exclusion edge `u -avoids-> v`."""
+        return self.add_edge("avoids", u, v)
+
+    def add_avoids(self, u: str, v: str) -> bool:
+        """Alias for add_avoids_edge for convenience in callers/tests."""
+        return self.add_avoids_edge(u, v)
+
     def _neighbors(self, etype: str, u: str) -> Set[str]:
         return set(self.edges_out.get(etype, {}).get(u, set()))
 
     def _parents(self, etype: str, v: str) -> Set[str]:
         return set(self.edges_in.get(etype, {}).get(v, set()))
+
+    def _avoids_targets(self, selected_nodes: Set[str]) -> Set[str]:
+        targets: Set[str] = set()
+        if not selected_nodes:
+            return targets
+        out_map = self.edges_out.get("avoids", {})
+        for u in selected_nodes:
+            targets |= set(out_map.get(u, set()))
+        return targets
+
+    def _apply_avoids_filter(
+        self,
+        nodes: Set[str],
+        *,
+        selected_nodes: Optional[Set[str]] = None,
+    ) -> Set[str]:
+        """Hard-filter nodes that are targeted by outgoing `avoids` edges.
+
+        Rule: if any selected node has `selected -avoids-> X`, X is excluded.
+        """
+        base_nodes = set(nodes or set())
+        if not base_nodes:
+            return base_nodes
+        selected = set(selected_nodes or base_nodes)
+        avoid_targets = self._avoids_targets(selected)
+        if not avoid_targets:
+            return base_nodes
+        return {nid for nid in base_nodes if nid not in avoid_targets}
 
     def _index_docids(self, nid: str):
         n = self.nodes.get(nid)
@@ -2370,7 +2407,7 @@ class GoCMemory(MemoryManagerBase):
         for s in seeds:
             if s in self.nodes:
                 visited.add(s)
-        return visited
+        return self._apply_avoids_filter(visited, selected_nodes=visited)
 
     def _doc_ref_expand(self, nodes: Set[str], limit_per_node: int) -> Set[str]:
         expanded = set(nodes)
@@ -2467,6 +2504,7 @@ class GoCMemory(MemoryManagerBase):
             # closure: seed + dependency closure (configurable edges) + doc_ref neighbors
             closure = self._dep_closure([nid], int(self.max_dep_depth), None)
             closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+            closure = self._apply_avoids_filter(closure, selected_nodes=closure)
             closure_list = [x for x in closure if x in self.nodes]
 
             # cost: only count nodes that would be newly activated
@@ -2536,6 +2574,10 @@ class GoCMemory(MemoryManagerBase):
             # Recompute full closure (candidate closure_ids might be truncated for logging).
             closure = self._dep_closure([sid], int(self.max_dep_depth), None)
             closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+            closure = self._apply_avoids_filter(
+                closure,
+                selected_nodes=set(closure) | set(chosen_nodes),
+            )
 
             add_cost = 0
             for x in closure:
@@ -2573,6 +2615,10 @@ class GoCMemory(MemoryManagerBase):
 
             closure = self._dep_closure([sid], int(self.max_dep_depth), None)
             closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+            closure = self._apply_avoids_filter(
+                closure,
+                selected_nodes=set(closure) | set(chosen_nodes),
+            )
 
             add_cost = 0
             for x in closure:

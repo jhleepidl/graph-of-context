@@ -894,6 +894,46 @@ def _format_commit_refs(commit1: Dict[str, Any] | None, commit2: Dict[str, Any] 
     return "Commit refs: " + ", ".join(lines)
 
 
+def _normalize_pivot_message_style(style: Any) -> str:
+    val = str(style or "transcript").strip().lower()
+    return val if val in {"banner", "transcript"} else "transcript"
+
+
+def _format_pivot_ticket_message(
+    *,
+    ticket_initial: str,
+    ticket_updated: str,
+    assistant_summary: str | None,
+    pivot_message_style: str,
+) -> str:
+    style = _normalize_pivot_message_style(pivot_message_style)
+    initial = str(ticket_initial or "").strip()
+    updated = str(ticket_updated or "").strip()
+    summary = str(assistant_summary or "").strip()
+
+    if style == "banner":
+        base = initial
+        if summary:
+            base = f"{base}\n\n{summary}" if base else summary
+        if base:
+            return f"{base}\n\nTicket Update (latest user instruction):\n{updated}".strip()
+        return f"Ticket Update (latest user instruction):\n{updated}".strip()
+
+    lines = [
+        "Conversation so far:",
+        f"User: {initial}",
+    ]
+    if summary:
+        lines.append(f"Assistant: {summary}")
+    lines.extend(
+        [
+            f"User: {updated}",
+            "Now: produce the final decision.",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
 def _build_threaded_prompt(
     ticket: str,
     commit_facts: Dict[str, Any],
@@ -1023,8 +1063,14 @@ def _select_goc_unfold_clause_ids(
     mmr_lambda: float = 0.35,
     anchor_top1_lexical: bool = True,
     max_selected: int = 4,
+    avoid_clause_ids: List[str] | None = None,
     include_debug: bool = False,
 ) -> tuple[List[str], Dict[str, List[str]], Dict[str, Any]]:
+    avoid_set = set(_unique_strs(avoid_clause_ids or []))
+    opened_history_ids = [cid for cid in _unique_strs(opened_history_ids) if cid not in avoid_set]
+    commit_clause_ids = [cid for cid in _unique_strs(commit_clause_ids) if cid not in avoid_set]
+    critical_clause_ids = [cid for cid in _unique_strs(critical_clause_ids) if cid not in avoid_set]
+
     ticket_tokens = set(_tokenize(ticket))
     ticket_lex_tokens = _lexical_tokens(ticket)
     ticket_activity = extract_activity(ticket)
@@ -1096,6 +1142,7 @@ def _select_goc_unfold_clause_ids(
             top10 = sorted(candidates, key=lambda c: _score_key(c), reverse=True)[:10]
             debug_payload = {
                 "ticket_activity": sorted(ticket_activity),
+                "avoid_clause_ids": sorted(avoid_set),
                 "selected_activity_summary": [
                     {
                         "clause_id": cid,
@@ -1178,6 +1225,7 @@ def _select_goc_unfold_clause_ids(
         top10 = sorted(candidates, key=lambda c: _score_key(c), reverse=True)[:10]
         debug_payload = {
             "ticket_activity": sorted(ticket_activity),
+            "avoid_clause_ids": sorted(avoid_set),
             "selected_activity_summary": [
                 {
                     "clause_id": cid,
@@ -2192,6 +2240,9 @@ def _evaluate_method(
                     "commit2": None,
                     "opened_history_ids": [],
                     "episode_records": {},
+                    "initial_ticket_node_id": None,
+                    "pivot_ticket_node_ids": [],
+                    "avoids_edges": [],
                 },
             )
         search_score_mode = getattr(args, "search_score_mode", "bm25_plus_bridge_bonus")
@@ -2244,6 +2295,15 @@ def _evaluate_method(
         ticket_updated = str(getattr(task, "ticket_updated", None) or "").strip()
         pivot_type = str(getattr(task, "pivot_type", None) or "")
         is_pivot_task = bool(ticket_updated)
+        pivot_message_style = _normalize_pivot_message_style(
+            getattr(args, "pivot_message_style", "transcript")
+        )
+        goc_enable_avoids = bool(getattr(args, "goc_enable_avoids", True))
+        goc_avoids_edge_injected = False
+        goc_initial_ticket_node_id: str | None = None
+        goc_pivot_ticket_node_id: str | None = None
+        goc_avoid_target_clause_ids: List[str] = []
+        goc_avoided_node_injected: bool | None = None
         if ticket_initial and ticket_initial != str(getattr(task, "user_ticket", "") or ""):
             task_for_run = copy.deepcopy(task)
             task_for_run.user_ticket = ticket_initial
@@ -2302,6 +2362,7 @@ def _evaluate_method(
         goc_unfolded_node_ids: List[str] = []
         judge_correct_full_episode: bool | None = None
         full_episode_supporting_count: int | None = None
+        commit_refs = ""
         if threaded_mode and thread_state and episode_id:
             if task_for_run is task:
                 task_for_run = copy.deepcopy(task)
@@ -2313,15 +2374,34 @@ def _evaluate_method(
             )
             if commit_refs:
                 task_for_run.user_ticket = f"{task_for_run.user_ticket}\n\n{commit_refs}"
-        if threaded_mode and episode_id == 3 and is_pivot_task:
+            # Track per-thread initial ticket node id for pivot-time avoids edge injection.
+            if not thread_state.get("initial_ticket_node_id"):
+                thread_state["initial_ticket_node_id"] = f"ticket_initial:{thread_id}"
+            goc_initial_ticket_node_id = str(thread_state.get("initial_ticket_node_id") or "")
+
+        if threaded_mode and episode_id and int(episode_id) >= 3 and is_pivot_task:
             if task_for_run is task:
                 task_for_run = copy.deepcopy(task)
-                task_for_run.user_ticket = ticket_initial or task_for_run.user_ticket
-            task_for_run.user_ticket = (
-                f"{task_for_run.user_ticket}\n\n"
-                "Ticket Update (latest user instruction):\n"
-                f"{ticket_updated}"
+            task_for_run.user_ticket = _format_pivot_ticket_message(
+                ticket_initial=ticket_initial or str(task_for_run.user_ticket or ""),
+                ticket_updated=ticket_updated,
+                assistant_summary=commit_refs or None,
+                pivot_message_style=pivot_message_style,
             )
+            if thread_state is not None and goc_enable_avoids:
+                if not thread_state.get("initial_ticket_node_id"):
+                    thread_state["initial_ticket_node_id"] = f"ticket_initial:{thread_id}"
+                goc_initial_ticket_node_id = str(thread_state.get("initial_ticket_node_id") or "")
+                goc_pivot_ticket_node_id = f"ticket_pivot:{task.task_id}"
+                if goc_initial_ticket_node_id:
+                    edge = {
+                        "type": "avoids",
+                        "u": goc_pivot_ticket_node_id,
+                        "v": goc_initial_ticket_node_id,
+                    }
+                    thread_state.setdefault("pivot_ticket_node_ids", []).append(goc_pivot_ticket_node_id)
+                    thread_state.setdefault("avoids_edges", []).append(edge)
+                    goc_avoids_edge_injected = True
         elif (not threaded_mode) and is_pivot_task:
             if task_for_run is task:
                 task_for_run = copy.deepcopy(task)
@@ -2419,6 +2499,13 @@ def _evaluate_method(
                 clause_objs = [world.clauses.get(cid) for cid in opened_history_ids if world.clauses.get(cid)]
                 summary_text = summarize_clause_history(clause_objs, max_items=6)
                 critical_clause_ids = list(getattr(task, "critical_core_clause_ids", None) or [])
+                avoid_clause_ids: List[str] = []
+                if goc_enable_avoids and bool(is_pivot_task):
+                    avoid_clause_ids = _unique_strs(
+                        list(commit1.get("anchor_clause_ids") or [])
+                        + list(commit1.get("supporting_clause_ids") or [])
+                    )
+                    goc_avoid_target_clause_ids = list(avoid_clause_ids)
                 activity_filter = bool(getattr(args, "goc_activity_filter", False))
                 activity_filter_fallback = bool(
                     getattr(args, "goc_activity_filter_fallback", True)
@@ -2441,6 +2528,7 @@ def _evaluate_method(
                     mmr_lambda=mmr_lambda,
                     anchor_top1_lexical=anchor_top1,
                     max_selected=max(1, min(4, len(opened_history_ids))),
+                    avoid_clause_ids=avoid_clause_ids,
                     include_debug=False,
                 )
                 anchor_ids = _unique_strs(
@@ -2456,7 +2544,7 @@ def _evaluate_method(
                 # In strict closed-book final (E3), do NOT expand candidate pool beyond observed memory.
                 if goc_closedbook_universe == "memory":
                     candidate_pool_size = 0
-                unfold_candidate_ids = list(opened_history_ids)
+                unfold_candidate_ids = [cid for cid in opened_history_ids if cid not in set(avoid_clause_ids)]
                 if candidate_pool_size > 0:
                     try:
                         pool_results = env.search(task_for_run.user_ticket, top_k=candidate_pool_size)
@@ -2523,6 +2611,9 @@ def _evaluate_method(
                         unfold_candidate_ids = closure_ids
                     else:
                         unfold_candidate_ids = list(anchor_ids)
+                if avoid_clause_ids:
+                    avoid_set = set(avoid_clause_ids)
+                    unfold_candidate_ids = [cid for cid in unfold_candidate_ids if cid not in avoid_set]
 
                 if goc_unfold_budget_mode_cfg == "hops_only":
                     max_selected = max(1, len(unfold_candidate_ids))
@@ -2540,6 +2631,7 @@ def _evaluate_method(
                     mmr_lambda=mmr_lambda,
                     anchor_top1_lexical=anchor_top1,
                     max_selected=max_selected,
+                    avoid_clause_ids=avoid_clause_ids,
                     include_debug=include_activity_debug,
                 )
                 goc_closure_candidate_count = int(len(unfold_candidate_ids))
@@ -2628,6 +2720,9 @@ def _evaluate_method(
             e3_packed_dropped_clause_count = dropped_clause_count
             e3_context_truncated = e3_packed_truncated
             e3_packed_clause_ids = list(e3_context_clause_ids)
+            if goc_avoid_target_clause_ids:
+                avoid_set = set(_unique_strs(goc_avoid_target_clause_ids))
+                goc_avoided_node_injected = bool(avoid_set & set(e3_context_clause_ids))
             full_episode_clause_ids = list(
                 dict.fromkeys(e12_opened_clause_ids + e3_packed_clause_ids)
             )
@@ -2810,23 +2905,29 @@ def _evaluate_method(
                 "goc_unfolded_critical_clause_count": goc_unfolded_critical_clause_count,
                 "goc_unfold_selected_clause_ids": goc_unfold_selected_clause_ids,
                 "goc_unfold_reason": goc_unfold_reason,
-            "goc_candidate_pool_count": goc_candidate_pool_count,
-            "goc_candidate_pool_added_count": goc_candidate_pool_added_count,
-            "goc_candidate_pool_size": int(getattr(args, "goc_candidate_pool_size", 0) or 0)
-            if method == "goc"
-            else None,
+                "goc_candidate_pool_count": goc_candidate_pool_count,
+                "goc_candidate_pool_added_count": goc_candidate_pool_added_count,
+                "goc_candidate_pool_size": (
+                    int(getattr(args, "goc_candidate_pool_size", 0) or 0)
+                    if method == "goc"
+                    else None
+                ),
                 "goc_unfold_max_nodes": goc_unfold_max_nodes_used if method == "goc" else None,
                 "goc_unfold_hops": goc_unfold_hops_used if method == "goc" else None,
                 "goc_unfold_budget_mode": (
                     goc_unfold_budget_mode_cfg if method == "goc" else None
                 ),
                 "closure_candidate_count": goc_closure_candidate_count,
-                                "candidate_pool_count": goc_candidate_pool_count,
-                                "candidate_pool_added_count": goc_candidate_pool_added_count,
-                                "candidate_pool_size": int(getattr(args, "goc_candidate_pool_size", 0) or 0),
                 "unfolded_node_count": goc_unfolded_node_count,
                 "selected_node_ids": list(goc_selected_node_ids),
                 "unfolded_node_ids": list(goc_unfolded_node_ids),
+                "pivot_message_style": pivot_message_style,
+                "goc_enable_avoids": bool(goc_enable_avoids),
+                "goc_initial_ticket_node_id": goc_initial_ticket_node_id,
+                "goc_pivot_ticket_node_id": goc_pivot_ticket_node_id,
+                "goc_avoids_edge_injected": bool(goc_avoids_edge_injected),
+                "goc_avoid_target_clause_ids": list(goc_avoid_target_clause_ids),
+                "goc_avoided_node_injected": goc_avoided_node_injected,
             }
             if bool(getattr(args, "goc_activity_debug_in_snapshot", False)) and goc_selection_debug:
                 diag["goc_activity_debug"] = goc_selection_debug
@@ -3421,6 +3522,7 @@ def _evaluate_method(
             "ticket_updated": ticket_updated or None,
             "pivot_type": pivot_type or None,
             "is_pivot_task": bool(is_pivot_task),
+            "pivot_message_style": pivot_message_style,
             "pivot_compliant": pivot_compliant,
             "stale_evidence": stale_evidence,
             "pivot_old_days": pivot_old_days,
@@ -3550,6 +3652,12 @@ def _evaluate_method(
             "goc_unfolded_node_count": goc_unfolded_node_count,
             "goc_selected_node_ids": list(goc_selected_node_ids),
             "goc_unfolded_node_ids": list(goc_unfolded_node_ids),
+            "goc_enable_avoids": bool(goc_enable_avoids) if method == "goc" else None,
+            "goc_initial_ticket_node_id": goc_initial_ticket_node_id,
+            "goc_pivot_ticket_node_id": goc_pivot_ticket_node_id,
+            "goc_avoids_edge_injected": bool(goc_avoids_edge_injected) if method == "goc" else None,
+            "goc_avoid_target_clause_ids": list(goc_avoid_target_clause_ids),
+            "goc_avoided_node_injected": goc_avoided_node_injected,
             "opened_evidence_clause_ids": opened_evidence_clause_ids,
             "opened_evidence_doc_ids": opened_evidence_doc_ids,
             "active_context_node_ids": active_context_node_ids,
@@ -3916,6 +4024,9 @@ def _evaluate_method(
                     "goc_unfold_budget_mode": record.get("goc_unfold_budget_mode"),
                     "closure_candidate_count": record.get("goc_closure_candidate_count"),
                     "unfolded_node_count": record.get("goc_unfolded_node_count"),
+                    "goc_avoids_edge_injected": record.get("goc_avoids_edge_injected"),
+                    "goc_avoid_target_clause_ids": list(record.get("goc_avoid_target_clause_ids") or []),
+                    "goc_avoided_node_injected": record.get("goc_avoided_node_injected"),
                     "selected_node_ids": _unique_strs(
                         list(record.get("goc_selected_node_ids") or [])
                     ),
@@ -4032,6 +4143,45 @@ def _evaluate_method(
             goc_graph.add_node(ticket_id, "ticket", text=task_for_run.user_ticket, step=goc_graph.step)
             _log("INIT", {"episode_id": episode_node_id, "ticket_id": ticket_id})
             goc_graph.step += 1
+
+            if bool(record.get("goc_avoids_edge_injected")):
+                init_ticket_node_id = str(
+                    record.get("goc_initial_ticket_node_id")
+                    or f"ticket_initial:{thread_id}"
+                )
+                pivot_ticket_node_id = str(
+                    record.get("goc_pivot_ticket_node_id")
+                    or f"ticket_pivot:{task.task_id}"
+                )
+                goc_graph.add_node(
+                    init_ticket_node_id,
+                    "ticket_initial",
+                    thread_id=thread_id,
+                    text=ticket_initial,
+                    step=goc_graph.step,
+                )
+                goc_graph.add_node(
+                    pivot_ticket_node_id,
+                    "ticket_pivot",
+                    thread_id=thread_id,
+                    text=ticket_updated,
+                    step=goc_graph.step,
+                )
+                goc_graph.add_edge(
+                    f"avoids:{pivot_ticket_node_id}:{init_ticket_node_id}",
+                    pivot_ticket_node_id,
+                    init_ticket_node_id,
+                    "avoids",
+                )
+                _log(
+                    "AVOIDS_EDGE",
+                    {
+                        "pivot_ticket_node_id": pivot_ticket_node_id,
+                        "initial_ticket_node_id": init_ticket_node_id,
+                        "avoid_target_clause_ids": list(record.get("goc_avoid_target_clause_ids") or []),
+                    },
+                )
+                goc_graph.step += 1
 
             if threaded_mode and episode_id and (record.get("commit_anchor_clause_ids") or record.get("commit_supporting_clause_ids")):
                 commit_node_id = f"commit:{thread_id}:C{episode_id}"
@@ -4839,6 +4989,27 @@ def _evaluate_method(
         if stale_evidence_vals
         else None
     )
+    avoids_eval_records = [
+        r
+        for r in e3_records
+        if bool(r.get("goc_avoids_edge_injected"))
+    ]
+    avoids_injected_vals = [
+        1.0 if r.get("goc_avoided_node_injected") else 0.0
+        for r in avoids_eval_records
+        if isinstance(r.get("goc_avoided_node_injected"), bool)
+    ]
+    aggregate["avoids_edge_injected_rate"] = (
+        float(len(avoids_eval_records)) / float(len(e3_records))
+        if e3_records
+        else None
+    )
+    aggregate["avoided_node_injected_rate"] = (
+        sum(avoids_injected_vals) / len(avoids_injected_vals)
+        if avoids_injected_vals
+        else None
+    )
+    aggregate["avoided_node_eval_count"] = len(avoids_injected_vals)
     pivot_acc_vals = [
         1.0 if r.get("judge_correct") else 0.0
         for r in pivot_records
@@ -5016,6 +5187,12 @@ def _evaluate_method(
         if method in {"goc", "goc_base"}
         else None,
         "goc_unfold_pivot_hops": int(goc_unfold_pivot_hops_cfg) if method in {"goc", "goc_base"} else None,
+        "pivot_message_style": _normalize_pivot_message_style(
+            getattr(args, "pivot_message_style", "transcript")
+        ),
+        "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True))
+        if method in {"goc", "goc_base"}
+        else None,
     }
     if controller_policy == "rerank" and isinstance(controller, RerankController):
         report["rerank_weights"] = dict(controller.weights)
@@ -5339,6 +5516,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
                         "closure_recall_core_mean": metrics.get(
                             "closure_recall_core_mean"
                         ),
+                        "avoided_node_injected_rate": metrics.get(
+                            "avoided_node_injected_rate"
+                        ),
                         "wrong_branch_recall_rate_mean": metrics.get(
                             "wrong_branch_recall_rate_mean"
                         ),
@@ -5379,6 +5559,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 "goc_unfolded_critical_clause_count_mean",
                 "goc_folded_episode_count_mean",
                 "closure_recall_core_mean",
+                "avoided_node_injected_rate",
                 "wrong_branch_recall_rate_mean",
             ]
             with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -5611,6 +5792,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
             "closure_recall_core_mean": method_report["metrics"].get(
                 "closure_recall_core_mean"
             ),
+            "avoided_node_injected_rate": method_report["metrics"].get(
+                "avoided_node_injected_rate"
+            ),
             "wrong_branch_recall_rate_mean": method_report["metrics"].get(
                 "wrong_branch_recall_rate_mean"
             ),
@@ -5784,6 +5968,10 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "goc_unfold_default_hops": int(getattr(args, "goc_unfold_default_hops", 0) or 0),
         "goc_unfold_pivot_max_nodes": int(getattr(args, "goc_unfold_pivot_max_nodes", 0) or 0),
         "goc_unfold_pivot_hops": int(getattr(args, "goc_unfold_pivot_hops", 0) or 0),
+        "pivot_message_style": _normalize_pivot_message_style(
+            getattr(args, "pivot_message_style", "transcript")
+        ),
+        "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True)),
         "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
         "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
         "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
@@ -6071,6 +6259,9 @@ def _run_compare_with_tasks(
             "closure_recall_core_mean": method_report["metrics"].get(
                 "closure_recall_core_mean"
             ),
+            "avoided_node_injected_rate": method_report["metrics"].get(
+                "avoided_node_injected_rate"
+            ),
             "wrong_branch_recall_rate_mean": method_report["metrics"].get(
                 "wrong_branch_recall_rate_mean"
             ),
@@ -6321,6 +6512,7 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "selection_upper_bound_judge_acc": metrics.get("selection_upper_bound_judge_acc"),
                     "deep_rank_core_rate": metrics.get("deep_rank_core_rate"),
                     "closure_recall_core_mean": metrics.get("closure_recall_core_mean"),
+                    "avoided_node_injected_rate": metrics.get("avoided_node_injected_rate"),
                     "wrong_branch_recall_rate_mean": metrics.get(
                         "wrong_branch_recall_rate_mean"
                     ),
@@ -6385,6 +6577,7 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         "selection_upper_bound_judge_acc",
         "deep_rank_core_rate",
         "closure_recall_core_mean",
+        "avoided_node_injected_rate",
         "wrong_branch_recall_rate_mean",
         "min_gold_core_rank_union_mean",
         "min_gold_core_rank_union_median",
@@ -6690,6 +6883,14 @@ def build_parser() -> argparse.ArgumentParser:
         ],
         default="v0",
     )
+    ev.add_argument(
+        "--pivot_message_style",
+        choices=["banner", "transcript"],
+        default="transcript",
+        help="How pivot updates are rendered for episode-3 tasks.",
+    )
+    ev.add_argument("--goc_enable_avoids", action="store_true", default=True)
+    ev.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     ev.add_argument("--thread_context_budget_chars", type=int, default=8000)
     ev.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     ev.add_argument("--agent_query_policy", choices=["single_hop", "two_hop_bridge"], default="single_hop")
@@ -6881,6 +7082,14 @@ def build_parser() -> argparse.ArgumentParser:
         ],
         default="v0",
     )
+    cmp.add_argument(
+        "--pivot_message_style",
+        choices=["banner", "transcript"],
+        default="transcript",
+        help="How pivot updates are rendered for episode-3 tasks.",
+    )
+    cmp.add_argument("--goc_enable_avoids", action="store_true", default=True)
+    cmp.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     cmp.add_argument("--thread_context_budget_chars", type=int, default=8000)
     cmp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     cmp.add_argument("--thread_context_budget_sweep", type=str, default="")
@@ -7006,6 +7215,14 @@ def build_parser() -> argparse.ArgumentParser:
         ],
         default="v0",
     )
+    swp.add_argument(
+        "--pivot_message_style",
+        choices=["banner", "transcript"],
+        default="transcript",
+        help="How pivot updates are rendered for episode-3 tasks.",
+    )
+    swp.add_argument("--goc_enable_avoids", action="store_true", default=True)
+    swp.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     swp.add_argument("--thread_context_budget_chars", type=int, default=8000)
     swp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     swp.add_argument("--e3_clause_jitter_max_chars", type=int, default=0)
@@ -7129,6 +7346,14 @@ def build_parser() -> argparse.ArgumentParser:
         ],
         default="llm",
     )
+    abl.add_argument(
+        "--pivot_message_style",
+        choices=["banner", "transcript"],
+        default="transcript",
+        help="How pivot updates are rendered for episode-3 tasks.",
+    )
+    abl.add_argument("--goc_enable_avoids", action="store_true", default=True)
+    abl.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     abl.add_argument("--dotenv", type=str, default=".env")
     abl.add_argument("--out_dir", type=Path, default=None)
     abl.add_argument(
