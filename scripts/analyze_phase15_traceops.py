@@ -20,6 +20,39 @@ def _as_float(value: Any) -> float:
     return float("nan")
 
 
+def _mean(values: List[float]) -> float:
+    clean = [v for v in values if isinstance(v, (int, float)) and np.isfinite(v)]
+    if not clean:
+        return float("nan")
+    return float(sum(clean) / len(clean))
+
+
+def _attach_vs_full(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        out = df.copy()
+        out["tokens_savings_vs_full"] = np.nan
+        out["accuracy_delta_vs_full"] = np.nan
+        return out
+
+    out = df.copy()
+    key_cols = ["traceops_level", "traceops_scenario"]
+    full_ref = out[out["method"] == "full"].groupby(key_cols, dropna=False).agg(
+        full_tokens_pivot_mean=("tokens_pivot_mean", "mean"),
+        full_pivot_e3_only_accuracy=("pivot_e3_only_accuracy", "mean"),
+    )
+    out = out.merge(full_ref, left_on=key_cols, right_index=True, how="left")
+    out["tokens_savings_vs_full"] = out["tokens_pivot_mean"] / out["full_tokens_pivot_mean"]
+    out["accuracy_delta_vs_full"] = (
+        out["pivot_e3_only_accuracy"] - out["full_pivot_e3_only_accuracy"]
+    )
+    out.drop(
+        columns=["full_tokens_pivot_mean", "full_pivot_e3_only_accuracy"],
+        inplace=True,
+        errors="ignore",
+    )
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase15_root", type=str, required=True)
@@ -43,6 +76,23 @@ def main() -> None:
         scenario_params = report.get("scenario_params") or {}
         for method, mr in method_reports.items():
             metrics = dict(mr.get("metrics") or {})
+            records = list(mr.get("records") or [])
+            thread_records = list(mr.get("thread_records") or [])
+            tokens_pivot_mean = _as_float(metrics.get("tokens_pivot_mean"))
+            if not np.isfinite(tokens_pivot_mean):
+                tokens_pivot_mean = _mean(
+                    [
+                        _as_float(
+                            rec.get("prompt_tokens_est", rec.get("prompt_tokens"))
+                        )
+                        for rec in records
+                    ]
+                )
+            tokens_total_mean = _as_float(metrics.get("tokens_total_mean"))
+            if not np.isfinite(tokens_total_mean):
+                tokens_total_mean = _mean(
+                    [_as_float(rec.get("pivot_token_total")) for rec in thread_records]
+                )
             row: Dict[str, Any] = dict(run)
             row.update(
                 {
@@ -80,8 +130,8 @@ def main() -> None:
                     "strict_pivot_accuracy": _as_float(
                         metrics.get("strict_pivot_accuracy")
                     ),
-                    "tokens_pivot_mean": _as_float(metrics.get("tokens_pivot_mean")),
-                    "tokens_total_mean": _as_float(metrics.get("tokens_total_mean")),
+                    "tokens_pivot_mean": tokens_pivot_mean,
+                    "tokens_total_mean": tokens_total_mean,
                     "mean_avoid_targets_per_pivot": _as_float(
                         metrics.get("mean_avoid_targets_per_pivot")
                     ),
@@ -93,7 +143,7 @@ def main() -> None:
             )
             rows.append(row)
 
-    df = pd.DataFrame(rows)
+    df = _attach_vs_full(pd.DataFrame(rows))
     csv_path = out_dir / "phase15_traceops_summary.csv"
     df.to_csv(csv_path, index=False)
 
@@ -117,6 +167,8 @@ def main() -> None:
             "mean_avoid_targets_per_pivot",
             "avoided_injected_rate",
             "revive_success_rate",
+            "tokens_savings_vs_full",
+            "accuracy_delta_vs_full",
         ]
         cols = [c for c in raw_cols if c in df.columns]
         md_lines.append(df[cols].to_markdown(index=False))
@@ -139,6 +191,7 @@ def main() -> None:
             .reset_index()
             .sort_values(group_cols)
         )
+        grouped = _attach_vs_full(grouped)
         md_lines.append("## Aggregated By Level/Scenario/Method")
         md_lines.append("")
         md_lines.append(grouped.to_markdown(index=False))

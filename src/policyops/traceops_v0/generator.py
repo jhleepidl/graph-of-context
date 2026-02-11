@@ -219,8 +219,8 @@ def generate_traceops_threads(
                         step_idx=step_idx,
                         node_type="EXCEPTION",
                         text="Footnote exception: residency mismatch can be tolerated with manual review.",
-                        state_key="region",
-                        state_value=str(state.get("region")),
+                        state_key=None,
+                        state_value=None,
                         tags=["exception", "latent"],
                         metadata={"salience": "low"},
                     )
@@ -275,7 +275,17 @@ def generate_traceops_threads(
                     scenario == "mixed" and trng.random() < float(contradiction_rate)
                 )
                 if contradiction_mode:
-                    pool = list(reversed(decision_ids[-2:] + assumption_ids[-2:] + option_ids[-2:]))
+                    # Prefer invalidating stale decisions/assumptions first, then options.
+                    # Keep the most recent decision checkpoint out of avoid targets to reduce
+                    # accidental invalidation of pivot-critical context.
+                    decision_pool = list(decision_ids[:-1]) if len(decision_ids) > 1 else []
+                    assumption_pool = list(assumption_ids)
+                    option_pool = list(option_ids)
+                    pool = (
+                        list(reversed(decision_pool[-3:]))
+                        + list(reversed(assumption_pool[-3:]))
+                        + list(reversed(option_pool[-2:]))
+                    )
                     avoid_targets = _unique_strs(pool[: max(1, min(2, len(pool)))])
                     active_invalidated.update(avoid_targets)
                     for upd_id in update_step_ids:
@@ -289,8 +299,8 @@ def generate_traceops_threads(
                         step_idx=step_idx,
                         node_type="EXCEPTION",
                         text="Exception activated: manual override allowed if deadline is tight.",
-                        state_key="deadline",
-                        state_value="tight",
+                        state_key=None,
+                        state_value=None,
                         depends_on=update_step_ids[:1],
                         tags=["exception", "activation"],
                     )

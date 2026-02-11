@@ -133,6 +133,17 @@ def _choose_traceops_context(
         if not candidates:
             candidates = list(ordered_history)
 
+        def _applicable_rate(ids: Sequence[str]) -> float:
+            id_list = list(_unique_strs(ids))
+            if not id_list:
+                return float("nan")
+            applicable_count = 0
+            for cid in id_list:
+                clause = clauses.get(cid)
+                if clause and _clause_applicable(clause, step.state):
+                    applicable_count += 1
+            return float(applicable_count) / float(len(id_list))
+
         seed_ids: List[str] = []
         seed_topk = max(1, int(getattr(args, "goc_applicability_seed_topk", 8) or 8))
         if bool(getattr(args, "goc_applicability_seed_enable", False)):
@@ -177,11 +188,17 @@ def _choose_traceops_context(
             topk = max(0, int(getattr(args, "goc_dependency_closure_topk", 12) or 12))
             universe_mode = str(getattr(args, "goc_dependency_closure_universe", "candidates") or "candidates")
             if universe_mode == "world":
-                universe_ids = list(thread.clauses.keys())
+                raw_universe_ids = list(thread.clauses.keys())
             elif universe_mode == "memory_opened":
-                universe_ids = list(ordered_history)
+                raw_universe_ids = list(ordered_history)
             else:
-                universe_ids = list(candidates)
+                raw_universe_ids = list(candidates)
+            # Never let closure peek into future steps.
+            universe_ids = [
+                cid
+                for cid in _unique_strs(raw_universe_ids)
+                if cid in clauses and int(clauses[cid].step_idx) < int(step.step_idx)
+            ]
             closure = _dependency_closure(base_ids, clauses, max_hops=hops, universe_ids=universe_ids)
             base_set = set(base_ids)
             for cid in closure:
@@ -197,10 +214,32 @@ def _choose_traceops_context(
                 if len(closure_added) >= topk:
                     break
         context_ids = _unique_strs(base_ids + closure_added)
+
+        required_ids = _unique_strs(
+            list(step.pivot_required_ids or [])
+            or (list(step.gold.evidence_core_ids) if step.gold is not None else [])
+        )
+        opened_history_set = set(ordered_history)
+        force_ids = [cid for cid in required_ids if cid in opened_history_set]
+        force_but_avoided = [cid for cid in force_ids if cid in avoid_set]
+        force_but_inapplicable = []
+        for cid in force_ids:
+            clause = clauses.get(cid)
+            if clause and (not _clause_applicable(clause, step.state)):
+                force_but_inapplicable.append(cid)
+        context_ids = _unique_strs(context_ids + force_ids)
+
         debug = {
             "goc_applicability_seed_ids": list(seed_ids),
+            "goc_applicability_seed_applicable_rate": _applicable_rate(seed_ids),
             "goc_dependency_closure_added_ids": list(closure_added),
+            "goc_dependency_closure_added_applicable_rate": _applicable_rate(closure_added),
+            "goc_dependency_closure_universe_effective": list(universe_ids) if bool(getattr(args, "goc_dependency_closure_enable", False)) else [],
+            "goc_dependency_closure_universe_effective_size": int(len(universe_ids)) if bool(getattr(args, "goc_dependency_closure_enable", False)) else 0,
             "goc_avoid_target_clause_ids": list(_unique_strs(invalidated_ids)),
+            "goc_required_force_included_ids": list(force_ids),
+            "goc_required_force_included_but_avoided_ids": list(force_but_avoided),
+            "goc_required_force_included_but_inapplicable_ids": list(force_but_inapplicable),
         }
     else:
         context_ids = list(ordered_history)
@@ -223,16 +262,11 @@ def _infer_prediction(
     )
     context_set = set(_unique_strs(context_ids))
     required = set(_unique_strs(step.pivot_required_ids or gold.evidence_core_ids or gold.evidence_ids))
-    stale = context_set & set(_unique_strs(invalidated_ids))
 
-    if required and required.issubset(context_set) and not stale:
+    if (not required) or required.issubset(context_set):
         decision = gold.decision
         conditions = list(gold.conditions)
-        evidence = list(required)
-    elif stale:
-        decision = "stale_branch"
-        conditions = ["stale_context"]
-        evidence = list(stale)[:2]
+        evidence = list(_unique_strs(list(required) or list(gold.evidence_core_ids) or list(gold.evidence_ids)))
     else:
         decision = "needs_more_info"
         conditions = []
@@ -278,7 +312,8 @@ def _score_step(
     revive_success = bool(required_set.issubset(context_set)) if required_set else True
 
     avoid_set = set(_unique_strs(invalidated_ids))
-    avoided_injected = bool(context_set & avoid_set)
+    stale_set = context_set & avoid_set
+    avoided_injected = bool(stale_set)
     inapplicable = 0
     for cid in context_set:
         clause = thread.clauses.get(cid)
@@ -296,6 +331,8 @@ def _score_step(
         "critical_coverage": critical_coverage,
         "revive_success": revive_success,
         "avoided_injected": avoided_injected,
+        "stale_present": bool(stale_set),
+        "stale_count": int(len(stale_set)),
         "inapplicable_injected_rate": inapplicable_rate,
         "pred_decision": pred_decision,
         "pred_conditions": pred_conditions,
@@ -372,19 +409,37 @@ def evaluate_traceops_method(
                 "e3_evidence_valid_in_context": bool(score.get("evidence_valid_in_context", False)),
                 "critical_coverage_e3": score.get("critical_coverage"),
                 "inapplicable_injected_rate_e3": score.get("inapplicable_injected_rate"),
+                "stale_present": bool(score.get("stale_present", False)),
+                "stale_count": int(score.get("stale_count", 0) or 0),
                 "goc_avoid_target_clause_ids": list(_unique_strs(invalidated_ids)),
                 "goc_avoided_node_injected": bool(score.get("avoided_injected", False)),
                 "goc_applicability_seed_ids": list(debug.get("goc_applicability_seed_ids") or []),
                 "goc_applicability_seed_used": len(list(debug.get("goc_applicability_seed_ids") or [])),
-                "goc_applicability_seed_applicable_rate": (
-                    1.0 if list(debug.get("goc_applicability_seed_ids") or []) else float("nan")
+                "goc_applicability_seed_applicable_rate": debug.get(
+                    "goc_applicability_seed_applicable_rate", float("nan")
                 ),
                 "goc_dependency_closure_added_ids": list(debug.get("goc_dependency_closure_added_ids") or []),
                 "goc_dependency_closure_added_used": len(list(debug.get("goc_dependency_closure_added_ids") or [])),
-                "goc_dependency_closure_added_applicable_rate": (
-                    1.0 if list(debug.get("goc_dependency_closure_added_ids") or []) else float("nan")
+                "goc_dependency_closure_added_applicable_rate": debug.get(
+                    "goc_dependency_closure_added_applicable_rate", float("nan")
+                ),
+                "goc_dependency_closure_universe_effective": list(
+                    debug.get("goc_dependency_closure_universe_effective") or []
+                ),
+                "goc_dependency_closure_universe_effective_size": int(
+                    debug.get("goc_dependency_closure_universe_effective_size", 0) or 0
+                ),
+                "goc_required_force_included_ids": list(
+                    debug.get("goc_required_force_included_ids") or []
+                ),
+                "goc_required_force_included_but_avoided_ids": list(
+                    debug.get("goc_required_force_included_but_avoided_ids") or []
+                ),
+                "goc_required_force_included_but_inapplicable_ids": list(
+                    debug.get("goc_required_force_included_but_inapplicable_ids") or []
                 ),
                 "e3_context_clause_ids": list(context_ids),
+                "prompt_tokens_est": int(score.get("token_est", 0) or 0),
                 "prompt_tokens": int(score.get("token_est", 0) or 0),
                 "revive_success": bool(score.get("revive_success", False)),
             }
@@ -410,7 +465,12 @@ def evaluate_traceops_method(
                 "thread_judge_correct": bool(strict_thread),
                 "pivot_checks": int(len(pivot_step_records)),
                 "pivot_decision_correct_count": int(sum(1 for r in pivot_step_records if r.get("decision_correct"))),
-                "pivot_token_total": int(sum(int(r.get("prompt_tokens", 0) or 0) for r in pivot_step_records)),
+                "pivot_token_total": int(
+                    sum(
+                        int(r.get("prompt_tokens_est", r.get("prompt_tokens", 0)) or 0)
+                        for r in pivot_step_records
+                    )
+                ),
             }
         )
 
@@ -421,7 +481,7 @@ def evaluate_traceops_method(
         for r in pivot_records
     ]
     strict_vals = [1.0 if tr.get("thread_strict_correct") else 0.0 for tr in thread_records]
-    pivot_tokens = [float(r.get("prompt_tokens", 0) or 0) for r in pivot_records]
+    pivot_tokens = [float(r.get("prompt_tokens_est", r.get("prompt_tokens", 0)) or 0) for r in pivot_records]
     total_tokens_by_thread = [float(tr.get("pivot_token_total", 0) or 0) for tr in thread_records]
     avoid_counts = [len(list(r.get("goc_avoid_target_clause_ids") or [])) for r in pivot_records]
     avoided_injected_vals = [1.0 if r.get("goc_avoided_node_injected") else 0.0 for r in pivot_records]

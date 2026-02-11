@@ -7970,6 +7970,8 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
     }
     out_path = compare_dir / f"{timestamp}.json"
     save_report(out_path, compare_report)
+    nested_out_path = compare_run_dir / f"{timestamp}.json"
+    save_report(nested_out_path, compare_report)
     print("TraceOps compare complete.")
     print(f"Report saved to {out_path}")
 
