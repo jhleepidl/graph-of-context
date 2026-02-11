@@ -61,11 +61,13 @@ def _build_traceops_llm_prompt(
             allowed_conditions.append(f"exception={cid}")
     allowed_conditions = _unique_strs(allowed_conditions)
 
+    schema_line = (
+        'JSON schema: {"decision":"allow|deny|require_condition|needs_more_info",'
+        '"conditions":["<condition_string>"],"evidence":["<clause_id>"]}'
+    )
     lines: List[str] = []
     lines.append("Use ONLY the provided CONTEXT. Output STRICT JSON only.")
-    lines.append(
-        'JSON schema: {"decision":"allow|deny|require_condition|needs_more_info","conditions":["<condition_string>"],"evidence":["<clause_id>"]}'
-    )
+    lines.append(schema_line)
     lines.append("You MUST choose one of the 4 decision labels exactly as written.")
     lines.append(
         "For conditions: choose strings ONLY from ALLOWED_CONDITIONS (copy exact); no free-form text."

@@ -185,6 +185,27 @@ def main() -> None:
             gen_cmd += ["--traceops_delay_to_relevance", str(args.traceops_delay_to_relevance)]
         _run(gen_cmd, cwd=repo_root, env=env)
 
+        meta_path = data_out / "data" / "traceops" / "meta.json"
+        if meta_path.exists():
+            try:
+                generated_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                generated_meta = {}
+            if isinstance(generated_meta, dict):
+                for key in [
+                    "traceops_threads",
+                    "traceops_trace_len",
+                    "traceops_delay_to_relevance",
+                    "traceops_distractor_branching",
+                    "traceops_contradiction_rate",
+                    "traceops_exception_density",
+                    "traceops_state_flip_count",
+                    "total_steps",
+                    "total_clauses",
+                ]:
+                    if key in generated_meta:
+                        manifest[key] = generated_meta.get(key)
+
         base_compare_flags = [
             "--benchmark",
             "traceops_v0",

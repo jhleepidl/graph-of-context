@@ -43,9 +43,14 @@ def _sample_thread_and_step() -> tuple[TraceThread, TraceStep]:
 def test_traceops_llm_prompt_contains_schema_and_clause_ids() -> None:
     thread, step = _sample_thread_and_step()
     prompt = _build_traceops_llm_prompt(step, thread, ["C0001", "C0002"])
+    expected_schema = (
+        'JSON schema: {"decision":"allow|deny|require_condition|needs_more_info",'
+        '"conditions":["<condition_string>"],"evidence":["<clause_id>"]}'
+    )
 
     assert "Output STRICT JSON only" in prompt
-    assert '"decision":"allow|deny|require_condition|needs_more_info"' in prompt
+    assert expected_schema in prompt
+    assert "..." not in prompt
     assert "You MUST choose one of the 4 decision labels exactly as written." in prompt
     assert "ALLOWED_CONDITIONS:" in prompt
     assert "choose strings ONLY from ALLOWED_CONDITIONS" in prompt
