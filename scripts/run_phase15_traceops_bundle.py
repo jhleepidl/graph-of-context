@@ -91,7 +91,10 @@ def main() -> None:
     ap.add_argument("--goc_enable_avoids", action="store_true", default=True)
     ap.add_argument("--no_goc_enable_avoids", action="store_false", dest="goc_enable_avoids")
     ap.add_argument("--goc_avoids_mode", choices=["legacy_commit", "applicability", "off"], default="applicability")
+    ap.add_argument("--traceops_eval_mode", choices=["deterministic", "llm"], default="deterministic")
+    ap.add_argument("--traceops_llm_max_pivots", type=int, default=0)
     ap.add_argument("--include_ablations", action="store_true")
+    ap.add_argument("--include_oracle", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -140,6 +143,8 @@ def main() -> None:
         "pivot_gold_mode": str(args.pivot_gold_mode),
         "goc_enable_avoids": bool(args.goc_enable_avoids),
         "goc_avoids_mode": str(args.goc_avoids_mode),
+        "traceops_eval_mode": str(args.traceops_eval_mode),
+        "traceops_llm_max_pivots": int(args.traceops_llm_max_pivots),
         "max_steps": int(args.max_steps),
         "runs": [],
     }
@@ -183,15 +188,34 @@ def main() -> None:
         base_compare_flags = [
             "--benchmark",
             "traceops_v0",
-            "--model",
-            args.model,
             "--pivot_gold_mode",
             args.pivot_gold_mode,
             "--goc_avoids_mode",
             str(args.goc_avoids_mode),
+            "--traceops_eval_mode",
+            str(args.traceops_eval_mode),
             "--parallel_workers",
             "1",
         ]
+        if str(args.traceops_eval_mode) == "llm":
+            base_compare_flags += [
+                "--llm",
+                "openai",
+                "--model",
+                args.model,
+                "--traceops_llm_max_pivots",
+                str(int(args.traceops_llm_max_pivots)),
+                "--traceops_llm_temperature",
+                "0.0",
+                "--traceops_llm_max_output_tokens",
+                "256",
+                "--traceops_llm_cache_dir",
+                ".cache/traceops_llm",
+                "--traceops_llm_seed",
+                "0",
+            ]
+        else:
+            base_compare_flags += ["--model", args.model]
         if args.goc_enable_avoids:
             base_compare_flags += ["--goc_enable_avoids"]
         else:
@@ -254,6 +278,7 @@ def main() -> None:
         def _run_goc_variant(
             variant: str,
             *,
+            method_name: str,
             seed_enable: bool,
             seed_topk: int,
             closure_enable: bool,
@@ -274,7 +299,7 @@ def main() -> None:
                 "compare",
             ] + base_compare_flags + [
                 "--methods",
-                "goc",
+                method_name,
                 "--goc_unfold_max_nodes",
                 str(unfold_max_nodes),
                 "--goc_unfold_hops",
@@ -315,7 +340,7 @@ def main() -> None:
                         traceops_exception_density=float(args.traceops_exception_density),
                         traceops_state_flip_count=int(args.traceops_state_flip_count),
                         variant=variant,
-                        method="goc",
+                        method=str(method_name),
                         pivot_gold_mode=str(args.pivot_gold_mode),
                         goc_enable_avoids=bool(args.goc_enable_avoids),
                         goc_avoids_mode=str(args.goc_avoids_mode),
@@ -333,36 +358,52 @@ def main() -> None:
 
         _run_goc_variant(
             "goc_phase13_style",
+            method_name="goc",
             seed_enable=False,
             seed_topk=8,
             closure_enable=False,
             closure_topk=12,
             closure_hops=1,
             closure_universe="candidates",
-            unfold_max_nodes=8,
+            unfold_max_nodes=999,
             unfold_hops=1,
         )
         _run_goc_variant(
             "goc_phase15_seed_closure",
+            method_name="goc",
             seed_enable=True,
             seed_topk=8,
             closure_enable=True,
             closure_topk=12,
             closure_hops=1,
             closure_universe="candidates",
-            unfold_max_nodes=10,
+            unfold_max_nodes=999,
             unfold_hops=1,
         )
         if args.include_ablations:
             _run_goc_variant(
                 "goc_phase15_seed_closure_world",
+                method_name="goc",
                 seed_enable=True,
                 seed_topk=8,
                 closure_enable=True,
                 closure_topk=12,
                 closure_hops=1,
                 closure_universe="world",
-                unfold_max_nodes=10,
+                unfold_max_nodes=999,
+                unfold_hops=1,
+            )
+        if args.include_oracle:
+            _run_goc_variant(
+                "goc_oracle_phase15_seed_closure",
+                method_name="goc_oracle",
+                seed_enable=True,
+                seed_topk=8,
+                closure_enable=True,
+                closure_topk=12,
+                closure_hops=1,
+                closure_universe="candidates",
+                unfold_max_nodes=999,
                 unfold_hops=1,
             )
 
@@ -386,7 +427,12 @@ def main() -> None:
         f"- delay_to_relevance={int(args.traceops_delay_to_relevance)} distractor_branching={int(args.traceops_distractor_branching)}",
         f"- contradiction_rate={float(args.traceops_contradiction_rate)} exception_density={float(args.traceops_exception_density)}",
         f"- state_flip_count={int(args.traceops_state_flip_count)} max_steps={int(args.max_steps)}",
-        "- traceops_v0 is deterministic in Phase15 (no LLM calls); token fields are estimates.",
+        f"- traceops_eval_mode={str(args.traceops_eval_mode)} traceops_llm_max_pivots={int(args.traceops_llm_max_pivots)}",
+        (
+            "- traceops_v0 deterministic mode (no LLM calls); token fields are estimates."
+            if str(args.traceops_eval_mode) == "deterministic"
+            else "- traceops_v0 llm mode enabled for pivot_check; usage tokens prefer actual API usage."
+        ),
         "",
         "## Outputs",
         f"- phase15_root: {phase15_root}",

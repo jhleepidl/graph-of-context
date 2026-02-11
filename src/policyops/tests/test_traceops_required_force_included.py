@@ -23,7 +23,7 @@ def _args(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def test_traceops_goc_force_includes_required_even_if_inapplicable() -> None:
+def test_traceops_required_force_include_is_oracle_only() -> None:
     clauses = {
         "C0001": TraceWorldClause(
             clause_id="C0001",
@@ -90,9 +90,14 @@ def test_traceops_goc_force_includes_required_even_if_inapplicable() -> None:
         meta={},
     )
 
-    report = evaluate_traceops_method("goc", [thread], args=_args())
-    rec = report["records"][0]
+    report_goc = evaluate_traceops_method("goc", [thread], args=_args())
+    rec_goc = report_goc["records"][0]
+    assert rec_goc["goc_required_force_included_ids"] == []
+    assert rec_goc["goc_required_force_included_but_inapplicable_ids"] == []
+    assert "C0001" not in rec_goc["e3_context_clause_ids"]
 
-    assert "C0001" in rec["goc_required_force_included_ids"]
-    assert "C0001" in rec["goc_required_force_included_but_inapplicable_ids"]
-    assert "C0001" in rec["e3_context_clause_ids"]
+    report_oracle = evaluate_traceops_method("goc_oracle", [thread], args=_args())
+    rec_oracle = report_oracle["records"][0]
+    assert "C0001" in rec_oracle["goc_required_force_included_ids"]
+    assert "C0001" in rec_oracle["goc_required_force_included_but_inapplicable_ids"]
+    assert "C0001" in rec_oracle["e3_context_clause_ids"]

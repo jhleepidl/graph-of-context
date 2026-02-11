@@ -7898,14 +7898,26 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
     run_dir = base_dir / "runs" / method
     run_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    report = evaluate_traceops_method(method, threads, args=args)
+    client = None
+    if str(getattr(args, "traceops_eval_mode", "deterministic") or "deterministic") == "llm":
+        if str(getattr(args, "llm", "openai") or "openai") != "openai":
+            raise RuntimeError("traceops_eval_mode=llm requires --llm openai")
+        client = OpenAIClient(
+            model=getattr(args, "model", "gpt-4.1-mini"),
+            dotenv_path=getattr(args, "dotenv", ".env"),
+        )
+    report = evaluate_traceops_method(method, threads, args=args, client=client)
     payload = {
         "benchmark": "traceops_v0",
         "method": method,
         "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run_id": timestamp,
         "model": getattr(args, "model", ""),
-        "scenario_params": dict(meta),
+        "scenario_params": {
+            **dict(meta),
+            "traceops_eval_mode": str(getattr(args, "traceops_eval_mode", "deterministic") or "deterministic"),
+            "traceops_llm_max_pivots": int(getattr(args, "traceops_llm_max_pivots", 0) or 0),
+        },
         "metrics": dict(report.get("metrics") or {}),
         "records": list(report.get("records") or []),
         "thread_records": list(report.get("thread_records") or []),
@@ -7925,7 +7937,25 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
     if getattr(args, "n_threads", None):
         threads = list(threads[: max(1, int(args.n_threads))])
 
-    methods = list(getattr(args, "methods", None) or ["full", "similarity_only", "agent_fold", "goc"])
+    methods_raw = getattr(args, "methods", None) or ["full", "similarity_only", "agent_fold", "goc"]
+    methods: List[str] = []
+    for item in list(methods_raw):
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "," in text:
+            methods.extend([part.strip() for part in text.split(",") if part.strip()])
+        else:
+            methods.append(text)
+    methods = methods or ["full", "similarity_only", "agent_fold", "goc"]
+    client = None
+    if str(getattr(args, "traceops_eval_mode", "deterministic") or "deterministic") == "llm":
+        if str(getattr(args, "llm", "openai") or "openai") != "openai":
+            raise RuntimeError("traceops_eval_mode=llm requires --llm openai")
+        client = OpenAIClient(
+            model=getattr(args, "model", "gpt-4.1-mini"),
+            dotenv_path=getattr(args, "dotenv", ".env"),
+        )
     compare_dir = base_dir / "runs" / "compare"
     compare_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -7937,7 +7967,7 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
     for method in methods:
         method_dir = compare_run_dir / method
         method_dir.mkdir(parents=True, exist_ok=True)
-        report = evaluate_traceops_method(method, threads, args=args)
+        report = evaluate_traceops_method(method, threads, args=args, client=client)
         method_reports[method] = report
         metrics = dict(report.get("metrics") or {})
         summary[method] = {
@@ -7946,6 +7976,10 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "strict_pivot_accuracy": metrics.get("strict_pivot_accuracy"),
             "tokens_pivot_mean": metrics.get("tokens_pivot_mean"),
             "tokens_total_mean": metrics.get("tokens_total_mean"),
+            "tokens_pivot_mean_est": metrics.get("tokens_pivot_mean_est"),
+            "tokens_total_mean_est": metrics.get("tokens_total_mean_est"),
+            "tokens_pivot_mean_actual": metrics.get("tokens_pivot_mean_actual"),
+            "tokens_total_mean_actual": metrics.get("tokens_total_mean_actual"),
             "mean_avoid_targets_per_pivot": metrics.get("mean_avoid_targets_per_pivot"),
             "avoided_injected_rate": metrics.get("avoided_injected_rate"),
             "revive_success_rate": metrics.get("revive_success_rate"),
@@ -7964,6 +7998,8 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
         "scenario_params": {
             **dict(meta),
             "traceops_max_steps": int(getattr(args, "traceops_max_steps", 0) or 0),
+            "traceops_eval_mode": str(getattr(args, "traceops_eval_mode", "deterministic") or "deterministic"),
+            "traceops_llm_max_pivots": int(getattr(args, "traceops_llm_max_pivots", 0) or 0),
         },
         "summary": summary,
         "method_reports": method_reports,
@@ -8533,6 +8569,27 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--train_ratio", type=float, default=0.7)
     ev.add_argument("--split_seed", type=int, default=0)
     ev.add_argument("--traceops_max_steps", type=int, default=0)
+    ev.add_argument(
+        "--traceops_eval_mode",
+        choices=["deterministic", "llm"],
+        default="deterministic",
+    )
+    ev.add_argument("--traceops_llm_temperature", type=float, default=0.0)
+    ev.add_argument(
+        "--traceops_llm_max_pivots",
+        type=int,
+        default=0,
+        help="Cap number of pivot_check steps evaluated in llm mode (0 = no cap).",
+    )
+    ev.add_argument("--traceops_llm_cache_dir", type=str, default=".cache/traceops_llm")
+    ev.add_argument("--traceops_llm_seed", type=int, default=0)
+    ev.add_argument("--traceops_llm_max_output_tokens", type=int, default=256)
+    ev.add_argument(
+        "--traceops_force_include_required",
+        action="store_true",
+        default=False,
+        help="TraceOps debug-only oracle mode: force include required/pivot evidence IDs in GoC context.",
+    )
     ev.set_defaults(func=cmd_eval)
 
     cmp = sub.add_parser("compare", help="Compare methods in one run")
@@ -8841,6 +8898,27 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--debug_task_ids", type=str, default="")
     cmp.add_argument("--n_threads", type=int, default=None)
     cmp.add_argument("--traceops_max_steps", type=int, default=0)
+    cmp.add_argument(
+        "--traceops_eval_mode",
+        choices=["deterministic", "llm"],
+        default="deterministic",
+    )
+    cmp.add_argument("--traceops_llm_temperature", type=float, default=0.0)
+    cmp.add_argument(
+        "--traceops_llm_max_pivots",
+        type=int,
+        default=0,
+        help="Cap number of pivot_check steps evaluated in llm mode (0 = no cap).",
+    )
+    cmp.add_argument("--traceops_llm_cache_dir", type=str, default=".cache/traceops_llm")
+    cmp.add_argument("--traceops_llm_seed", type=int, default=0)
+    cmp.add_argument("--traceops_llm_max_output_tokens", type=int, default=256)
+    cmp.add_argument(
+        "--traceops_force_include_required",
+        action="store_true",
+        default=False,
+        help="TraceOps debug-only oracle mode: force include required/pivot evidence IDs in GoC context.",
+    )
     cmp.add_argument("--parallel_workers", type=int, default=1)
     cmp.set_defaults(func=cmd_compare)
 

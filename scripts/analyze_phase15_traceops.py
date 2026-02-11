@@ -31,6 +31,7 @@ def _attach_vs_full(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         out = df.copy()
         out["tokens_savings_vs_full"] = np.nan
+        out["tokens_savings_vs_full_actual"] = np.nan
         out["accuracy_delta_vs_full"] = np.nan
         return out
 
@@ -38,15 +39,23 @@ def _attach_vs_full(df: pd.DataFrame) -> pd.DataFrame:
     key_cols = ["traceops_level", "traceops_scenario"]
     full_ref = out[out["method"] == "full"].groupby(key_cols, dropna=False).agg(
         full_tokens_pivot_mean=("tokens_pivot_mean", "mean"),
+        full_tokens_pivot_mean_actual=("tokens_pivot_mean_actual", "mean"),
         full_pivot_e3_only_accuracy=("pivot_e3_only_accuracy", "mean"),
     )
     out = out.merge(full_ref, left_on=key_cols, right_index=True, how="left")
     out["tokens_savings_vs_full"] = out["tokens_pivot_mean"] / out["full_tokens_pivot_mean"]
+    out["tokens_savings_vs_full_actual"] = (
+        out["tokens_pivot_mean_actual"] / out["full_tokens_pivot_mean_actual"]
+    )
     out["accuracy_delta_vs_full"] = (
         out["pivot_e3_only_accuracy"] - out["full_pivot_e3_only_accuracy"]
     )
     out.drop(
-        columns=["full_tokens_pivot_mean", "full_pivot_e3_only_accuracy"],
+        columns=[
+            "full_tokens_pivot_mean",
+            "full_tokens_pivot_mean_actual",
+            "full_pivot_e3_only_accuracy",
+        ],
         inplace=True,
         errors="ignore",
     )
@@ -78,20 +87,42 @@ def main() -> None:
             metrics = dict(mr.get("metrics") or {})
             records = list(mr.get("records") or [])
             thread_records = list(mr.get("thread_records") or [])
-            tokens_pivot_mean = _as_float(metrics.get("tokens_pivot_mean"))
-            if not np.isfinite(tokens_pivot_mean):
-                tokens_pivot_mean = _mean(
+            tokens_pivot_mean_est = _as_float(metrics.get("tokens_pivot_mean_est"))
+            if not np.isfinite(tokens_pivot_mean_est):
+                tokens_pivot_mean_est = _mean(
                     [
-                        _as_float(
-                            rec.get("prompt_tokens_est", rec.get("prompt_tokens"))
-                        )
+                        _as_float(rec.get("prompt_tokens_est", rec.get("prompt_tokens")))
                         for rec in records
                     ]
                 )
+            tokens_total_mean_est = _as_float(metrics.get("tokens_total_mean_est"))
+            if not np.isfinite(tokens_total_mean_est):
+                tokens_total_mean_est = _mean(
+                    [_as_float(rec.get("pivot_token_total_est")) for rec in thread_records]
+                )
+            tokens_pivot_mean_actual = _as_float(metrics.get("tokens_pivot_mean_actual"))
+            if not np.isfinite(tokens_pivot_mean_actual):
+                tokens_pivot_mean_actual = _mean(
+                    [_as_float(rec.get("total_tokens_actual")) for rec in records]
+                )
+            tokens_total_mean_actual = _as_float(metrics.get("tokens_total_mean_actual"))
+            if not np.isfinite(tokens_total_mean_actual):
+                tokens_total_mean_actual = _mean(
+                    [_as_float(rec.get("pivot_token_total_actual")) for rec in thread_records]
+                )
+            tokens_pivot_mean = _as_float(metrics.get("tokens_pivot_mean"))
+            if not np.isfinite(tokens_pivot_mean):
+                tokens_pivot_mean = (
+                    tokens_pivot_mean_actual
+                    if np.isfinite(tokens_pivot_mean_actual)
+                    else tokens_pivot_mean_est
+                )
             tokens_total_mean = _as_float(metrics.get("tokens_total_mean"))
             if not np.isfinite(tokens_total_mean):
-                tokens_total_mean = _mean(
-                    [_as_float(rec.get("pivot_token_total")) for rec in thread_records]
+                tokens_total_mean = (
+                    tokens_total_mean_actual
+                    if np.isfinite(tokens_total_mean_actual)
+                    else tokens_total_mean_est
                 )
             row: Dict[str, Any] = dict(run)
             row.update(
@@ -132,6 +163,10 @@ def main() -> None:
                     ),
                     "tokens_pivot_mean": tokens_pivot_mean,
                     "tokens_total_mean": tokens_total_mean,
+                    "tokens_pivot_mean_est": tokens_pivot_mean_est,
+                    "tokens_total_mean_est": tokens_total_mean_est,
+                    "tokens_pivot_mean_actual": tokens_pivot_mean_actual,
+                    "tokens_total_mean_actual": tokens_total_mean_actual,
                     "mean_avoid_targets_per_pivot": _as_float(
                         metrics.get("mean_avoid_targets_per_pivot")
                     ),
@@ -164,10 +199,15 @@ def main() -> None:
             "strict_pivot_accuracy",
             "tokens_pivot_mean",
             "tokens_total_mean",
+            "tokens_pivot_mean_est",
+            "tokens_total_mean_est",
+            "tokens_pivot_mean_actual",
+            "tokens_total_mean_actual",
             "mean_avoid_targets_per_pivot",
             "avoided_injected_rate",
             "revive_success_rate",
             "tokens_savings_vs_full",
+            "tokens_savings_vs_full_actual",
             "accuracy_delta_vs_full",
         ]
         cols = [c for c in raw_cols if c in df.columns]
@@ -181,6 +221,10 @@ def main() -> None:
             "strict_pivot_accuracy",
             "tokens_pivot_mean",
             "tokens_total_mean",
+            "tokens_pivot_mean_est",
+            "tokens_total_mean_est",
+            "tokens_pivot_mean_actual",
+            "tokens_total_mean_actual",
             "mean_avoid_targets_per_pivot",
             "avoided_injected_rate",
             "revive_success_rate",

@@ -154,8 +154,34 @@ class OpenAIClient(LLMClient):
         jitter = random.uniform(0.0, max(0.0, delay * 0.25))
         time.sleep(min(self.backoff_max, delay + jitter))
 
-    def generate(self, prompt: str) -> str:
-        payload = {"model": self.model, "input": prompt}
+    def _extract_output_text(self, response: Dict[str, Any]) -> str:
+        text = response.get("output_text")
+        if isinstance(text, str) and text.strip():
+            return text
+        output = response.get("output", [])
+        chunks: List[str] = []
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if isinstance(part.get("text"), str):
+                        chunks.append(part["text"])
+        if chunks:
+            return "\n".join(chunks)
+        choices = response.get("choices", [])
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return msg["content"]
+        return ""
+
+    def _request_response(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
         retryable_http_codes = {429, 500, 502, 503, 504}
         for attempt in range(self.max_retries + 1):
@@ -172,31 +198,9 @@ class OpenAIClient(LLMClient):
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw = resp.read().decode("utf-8")
                 response = json.loads(raw)
-                text = response.get("output_text")
-                if isinstance(text, str) and text.strip():
-                    return text
-                output = response.get("output", [])
-                chunks: List[str] = []
-                if isinstance(output, list):
-                    for item in output:
-                        if not isinstance(item, dict):
-                            continue
-                        content = item.get("content", [])
-                        if not isinstance(content, list):
-                            continue
-                        for part in content:
-                            if not isinstance(part, dict):
-                                continue
-                            if isinstance(part.get("text"), str):
-                                chunks.append(part["text"])
-                if chunks:
-                    return "\n".join(chunks)
-                choices = response.get("choices", [])
-                if isinstance(choices, list) and choices:
-                    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-                    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-                        return msg["content"]
-                return ""
+                if isinstance(response, dict):
+                    return response
+                return {}
             except urllib.error.HTTPError as exc:
                 status_code = int(getattr(exc, "code", 0) or 0)
                 should_retry = status_code in retryable_http_codes and attempt < self.max_retries
@@ -216,7 +220,48 @@ class OpenAIClient(LLMClient):
                 if attempt >= self.max_retries:
                     raise
                 self._backoff_sleep(attempt)
-        return ""
+        return {}
+
+    def generate(self, prompt: str) -> str:
+        payload = {"model": self.model, "input": prompt}
+        response = self._request_response(payload)
+        return self._extract_output_text(response)
+
+    def generate_with_usage(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.0,
+        max_output_tokens: int = 256,
+    ) -> Tuple[str, Dict[str, Any]]:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": prompt,
+            "temperature": float(temperature),
+            "max_output_tokens": int(max(1, max_output_tokens)),
+        }
+        response = self._request_response(payload)
+        text = self._extract_output_text(response)
+        usage_raw = response.get("usage") if isinstance(response, dict) else {}
+        usage_raw = usage_raw if isinstance(usage_raw, dict) else {}
+        usage: Dict[str, Any] = {}
+        for out_key, in_keys in {
+            "input_tokens": ("input_tokens", "prompt_tokens"),
+            "output_tokens": ("output_tokens", "completion_tokens"),
+            "total_tokens": ("total_tokens",),
+        }.items():
+            for key in in_keys:
+                value = usage_raw.get(key)
+                if isinstance(value, (int, float)):
+                    usage[out_key] = int(value)
+                    break
+        if (
+            "total_tokens" not in usage
+            and "input_tokens" in usage
+            and "output_tokens" in usage
+        ):
+            usage["total_tokens"] = int(usage["input_tokens"] + usage["output_tokens"])
+        return text, usage
 
 
 def run_engine_oracle(task: Any, env: PolicyOpsEnv) -> Dict[str, Any]:
