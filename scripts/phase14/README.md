@@ -1,11 +1,17 @@
-# Phase 14 Pivot/Avoids Run Notes
+# Phase 14 Entity-Switch Run Notes
 
-This repo now supports two new controls for PolicyOps threaded pivot runs:
+Phase14 keeps the Phase13 evaluation stack and adds relationship-driven E3 GoC selection:
 
 - `--pivot_message_style {transcript,banner}`
 - `--pivot_gold_mode {respect_ticket_updated,original,both}`
 - `--goc_enable_avoids` / `--no_goc_enable_avoids`
 - `--goc_avoids_mode {applicability,legacy_commit,off}`
+- `--goc_applicability_seed_enable`
+- `--goc_applicability_seed_topk`
+- `--goc_dependency_closure_enable`
+- `--goc_dependency_closure_topk`
+- `--goc_dependency_closure_hops`
+- `--goc_dependency_closure_universe {candidates,world,memory_opened}`
 
 Defaults:
 
@@ -13,46 +19,35 @@ Defaults:
 - `pivot_gold_mode=respect_ticket_updated`
 - `goc_enable_avoids=true`
 - `goc_avoids_mode=applicability`
+- `goc_applicability_seed_enable=true`
+- `goc_applicability_seed_topk=8`
+- `goc_dependency_closure_enable=true`
+- `goc_dependency_closure_topk=12`
+- `goc_dependency_closure_hops=1`
+- `goc_dependency_closure_universe=candidates`
 
 Metric note:
 
 - Primary late-pivot headline: `e3_pivot_e3_only_accuracy`
 - Secondary strict pipeline metric: `strict_final_pivot_accuracy`
+- Diagnostic: `critical_coverage_pivot_rate`
 
-## Full bundle run (Phase 13 entrypoint)
+## Phase14 bundle run (entity_switch focus)
 
 ```bash
-python scripts/run_phase13_e2e_universe_frontier_bundle.py \
+python scripts/run_phase14_e2e_entity_switch_bundle.py \
   --dotenv .env \
   --model gpt-4.1-mini \
   --pivot_message_style transcript \
   --pivot_gold_mode respect_ticket_updated \
   --goc_enable_avoids \
-  --goc_avoids_mode applicability
-```
-
-To reproduce legacy pivot prompt behavior:
-
-```bash
-python scripts/run_phase13_e2e_universe_frontier_bundle.py \
-  --dotenv .env \
-  --model gpt-4.1-mini \
-  --pivot_message_style banner \
-  --pivot_gold_mode respect_ticket_updated \
-  --goc_enable_avoids \
-  --goc_avoids_mode applicability
-```
-
-To disable avoids filtering:
-
-```bash
-python scripts/run_phase13_e2e_universe_frontier_bundle.py \
-  --dotenv .env \
-  --model gpt-4.1-mini \
-  --pivot_message_style transcript \
-  --pivot_gold_mode respect_ticket_updated \
-  --no_goc_enable_avoids \
-  --goc_avoids_mode off
+  --goc_avoids_mode applicability \
+  --goc_applicability_seed_enable \
+  --goc_applicability_seed_topk 8 \
+  --goc_dependency_closure_enable \
+  --goc_dependency_closure_topk 12 \
+  --goc_dependency_closure_hops 1 \
+  --goc_dependency_closure_universe candidates
 ```
 
 ## Direct compare run (manual)
@@ -68,6 +63,12 @@ python -m policyops.run compare \
   --pivot_gold_mode respect_ticket_updated \
   --goc_enable_avoids \
   --goc_avoids_mode applicability \
+  --goc_applicability_seed_enable \
+  --goc_applicability_seed_topk 8 \
+  --goc_dependency_closure_enable \
+  --goc_dependency_closure_topk 12 \
+  --goc_dependency_closure_hops 1 \
+  --goc_dependency_closure_universe candidates \
   --out_dir runs/phase14_compare \
   --dotenv .env
 ```

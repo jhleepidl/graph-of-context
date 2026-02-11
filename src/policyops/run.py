@@ -968,6 +968,130 @@ def _compute_goc_avoid_clause_ids(
     return list(inapplicable), inapplicable
 
 
+def _is_unconstrained_clause(clause: Any) -> bool:
+    applies_if = getattr(clause, "applies_if", None) or {}
+    if not isinstance(applies_if, dict) or not applies_if:
+        return True
+    for values in applies_if.values():
+        if isinstance(values, list) and values:
+            return False
+    return True
+
+
+def _compute_phase14_applicability_seed_ids(
+    *,
+    candidate_clause_ids: List[str],
+    world: Any,
+    effective_context: Dict[str, Any],
+    avoid_clause_ids: List[str] | None = None,
+    top_k: int = 8,
+) -> tuple[List[str], float]:
+    """Pick top-K applicable seed clauses with stable ordering tie-breaks."""
+    ordered = _unique_strs(candidate_clause_ids)
+    avoid_set = set(_unique_strs(avoid_clause_ids or []))
+    if not ordered:
+        return [], float("nan")
+    max_k = max(0, int(top_k or 0))
+    if max_k <= 0:
+        return [], float("nan")
+
+    scored: List[tuple[float, int, str]] = []
+    for idx, cid in enumerate(ordered):
+        if cid in avoid_set:
+            continue
+        clause = world.clauses.get(cid) if world is not None else None
+        if clause is None:
+            continue
+        if not _clause_applies_to_context(clause, effective_context):
+            continue
+        score = 1.0
+        if str(getattr(clause, "kind", "") or "") == "priority":
+            score += 0.05
+        scored.append((score, idx, cid))
+
+    if not scored:
+        return [], float("nan")
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    seed_ids = [cid for _, _, cid in scored[:max_k]]
+    applicable_rate = 1.0 if seed_ids else float("nan")
+    return seed_ids, applicable_rate
+
+
+def _compute_phase14_dependency_closure_ids(
+    *,
+    seed_clause_ids: List[str],
+    unfold_candidate_ids: List[str],
+    opened_history_ids: List[str],
+    avoid_clause_ids: List[str],
+    world: Any,
+    effective_context: Dict[str, Any],
+    top_k: int,
+    hops: int,
+    universe_mode: str,
+) -> tuple[List[str], float]:
+    """Compute closure-added clause IDs under applicability/avoid constraints."""
+    seed_ids = _unique_strs(seed_clause_ids)
+    if not seed_ids:
+        return [], float("nan")
+    max_top_k = max(0, int(top_k or 0))
+    if max_top_k <= 0:
+        return [], float("nan")
+
+    mode = str(universe_mode or "candidates")
+    if mode not in {"candidates", "world", "memory_opened"}:
+        mode = "candidates"
+
+    if mode == "world":
+        clauses_map = getattr(world, "clauses", None) if world is not None else None
+        if isinstance(clauses_map, dict):
+            universe_clause_ids = list(clauses_map.keys())
+        else:
+            universe_clause_ids = list(_unique_strs(unfold_candidate_ids))
+    elif mode == "memory_opened":
+        universe_clause_ids = list(_unique_strs(opened_history_ids))
+    else:
+        universe_clause_ids = list(_unique_strs(unfold_candidate_ids))
+
+    closure_full = _expand_clause_dependency_closure(
+        seed_clause_ids=seed_ids,
+        candidate_clause_ids=list(_unique_strs(unfold_candidate_ids)),
+        world=world,
+        max_hops=max(0, int(hops or 0)),
+        universe_clause_ids=universe_clause_ids,
+    )
+    if not closure_full:
+        return [], float("nan")
+
+    selected_set = set(seed_ids)
+    avoid_set = set(_unique_strs(avoid_clause_ids))
+    closure_candidates: List[str] = []
+    for cid in closure_full:
+        if cid in selected_set or cid in avoid_set:
+            continue
+        clause = world.clauses.get(cid) if world is not None else None
+        if clause is None:
+            continue
+        applicable = _clause_applies_to_context(clause, effective_context)
+        keep = (
+            applicable
+            or str(getattr(clause, "kind", "") or "") == "priority"
+            or _is_unconstrained_clause(clause)
+        )
+        if keep:
+            closure_candidates.append(cid)
+    closure_added = closure_candidates[:max_top_k]
+    if not closure_added:
+        return [], float("nan")
+    applicable_count = 0
+    for cid in closure_added:
+        clause = world.clauses.get(cid) if world is not None else None
+        if clause is not None and _clause_applies_to_context(clause, effective_context):
+            applicable_count += 1
+    rate = float(applicable_count) / float(len(closure_added))
+    return closure_added, rate
+
+
 def _compute_pivot_compliance(
     *,
     ticket_initial: str,
@@ -2839,6 +2963,32 @@ def _evaluate_method(
         goc_unfolded_node_count: int | None = None
         goc_selected_node_ids: List[str] = []
         goc_unfolded_node_ids: List[str] = []
+        goc_applicability_seed_enable_cfg = bool(
+            getattr(args, "goc_applicability_seed_enable", False)
+        )
+        goc_applicability_seed_topk_cfg = int(
+            getattr(args, "goc_applicability_seed_topk", 8) or 0
+        )
+        goc_applicability_seed_ids: List[str] = []
+        goc_applicability_seed_used: int | None = None
+        goc_applicability_seed_applicable_rate: float | None = None
+        goc_dependency_closure_enable_cfg = bool(
+            getattr(args, "goc_dependency_closure_enable", False)
+        )
+        goc_dependency_closure_topk_cfg = int(
+            getattr(args, "goc_dependency_closure_topk", 12) or 0
+        )
+        goc_dependency_closure_hops_cfg = int(
+            getattr(args, "goc_dependency_closure_hops", 1) or 0
+        )
+        goc_dependency_closure_universe_cfg = str(
+            getattr(args, "goc_dependency_closure_universe", "candidates") or "candidates"
+        )
+        if goc_dependency_closure_universe_cfg not in {"candidates", "world", "memory_opened"}:
+            goc_dependency_closure_universe_cfg = "candidates"
+        goc_dependency_closure_added_ids: List[str] = []
+        goc_dependency_closure_added_used: int | None = None
+        goc_dependency_closure_added_applicable_rate: float | None = None
         judge_correct_full_episode: bool | None = None
         full_episode_supporting_count: int | None = None
         commit_refs = ""
@@ -3150,6 +3300,34 @@ def _evaluate_method(
                 else:
                     max_selected = int(goc_unfold_max_nodes_used) if goc_unfold_max_nodes_used > 0 else 4
 
+                goc_applicability_seed_ids = []
+                goc_applicability_seed_applicable_rate = float("nan")
+                is_phase14_pivot_e3 = bool(
+                    int(episode_id or 0) == 3 and bool(is_pivot_task)
+                )
+                if (
+                    is_phase14_pivot_e3
+                    and goc_applicability_seed_enable_cfg
+                    and goc_applicability_seed_topk_cfg > 0
+                ):
+                    seed_candidates = list(_unique_strs(unfold_candidate_ids))
+                    if not seed_candidates:
+                        seed_candidates = [
+                            cid
+                            for cid in _unique_strs(opened_history_ids)
+                            if cid not in set(_unique_strs(avoid_clause_ids))
+                        ]
+                    goc_applicability_seed_ids, goc_applicability_seed_applicable_rate = (
+                        _compute_phase14_applicability_seed_ids(
+                            candidate_clause_ids=seed_candidates,
+                            world=world,
+                            effective_context=goc_effective_context,
+                            avoid_clause_ids=avoid_clause_ids,
+                            top_k=goc_applicability_seed_topk_cfg,
+                        )
+                    )
+                goc_applicability_seed_used = int(len(goc_applicability_seed_ids))
+
                 context_clause_ids, reason_map, goc_selection_debug = _select_goc_unfold_clause_ids(
                     unfold_candidate_ids,
                     selection_commit_clause_ids,
@@ -3164,6 +3342,53 @@ def _evaluate_method(
                     avoid_clause_ids=avoid_clause_ids,
                     include_debug=include_activity_debug,
                 )
+                if goc_applicability_seed_ids:
+                    merged = _unique_strs(list(goc_applicability_seed_ids) + list(context_clause_ids))
+                    context_clause_ids = merged[:max_selected]
+                    for cid in goc_applicability_seed_ids:
+                        reason_map.setdefault(cid, [])
+                        if "applicability_seed" not in reason_map[cid]:
+                            reason_map[cid].append("applicability_seed")
+
+                goc_dependency_closure_added_ids = []
+                goc_dependency_closure_added_applicable_rate = float("nan")
+                if (
+                    is_phase14_pivot_e3
+                    and goc_dependency_closure_enable_cfg
+                    and goc_dependency_closure_topk_cfg > 0
+                ):
+                    closure_added_ids, closure_added_rate = _compute_phase14_dependency_closure_ids(
+                        seed_clause_ids=context_clause_ids,
+                        unfold_candidate_ids=unfold_candidate_ids,
+                        opened_history_ids=opened_history_ids,
+                        avoid_clause_ids=avoid_clause_ids,
+                        world=world,
+                        effective_context=goc_effective_context,
+                        top_k=goc_dependency_closure_topk_cfg,
+                        hops=goc_dependency_closure_hops_cfg,
+                        universe_mode=goc_dependency_closure_universe_cfg,
+                    )
+                    if closure_added_ids:
+                        base_ids = list(_unique_strs(context_clause_ids))
+                        merged = _unique_strs(base_ids + closure_added_ids)
+                        if len(merged) > max_selected:
+                            merged = merged[:max_selected]
+                        base_set = set(base_ids)
+                        goc_dependency_closure_added_ids = [
+                            cid for cid in merged if cid not in base_set
+                        ]
+                        context_clause_ids = merged
+                    goc_dependency_closure_added_applicable_rate = closure_added_rate
+                goc_dependency_closure_added_used = int(len(goc_dependency_closure_added_ids))
+
+                if include_activity_debug:
+                    goc_selection_debug = dict(goc_selection_debug or {})
+                    goc_selection_debug["phase14_applicability_seed_ids"] = list(
+                        goc_applicability_seed_ids
+                    )
+                    goc_selection_debug["phase14_dependency_closure_added_ids"] = list(
+                        goc_dependency_closure_added_ids
+                    )
                 goc_closure_candidate_count = int(len(unfold_candidate_ids))
                 # closure candidates (after hop expansion) vs unfolded nodes (actually opened/used)
                 goc_unfolded_node_count = int(len(context_clause_ids))
@@ -3293,6 +3518,8 @@ def _evaluate_method(
                             "closure_clause_ids": dep_nodes,
                             "unfolded_clause_ids": list(context_clause_ids),
                             "anchor_clause_ids": list(anchor_ids or []),
+                            "applicability_seed_clause_ids": list(goc_applicability_seed_ids or []),
+                            "dependency_closure_added_clause_ids": list(goc_dependency_closure_added_ids or []),
                             "depends_edge_pairs": int(dep_edge_pairs),
                             "ctx_dep_edge_pairs": int(ctx_dep_pairs),
                             "override_edge_pairs": int(override_pairs),
@@ -3574,6 +3801,18 @@ def _evaluate_method(
                 "goc_avoid_target_clause_ids": list(goc_avoid_target_clause_ids),
                 "goc_avoided_node_injected": goc_avoided_node_injected,
                 "goc_inapplicable_clause_ids": list(goc_inapplicable_clause_ids),
+                "goc_applicability_seed_enable": bool(goc_applicability_seed_enable_cfg),
+                "goc_applicability_seed_topk": int(goc_applicability_seed_topk_cfg),
+                "goc_applicability_seed_ids": list(goc_applicability_seed_ids),
+                "goc_applicability_seed_used": goc_applicability_seed_used,
+                "goc_applicability_seed_applicable_rate": goc_applicability_seed_applicable_rate,
+                "goc_dependency_closure_enable": bool(goc_dependency_closure_enable_cfg),
+                "goc_dependency_closure_topk": int(goc_dependency_closure_topk_cfg),
+                "goc_dependency_closure_hops": int(goc_dependency_closure_hops_cfg),
+                "goc_dependency_closure_universe": str(goc_dependency_closure_universe_cfg),
+                "goc_dependency_closure_added_ids": list(goc_dependency_closure_added_ids),
+                "goc_dependency_closure_added_used": goc_dependency_closure_added_used,
+                "goc_dependency_closure_added_applicable_rate": goc_dependency_closure_added_applicable_rate,
                 "goc_effective_context": dict(goc_effective_context),
                 "goc_initial_context": dict(goc_initial_context),
                 "pivot_override_keys": list(pivot_override_keys),
@@ -4583,6 +4822,18 @@ def _evaluate_method(
             "goc_avoid_target_clause_ids": list(goc_avoid_target_clause_ids),
             "goc_avoided_node_injected": goc_avoided_node_injected,
             "goc_inapplicable_clause_ids": list(goc_inapplicable_clause_ids),
+            "goc_applicability_seed_enable": bool(goc_applicability_seed_enable_cfg),
+            "goc_applicability_seed_topk": int(goc_applicability_seed_topk_cfg),
+            "goc_applicability_seed_ids": list(goc_applicability_seed_ids),
+            "goc_applicability_seed_used": goc_applicability_seed_used,
+            "goc_applicability_seed_applicable_rate": goc_applicability_seed_applicable_rate,
+            "goc_dependency_closure_enable": bool(goc_dependency_closure_enable_cfg),
+            "goc_dependency_closure_topk": int(goc_dependency_closure_topk_cfg),
+            "goc_dependency_closure_hops": int(goc_dependency_closure_hops_cfg),
+            "goc_dependency_closure_universe": str(goc_dependency_closure_universe_cfg),
+            "goc_dependency_closure_added_ids": list(goc_dependency_closure_added_ids),
+            "goc_dependency_closure_added_used": goc_dependency_closure_added_used,
+            "goc_dependency_closure_added_applicable_rate": goc_dependency_closure_added_applicable_rate,
             "goc_effective_context": dict(goc_effective_context),
             "goc_initial_context": dict(goc_initial_context),
             "pivot_override_keys": list(pivot_override_keys),
@@ -6326,6 +6577,9 @@ def _evaluate_method(
     return report
 
 def cmd_generate(args: argparse.Namespace) -> None:
+    if _is_traceops_benchmark(args):
+        _cmd_generate_traceops(args)
+        return
     _normalize_scenario_mode_arg(args)
     _apply_preset(args)
     _apply_generation_defaults(args)
@@ -6389,6 +6643,9 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
+    if _is_traceops_benchmark(args):
+        _cmd_eval_traceops(args)
+        return
     _normalize_scenario_mode_arg(args)
     base_dir = args.out_dir or _default_base_dir()
     world_dir = Path(base_dir) / "data" / "worlds"
@@ -6517,6 +6774,9 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
+    if _is_traceops_benchmark(args):
+        _cmd_compare_traceops(args)
+        return
     _normalize_scenario_mode_arg(args)
     if getattr(args, "thread_context_budget_sweep", ""):
         sweep_values = [
@@ -7098,6 +7358,25 @@ def cmd_compare(args: argparse.Namespace) -> None:
         ),
         "goc_enable_avoids": bool(getattr(args, "goc_enable_avoids", True)),
         "goc_avoids_mode": _resolve_goc_avoids_mode(args),
+        "goc_applicability_seed_enable": bool(
+            getattr(args, "goc_applicability_seed_enable", False)
+        ),
+        "goc_applicability_seed_topk": int(
+            getattr(args, "goc_applicability_seed_topk", 8) or 0
+        ),
+        "goc_dependency_closure_enable": bool(
+            getattr(args, "goc_dependency_closure_enable", False)
+        ),
+        "goc_dependency_closure_topk": int(
+            getattr(args, "goc_dependency_closure_topk", 12) or 0
+        ),
+        "goc_dependency_closure_hops": int(
+            getattr(args, "goc_dependency_closure_hops", 1) or 0
+        ),
+        "goc_dependency_closure_universe": str(
+            getattr(args, "goc_dependency_closure_universe", "candidates")
+            or "candidates"
+        ),
         "e3_clause_jitter_max_chars": world.meta.get("e3_clause_jitter_max_chars"),
         "e3_clause_jitter_max_chars_critical": world.meta.get("e3_clause_jitter_max_chars_critical"),
         "e3_clause_jitter_max_chars_noncritical": world.meta.get("e3_clause_jitter_max_chars_noncritical"),
@@ -7138,6 +7417,25 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "goc_unfold_hops": int(getattr(args, "goc_unfold_hops", 0) or 0),
         "goc_unfold_budget_mode": str(
             getattr(args, "goc_unfold_budget_mode", "nodes_and_hops") or "nodes_and_hops"
+        ),
+        "goc_applicability_seed_enable": bool(
+            getattr(args, "goc_applicability_seed_enable", False)
+        ),
+        "goc_applicability_seed_topk": int(
+            getattr(args, "goc_applicability_seed_topk", 8) or 0
+        ),
+        "goc_dependency_closure_enable": bool(
+            getattr(args, "goc_dependency_closure_enable", False)
+        ),
+        "goc_dependency_closure_topk": int(
+            getattr(args, "goc_dependency_closure_topk", 12) or 0
+        ),
+        "goc_dependency_closure_hops": int(
+            getattr(args, "goc_dependency_closure_hops", 1) or 0
+        ),
+        "goc_dependency_closure_universe": str(
+            getattr(args, "goc_dependency_closure_universe", "candidates")
+            or "candidates"
         ),
         "controller_enabled": bool(controller),
         "controller_mode": controller_mode,
@@ -7545,6 +7843,136 @@ def _run_compare_with_tasks(
     return compare_report
 
 
+def _is_traceops_benchmark(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "benchmark", "policyops_v0") or "policyops_v0") == "traceops_v0"
+
+
+def _parse_traceops_scenarios_arg(raw: Any) -> List[str]:
+    parts = [str(x).strip() for x in str(raw or "mixed").split(",")]
+    out = [p for p in parts if p]
+    return out or ["mixed"]
+
+
+def _cmd_generate_traceops(args: argparse.Namespace) -> None:
+    from .traceops_v0.generator import generate_traceops_threads, save_traceops_dataset
+
+    base_dir = Path(args.out_dir) if args.out_dir else _default_base_dir()
+    scenarios = _parse_traceops_scenarios_arg(getattr(args, "traceops_scenarios", "mixed"))
+    threads, meta = generate_traceops_threads(
+        level=int(getattr(args, "traceops_level", 1) or 1),
+        scenarios=scenarios,
+        seed=int(getattr(args, "traceops_seed", getattr(args, "seed", 0)) or 0),
+        threads=int(getattr(args, "traceops_threads", getattr(args, "n_tasks", 1)) or 1),
+        trace_len=(
+            int(getattr(args, "traceops_trace_len", 0) or 0)
+            if int(getattr(args, "traceops_trace_len", 0) or 0) > 0
+            else None
+        ),
+        delay_to_relevance=(
+            int(getattr(args, "traceops_delay_to_relevance", 0) or 0)
+            if int(getattr(args, "traceops_delay_to_relevance", 0) or 0) > 0
+            else None
+        ),
+        distractor_branching=int(getattr(args, "traceops_distractor_branching", 2) or 2),
+        contradiction_rate=float(getattr(args, "traceops_contradiction_rate", 0.35) or 0.35),
+        exception_density=float(getattr(args, "traceops_exception_density", 0.35) or 0.35),
+        state_flip_count=int(getattr(args, "traceops_state_flip_count", 1) or 1),
+    )
+    data_dir = save_traceops_dataset(base_dir, threads, meta)
+    total_steps = sum(len(t.steps) for t in threads)
+    print(
+        f"Generated TraceOps v0 data. threads={len(threads)} steps={total_steps} data_dir={data_dir}",
+        flush=True,
+    )
+
+
+def _cmd_eval_traceops(args: argparse.Namespace) -> None:
+    from .traceops_v0.evaluator import evaluate_traceops_method
+    from .traceops_v0.generator import load_traceops_dataset
+
+    base_dir = Path(args.out_dir) if args.out_dir else _default_base_dir()
+    threads, meta = load_traceops_dataset(base_dir)
+    if getattr(args, "n_threads", None):
+        threads = list(threads[: max(1, int(args.n_threads))])
+    method = str(getattr(args, "method", "goc") or "goc")
+    run_dir = base_dir / "runs" / method
+    run_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    report = evaluate_traceops_method(method, threads, args=args)
+    payload = {
+        "benchmark": "traceops_v0",
+        "method": method,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": timestamp,
+        "model": getattr(args, "model", ""),
+        "scenario_params": dict(meta),
+        "metrics": dict(report.get("metrics") or {}),
+        "records": list(report.get("records") or []),
+        "thread_records": list(report.get("thread_records") or []),
+    }
+    out_path = run_dir / f"{timestamp}.json"
+    save_report(out_path, payload)
+    print("TraceOps evaluation complete.")
+    print(f"Report saved to {out_path}")
+
+
+def _cmd_compare_traceops(args: argparse.Namespace) -> None:
+    from .traceops_v0.evaluator import evaluate_traceops_method
+    from .traceops_v0.generator import load_traceops_dataset
+
+    base_dir = Path(args.out_dir) if args.out_dir else _default_base_dir()
+    threads, meta = load_traceops_dataset(base_dir)
+    if getattr(args, "n_threads", None):
+        threads = list(threads[: max(1, int(args.n_threads))])
+
+    methods = list(getattr(args, "methods", None) or ["full", "similarity_only", "agent_fold", "goc"])
+    compare_dir = base_dir / "runs" / "compare"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    compare_run_dir = compare_dir / timestamp
+    compare_run_dir.mkdir(parents=True, exist_ok=True)
+
+    method_reports: Dict[str, Any] = {}
+    summary: Dict[str, Any] = {}
+    for method in methods:
+        method_dir = compare_run_dir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
+        report = evaluate_traceops_method(method, threads, args=args)
+        method_reports[method] = report
+        metrics = dict(report.get("metrics") or {})
+        summary[method] = {
+            "pivot_decision_accuracy": metrics.get("pivot_decision_accuracy"),
+            "pivot_e3_only_accuracy": metrics.get("pivot_e3_only_accuracy"),
+            "strict_pivot_accuracy": metrics.get("strict_pivot_accuracy"),
+            "tokens_pivot_mean": metrics.get("tokens_pivot_mean"),
+            "tokens_total_mean": metrics.get("tokens_total_mean"),
+            "mean_avoid_targets_per_pivot": metrics.get("mean_avoid_targets_per_pivot"),
+            "avoided_injected_rate": metrics.get("avoided_injected_rate"),
+            "revive_success_rate": metrics.get("revive_success_rate"),
+            "decision_accuracy": metrics.get("decision_accuracy"),
+            "judge_accuracy": metrics.get("judge_accuracy"),
+        }
+
+    compare_report = {
+        "benchmark": "traceops_v0",
+        "methods": methods,
+        "model": getattr(args, "model", ""),
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": timestamp,
+        "invoked_cmdline": " ".join(sys.argv),
+        "judge": getattr(args, "judge", "symbolic"),
+        "scenario_params": {
+            **dict(meta),
+            "traceops_max_steps": int(getattr(args, "traceops_max_steps", 0) or 0),
+        },
+        "summary": summary,
+        "method_reports": method_reports,
+    }
+    out_path = compare_dir / f"{timestamp}.json"
+    save_report(out_path, compare_report)
+    print("TraceOps compare complete.")
+    print(f"Report saved to {out_path}")
+
 def cmd_sweep(args: argparse.Namespace) -> None:
     _normalize_scenario_mode_arg(args)
     _apply_preset(args)
@@ -7871,6 +8299,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     gen = sub.add_parser("generate", help="Generate synthetic world and tasks")
+    gen.add_argument(
+        "--benchmark",
+        choices=["policyops_v0", "traceops_v0"],
+        default="policyops_v0",
+    )
     gen.add_argument("--preset", choices=list(PRESET_CONFIGS.keys()), default=None)
     gen.add_argument("--seed", type=int, default=0)
     gen.add_argument("--n_docs", type=int, default=None)
@@ -7955,9 +8388,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="retention_flip",
     )
     gen.add_argument("--out_dir", type=Path, default=None)
+    gen.add_argument("--traceops_level", type=int, default=1)
+    gen.add_argument("--traceops_scenarios", type=str, default="mixed")
+    gen.add_argument("--traceops_seed", type=int, default=0)
+    gen.add_argument("--traceops_threads", type=int, default=32)
+    gen.add_argument("--traceops_trace_len", type=int, default=0)
+    gen.add_argument("--traceops_delay_to_relevance", type=int, default=0)
+    gen.add_argument("--traceops_distractor_branching", type=int, default=2)
+    gen.add_argument("--traceops_contradiction_rate", type=float, default=0.35)
+    gen.add_argument("--traceops_exception_density", type=float, default=0.35)
+    gen.add_argument("--traceops_state_flip_count", type=int, default=1)
     gen.set_defaults(func=cmd_generate)
 
     ev = sub.add_parser("eval", help="Evaluate baselines")
+    ev.add_argument(
+        "--benchmark",
+        choices=["policyops_v0", "traceops_v0"],
+        default="policyops_v0",
+    )
     ev.add_argument(
         "--method",
         choices=["topk", "full", "full_history", "goc", "goc_base", "oracle", "engine", "similarity_only", "agent_fold"],
@@ -8082,9 +8530,15 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--task_split", choices=["none", "holdout"], default="none")
     ev.add_argument("--train_ratio", type=float, default=0.7)
     ev.add_argument("--split_seed", type=int, default=0)
+    ev.add_argument("--traceops_max_steps", type=int, default=0)
     ev.set_defaults(func=cmd_eval)
 
     cmp = sub.add_parser("compare", help="Compare methods in one run")
+    cmp.add_argument(
+        "--benchmark",
+        choices=["policyops_v0", "traceops_v0"],
+        default="policyops_v0",
+    )
     cmp.add_argument("--methods", nargs="+", default=["topk", "full", "goc", "oracle", "engine"])
     cmp.add_argument("--model", type=str, default="gpt-4.1-mini")
     cmp.add_argument("--llm", choices=["dummy", "openai"], default="openai")
@@ -8258,6 +8712,42 @@ def build_parser() -> argparse.ArgumentParser:
             "When unset, default behavior is applicability via --goc_enable_avoids alias."
         ),
     )
+    cmp.add_argument(
+        "--goc_applicability_seed_enable",
+        action="store_true",
+        default=False,
+        help="Enable Phase14 applicability seeding for E3 pivot GoC selection.",
+    )
+    cmp.add_argument(
+        "--goc_applicability_seed_topk",
+        type=int,
+        default=8,
+        help="Top-K applicable clauses used as pre-seeds for E3 GoC selection.",
+    )
+    cmp.add_argument(
+        "--goc_dependency_closure_enable",
+        action="store_true",
+        default=False,
+        help="Enable budgeted dependency closure add-on after GoC E3 clause selection.",
+    )
+    cmp.add_argument(
+        "--goc_dependency_closure_topk",
+        type=int,
+        default=12,
+        help="Maximum number of closure-added clause IDs in E3 GoC selection.",
+    )
+    cmp.add_argument(
+        "--goc_dependency_closure_hops",
+        type=int,
+        default=1,
+        help="Hop depth for dependency closure add-on in E3 GoC selection.",
+    )
+    cmp.add_argument(
+        "--goc_dependency_closure_universe",
+        choices=["candidates", "world", "memory_opened"],
+        default="candidates",
+        help="Universe used for dependency closure expansion in E3 GoC selection.",
+    )
     cmp.add_argument("--thread_context_budget_chars", type=int, default=8000)
     cmp.add_argument("--thread_open_policy", choices=["current", "shared_topk"], default="current")
     cmp.add_argument("--thread_context_budget_sweep", type=str, default="")
@@ -8348,6 +8838,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--debug_n", type=int, default=0)
     cmp.add_argument("--debug_task_ids", type=str, default="")
     cmp.add_argument("--n_threads", type=int, default=None)
+    cmp.add_argument("--traceops_max_steps", type=int, default=0)
     cmp.add_argument("--parallel_workers", type=int, default=1)
     cmp.set_defaults(func=cmd_compare)
 

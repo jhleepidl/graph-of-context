@@ -238,6 +238,19 @@ def _inapplicable_injected_rate_pivot(task_recs: List[Dict[str, Any]]) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
+def _pivot_episode3_numeric_mean(task_recs: List[Dict[str, Any]], key: str) -> float:
+    vals: List[float] = []
+    for r in task_recs:
+        if int(r.get("episode_id") or 0) != 3:
+            continue
+        if not bool(r.get("is_pivot_task")):
+            continue
+        value = r.get(key)
+        if isinstance(value, (int, float)):
+            vals.append(float(value))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def _frontier_first_seen_rate_from_graph(graph_jsonl: Path) -> Optional[float]:
     """Best-effort: fraction of *doc nodes* whose first_seen_stage == 'graph_frontier'.
 
@@ -427,6 +440,16 @@ def main() -> None:
             inapplicable_injected_rate_pivot = _inapplicable_injected_rate_pivot(task_recs)
             e3_evidence_valid_in_context_rate = _e3_bool_rate(task_recs, "e3_evidence_valid_in_context")
             e3_evidence_valid_in_commits_rate = _e3_bool_rate(task_recs, "e3_evidence_valid_in_commits")
+            mean_seed_size = _pivot_episode3_numeric_mean(task_recs, "goc_applicability_seed_used")
+            mean_closure_added_size = _pivot_episode3_numeric_mean(
+                task_recs, "goc_dependency_closure_added_used"
+            )
+            seed_applicable_rate_mean = _pivot_episode3_numeric_mean(
+                task_recs, "goc_applicability_seed_applicable_rate"
+            )
+            closure_applicable_rate_mean = _pivot_episode3_numeric_mean(
+                task_recs, "goc_dependency_closure_added_applicable_rate"
+            )
 
             # Frontier graph attribution (best-effort, GoC only)
             frontier_rates: List[float] = []
@@ -504,6 +527,10 @@ def main() -> None:
                     "inapplicable_injected_rate_pivot": inapplicable_injected_rate_pivot,
                     "e3_evidence_valid_in_context_rate": e3_evidence_valid_in_context_rate,
                     "e3_evidence_valid_in_commits_rate": e3_evidence_valid_in_commits_rate,
+                    "mean_seed_size": mean_seed_size,
+                    "mean_closure_added_size": mean_closure_added_size,
+                    "seed_applicable_rate_mean": seed_applicable_rate_mean,
+                    "closure_applicable_rate_mean": closure_applicable_rate_mean,
                     "frontier_first_seen_rate": frontier_first_seen_rate,
                 }
             )
@@ -523,6 +550,8 @@ def main() -> None:
     md_lines.append("- stale_evidence_pivot_rate (pivot robustness)\n")
     md_lines.append("- avoided_node_injected_rate (pivot avoids integrity)\n")
     md_lines.append("- critical_coverage_pivot_rate, inapplicable_injected_rate_pivot (dependency quality)\n")
+    md_lines.append("- mean_seed_size / mean_closure_added_size (Phase14 selection diagnostics)\n")
+    md_lines.append("- seed_applicable_rate_mean / closure_applicable_rate_mean (Phase14 applicability diagnostics)\n")
     md_lines.append("- e3_evidence_valid_in_context_rate / e3_evidence_valid_in_commits_rate\n")
     md_lines.append("- e1/e2/e3 decision accuracies + pivot/nonpivot E3 split\n")
     md_lines.append("- e3_pivot_e3_only_accuracy (headline) + strict_final_pivot_accuracy (strict pipeline metric)\n")
@@ -558,6 +587,10 @@ def main() -> None:
         "avoided_node_injected_rate",
         "critical_coverage_pivot_rate",
         "inapplicable_injected_rate_pivot",
+        "mean_seed_size",
+        "mean_closure_added_size",
+        "seed_applicable_rate_mean",
+        "closure_applicable_rate_mean",
         "e3_evidence_valid_in_context_rate",
         "e3_evidence_valid_in_commits_rate",
         "frontier_first_seen_rate",
