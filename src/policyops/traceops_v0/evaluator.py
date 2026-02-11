@@ -44,21 +44,45 @@ def _build_traceops_llm_prompt(
     thread: TraceThread,
     context_ids: Sequence[str],
 ) -> str:
+    allowed_ids = _unique_strs(list(context_ids))
+    allowed_conditions: List[str] = ["apply_latest_update"]
+    state = step.state if isinstance(step.state, dict) else {}
+    for key, value in state.items():
+        k = str(key).strip()
+        v = str(value).strip()
+        if not k or not v:
+            continue
+        allowed_conditions.append(f"{k}={v}")
+    for cid in allowed_ids:
+        clause = thread.clauses.get(cid)
+        if clause is None:
+            continue
+        if str(clause.node_type or "") == "EXCEPTION":
+            allowed_conditions.append(f"exception={cid}")
+    allowed_conditions = _unique_strs(allowed_conditions)
+
     lines: List[str] = []
-    lines.append(
-        "Use ONLY the provided CONTEXT. Output STRICT JSON only."
-    )
+    lines.append("Use ONLY the provided CONTEXT. Output STRICT JSON only.")
     lines.append(
         'JSON schema: {"decision":"allow|deny|require_condition|needs_more_info","conditions":["<condition_string>"],"evidence":["<clause_id>"]}'
     )
     lines.append("You MUST choose one of the 4 decision labels exactly as written.")
+    lines.append(
+        "For conditions: choose strings ONLY from ALLOWED_CONDITIONS (copy exact); no free-form text."
+    )
     lines.append("Return only a JSON object; no markdown, no explanations.")
     lines.append("")
     lines.append(f"Pivot question: {step.message}")
     lines.append("")
     lines.append("Allowed evidence clause IDs:")
-    allowed_ids = _unique_strs(list(context_ids))
     lines.append(", ".join(allowed_ids) if allowed_ids else "(none)")
+    lines.append("")
+    lines.append("ALLOWED_CONDITIONS:")
+    if allowed_conditions:
+        for cond in allowed_conditions:
+            lines.append(f"- {cond}")
+    else:
+        lines.append("- (none)")
     lines.append("")
     lines.append("CONTEXT:")
     for cid in allowed_ids:
@@ -120,7 +144,8 @@ def _parse_llm_json(text: str) -> Dict[str, Any]:
     if decision not in {"allow", "deny", "require_condition", "needs_more_info"}:
         decision = "needs_more_info"
     conditions_raw = parsed.get("conditions")
-    conditions = _unique_strs(list(conditions_raw) if isinstance(conditions_raw, list) else [])
+    conditions_items = list(conditions_raw) if isinstance(conditions_raw, list) else []
+    conditions = _unique_strs([str(item).strip() for item in conditions_items])
     evidence_raw = parsed.get("evidence")
     evidence = _unique_strs(list(evidence_raw) if isinstance(evidence_raw, list) else [])
     return {
@@ -443,7 +468,12 @@ def _score_step(
     decision_correct_family = bool(pred_decision == gold_decision_family)
     decision_correct = decision_correct_family if str(eval_mode) == "llm" else decision_correct_exact
     gold_conditions = _unique_strs(gold.conditions)
-    conditions_correct = bool(set(pred_conditions) == set(gold_conditions))
+    conditions_correct_exact = bool(set(pred_conditions) == set(gold_conditions))
+    conditions_correct_subset = bool(set(gold_conditions).issubset(set(pred_conditions)))
+    if str(eval_mode) == "llm":
+        conditions_correct = conditions_correct_subset
+    else:
+        conditions_correct = conditions_correct_exact
     answer_correct = bool(decision_correct and conditions_correct)
     evidence_valid_in_context = bool(all(cid in context_set for cid in pred_evidence))
     critical_coverage = (
@@ -471,6 +501,8 @@ def _score_step(
         "decision_correct_exact": decision_correct_exact,
         "decision_correct_family": decision_correct_family,
         "conditions_correct": conditions_correct,
+        "conditions_correct_exact": conditions_correct_exact,
+        "conditions_correct_subset": conditions_correct_subset,
         "answer_correct": answer_correct,
         "evidence_valid_in_context": evidence_valid_in_context,
         "critical_coverage": critical_coverage,
@@ -647,6 +679,8 @@ def evaluate_traceops_method(
                 "decision_correct_exact": bool(score.get("decision_correct_exact", False)),
                 "decision_correct_family": bool(score.get("decision_correct_family", False)),
                 "conditions_correct": bool(score.get("conditions_correct", False)),
+                "conditions_correct_exact": bool(score.get("conditions_correct_exact", False)),
+                "conditions_correct_subset": bool(score.get("conditions_correct_subset", False)),
                 "e3_answer_correct": bool(score.get("answer_correct", False)),
                 "e3_evidence_valid_in_context": bool(score.get("evidence_valid_in_context", False)),
                 "critical_coverage_e3": score.get("critical_coverage"),

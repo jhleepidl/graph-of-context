@@ -409,16 +409,6 @@ def main() -> None:
 
     (phase15_root / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    analyze_cmd = [
-        sys.executable,
-        str(repo_root / "scripts" / "analyze_phase15_traceops.py"),
-        "--phase15_root",
-        str(phase15_root),
-        "--out_dir",
-        str(analysis_root),
-    ]
-    _run(analyze_cmd, cwd=repo_root, env=env)
-
     idx_lines = [
         f"# Phase15 TraceOps bundle: {bundle_name}",
         "",
@@ -442,6 +432,17 @@ def main() -> None:
     (bundle_root / "INDEX.md").write_text("\n".join(idx_lines) + "\n", encoding="utf-8")
 
     quick_dirs = build_bundle_quick_access(bundle_root)
+
+    analyze_cmd = [
+        sys.executable,
+        str(repo_root / "scripts" / "analyze_phase15_traceops.py"),
+        "--phase15_root",
+        str(phase15_root),
+        "--out_dir",
+        str(analysis_root),
+    ]
+    _run(analyze_cmd, cwd=repo_root, env=env)
+
     for qd in quick_dirs:
         print(f"Quick access: {qd}")
 

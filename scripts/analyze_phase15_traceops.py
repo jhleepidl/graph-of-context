@@ -34,6 +34,26 @@ def _load_threads_by_scenario(phase15_root: Path, scenario: str) -> Dict[str, An
     return out
 
 
+def _resolve_report_path(phase15_root: Path, run: Dict[str, Any]) -> Path | None:
+    scenario = str(run.get("traceops_scenario") or "").strip()
+    variant = str(run.get("variant") or "").strip()
+    if scenario and variant:
+        quick_report = (
+            phase15_root
+            / "quick_access"
+            / "reports"
+            / f"{scenario}__{variant}.json"
+        )
+        if quick_report.exists():
+            return quick_report
+    report_rel = str(run.get("report_json", "") or "").strip()
+    if report_rel:
+        fallback = phase15_root / Path(report_rel)
+        if fallback.exists():
+            return fallback
+    return None
+
+
 def _gold_decision_family(gold_decision: str) -> str:
     decision = str(gold_decision or "")
     if decision == "allow":
@@ -116,8 +136,8 @@ def main() -> None:
 
     rows: List[Dict[str, Any]] = []
     for run in runs:
-        report_path = phase15_root / Path(str(run.get("report_json", "")))
-        if not report_path.exists():
+        report_path = _resolve_report_path(phase15_root, run)
+        if report_path is None or not report_path.exists():
             continue
         report = _load_json(report_path)
         method_reports = report.get("method_reports") or {}
