@@ -1256,6 +1256,15 @@ def evaluate_traceops_method(
                 exception_injected_ids.append(str(cid))
                 if _clause_applicable(clause, step.state):
                     exception_applicable_count += 1
+            step_meta = dict(step.metadata or {})
+            hidden_core_ids = _unique_strs(step_meta.get("hidden_core_ids") or [])
+            hidden_core_parent_ids = _unique_strs(step_meta.get("hidden_core_parent_ids") or [])
+            raw_flip_count = step_meta.get("core_necessity_flip_count")
+            core_necessity_flip_count = (
+                int(raw_flip_count)
+                if isinstance(raw_flip_count, (int, float))
+                else float("nan")
+            )
 
             rec = {
                 "task_id": f"{thread.thread_id}:{step.step_id}",
@@ -1393,6 +1402,13 @@ def evaluate_traceops_method(
                 "core_size": int(step.metadata.get("core_size", len(step.pivot_required_ids)) or 0),
                 "pivot_style": str(step.metadata.get("pivot_style", "")),
                 "trap_distractor_ids": list(_unique_strs(step.metadata.get("trap_distractor_ids") or [])),
+                "core_necessity_flip_count": core_necessity_flip_count,
+                "core_necessity_all_required": bool(step_meta.get("core_necessity_all_required", False)),
+                "core_necessity_failed": bool(step_meta.get("core_necessity_failed", False)),
+                "trap_decision_label": str(step_meta.get("trap_decision_label", "") or ""),
+                "trap_decision_flip": bool(step_meta.get("trap_decision_flip", False)),
+                "hidden_core_ids": list(hidden_core_ids),
+                "hidden_core_parent_ids": list(hidden_core_parent_ids),
             }
             records.append(rec)
             pivot_step_records.append(rec)
@@ -1469,6 +1485,42 @@ def evaluate_traceops_method(
     ]
     core_size_vals = [float(int(r.get("core_size", 0) or 0)) for r in pivot_records]
     trap_present_vals = [1.0 if bool(r.get("trap_present", False)) else 0.0 for r in pivot_records]
+    core_need_all_required_vals = [
+        1.0 if bool(r.get("core_necessity_all_required", False)) else 0.0 for r in pivot_records
+    ]
+    core_need_failed_vals = [1.0 if bool(r.get("core_necessity_failed", False)) else 0.0 for r in pivot_records]
+    core_need_flip_vals = [
+        float(r.get("core_necessity_flip_count"))
+        for r in pivot_records
+        if isinstance(r.get("core_necessity_flip_count"), (int, float))
+        and math.isfinite(float(r.get("core_necessity_flip_count")))
+    ]
+    trap_decision_flip_vals = [1.0 if bool(r.get("trap_decision_flip", False)) else 0.0 for r in pivot_records]
+    hidden_core_present_vals = [
+        1.0 if len(list(r.get("hidden_core_ids") or [])) > 0 else 0.0 for r in pivot_records
+    ]
+
+    method_name = str(method or "")
+    depwalk_enabled = bool(getattr(args, "goc_depwalk_enable", False))
+    hidden_pivot_records = [
+        r for r in pivot_records if len(list(r.get("hidden_core_ids") or [])) > 0
+    ]
+    hidden_core_rescued_by_depwalk_rate = float("nan")
+    hidden_core_missing_without_depwalk_rate = float("nan")
+    if method_name == "goc" and depwalk_enabled:
+        rescued_vals = []
+        for rec in hidden_pivot_records:
+            hidden_set = {str(cid) for cid in (rec.get("hidden_core_ids") or []) if str(cid).strip()}
+            depwalk_set = {str(cid) for cid in (rec.get("goc_depwalk_added_ids") or []) if str(cid).strip()}
+            rescued_vals.append(1.0 if bool(hidden_set & depwalk_set) else 0.0)
+        hidden_core_rescued_by_depwalk_rate = _mean(rescued_vals)
+    elif method_name == "goc" and not depwalk_enabled:
+        missing_vals = []
+        for rec in hidden_pivot_records:
+            hidden_set = {str(cid) for cid in (rec.get("hidden_core_ids") or []) if str(cid).strip()}
+            context_set = {str(cid) for cid in (rec.get("e3_context_clause_ids") or []) if str(cid).strip()}
+            missing_vals.append(1.0 if bool(hidden_set - context_set) else 0.0)
+        hidden_core_missing_without_depwalk_rate = _mean(missing_vals)
 
     tokens_pivot_mean_est = _mean(pivot_tokens_est)
     tokens_total_mean_est = _mean(total_tokens_by_thread_est)
@@ -1498,6 +1550,13 @@ def evaluate_traceops_method(
         "mean_trap_gap": _mean(trap_gap_vals),
         "trap_present_rate": _mean(trap_present_vals),
         "mean_core_size": _mean(core_size_vals),
+        "core_necessity_all_required_rate": _mean(core_need_all_required_vals),
+        "mean_core_necessity_flip_count": _mean(core_need_flip_vals),
+        "core_necessity_failed_rate": _mean(core_need_failed_vals),
+        "trap_decision_flip_rate": _mean(trap_decision_flip_vals),
+        "hidden_core_present_rate": _mean(hidden_core_present_vals),
+        "hidden_core_rescued_by_depwalk_rate": hidden_core_rescued_by_depwalk_rate,
+        "hidden_core_missing_without_depwalk_rate": hidden_core_missing_without_depwalk_rate,
         "pivot_records": int(len(pivot_records)),
         "thread_records": int(len(thread_records)),
         "pivots_available_total": int(pivots_available_total),

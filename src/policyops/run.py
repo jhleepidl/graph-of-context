@@ -7884,6 +7884,14 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
         core_size_max=int(getattr(args, "traceops_core_size_max", 4) or 4),
         alias_chain_len=int(getattr(args, "traceops_alias_chain_len", 2) or 2),
         indirect_pivot_style=str(getattr(args, "traceops_indirect_pivot_style", "blended") or "blended"),
+        core_necessity_enable=bool(getattr(args, "traceops_core_necessity_enable", False)),
+        core_necessity_require_all=bool(getattr(args, "traceops_core_necessity_require_all", True)),
+        trap_decision_flip_enable=bool(getattr(args, "traceops_trap_decision_flip_enable", False)),
+        hidden_core_enable=bool(getattr(args, "traceops_hidden_core_enable", False)),
+        hidden_core_kind=str(getattr(args, "traceops_hidden_core_kind", "low_overlap_clause") or "low_overlap_clause"),
+        hidden_core_link_mode=str(
+            getattr(args, "traceops_hidden_core_link_mode", "depends_on") or "depends_on"
+        ),
     )
     data_dir = save_traceops_dataset(base_dir, threads, meta)
     total_steps = sum(len(t.steps) for t in threads)
@@ -7934,6 +7942,22 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             "traceops_alias_chain_len": int(getattr(args, "traceops_alias_chain_len", 2) or 2),
             "traceops_indirect_pivot_style": str(
                 getattr(args, "traceops_indirect_pivot_style", "blended") or "blended"
+            ),
+            "traceops_core_necessity_enable": bool(
+                getattr(args, "traceops_core_necessity_enable", False)
+            ),
+            "traceops_core_necessity_require_all": bool(
+                getattr(args, "traceops_core_necessity_require_all", True)
+            ),
+            "traceops_trap_decision_flip_enable": bool(
+                getattr(args, "traceops_trap_decision_flip_enable", False)
+            ),
+            "traceops_hidden_core_enable": bool(getattr(args, "traceops_hidden_core_enable", False)),
+            "traceops_hidden_core_kind": str(
+                getattr(args, "traceops_hidden_core_kind", "low_overlap_clause") or "low_overlap_clause"
+            ),
+            "traceops_hidden_core_link_mode": str(
+                getattr(args, "traceops_hidden_core_link_mode", "depends_on") or "depends_on"
             ),
             "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
             "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
@@ -8041,6 +8065,22 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "traceops_alias_chain_len": int(getattr(args, "traceops_alias_chain_len", 2) or 2),
             "traceops_indirect_pivot_style": str(
                 getattr(args, "traceops_indirect_pivot_style", "blended") or "blended"
+            ),
+            "traceops_core_necessity_enable": bool(
+                getattr(args, "traceops_core_necessity_enable", False)
+            ),
+            "traceops_core_necessity_require_all": bool(
+                getattr(args, "traceops_core_necessity_require_all", True)
+            ),
+            "traceops_trap_decision_flip_enable": bool(
+                getattr(args, "traceops_trap_decision_flip_enable", False)
+            ),
+            "traceops_hidden_core_enable": bool(getattr(args, "traceops_hidden_core_enable", False)),
+            "traceops_hidden_core_kind": str(
+                getattr(args, "traceops_hidden_core_kind", "low_overlap_clause") or "low_overlap_clause"
+            ),
+            "traceops_hidden_core_link_mode": str(
+                getattr(args, "traceops_hidden_core_link_mode", "depends_on") or "depends_on"
             ),
             "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
             "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
@@ -8492,6 +8532,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ordinal_ref", "alias_handle", "blended"],
         default="blended",
     )
+    gen.add_argument("--traceops_core_necessity_enable", action="store_true", default=False)
+    gen.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
+    gen.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
+    gen.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    gen.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
+    gen.add_argument(
+        "--traceops_hidden_core_kind",
+        choices=["low_overlap_clause", "alias_only_update"],
+        default="low_overlap_clause",
+    )
+    gen.add_argument(
+        "--traceops_hidden_core_link_mode",
+        choices=["depends_on", "none"],
+        default="depends_on",
+    )
     gen.set_defaults(func=cmd_generate)
 
     ev = sub.add_parser("eval", help="Evaluate baselines")
@@ -8670,6 +8725,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--traceops_indirect_pivot_style",
         choices=["ordinal_ref", "alias_handle", "blended"],
         default="blended",
+    )
+    ev.add_argument("--traceops_core_necessity_enable", action="store_true", default=False)
+    ev.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
+    ev.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
+    ev.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    ev.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
+    ev.add_argument(
+        "--traceops_hidden_core_kind",
+        choices=["low_overlap_clause", "alias_only_update"],
+        default="low_overlap_clause",
+    )
+    ev.add_argument(
+        "--traceops_hidden_core_link_mode",
+        choices=["depends_on", "none"],
+        default="depends_on",
     )
     ev.add_argument(
         "--traceops_force_include_required",
@@ -9030,6 +9100,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--traceops_indirect_pivot_style",
         choices=["ordinal_ref", "alias_handle", "blended"],
         default="blended",
+    )
+    cmp.add_argument("--traceops_core_necessity_enable", action="store_true", default=False)
+    cmp.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
+    cmp.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
+    cmp.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    cmp.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
+    cmp.add_argument(
+        "--traceops_hidden_core_kind",
+        choices=["low_overlap_clause", "alias_only_update"],
+        default="low_overlap_clause",
+    )
+    cmp.add_argument(
+        "--traceops_hidden_core_link_mode",
+        choices=["depends_on", "none"],
+        default="depends_on",
     )
     cmp.add_argument(
         "--traceops_force_include_required",

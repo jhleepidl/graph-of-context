@@ -45,7 +45,7 @@ def _discover_report_json(out_dir: Path) -> Optional[Path]:
     return cand[0] if cand else None
 
 
-def _rewrite_phase17_quick_index(phase_root: Path, manifest: Dict[str, Any]) -> None:
+def _rewrite_phase18_quick_index(phase_root: Path, manifest: Dict[str, Any]) -> None:
     quick_root = phase_root / "quick_access"
     quick_root.mkdir(parents=True, exist_ok=True)
     index_path = quick_root / "INDEX.md"
@@ -155,6 +155,11 @@ def main() -> None:
         default="blended",
     )
     ap.add_argument("--traceops_core_necessity_enable", action="store_true", default=False)
+    ap.add_argument(
+        "--no_traceops_core_necessity_enable",
+        action="store_false",
+        dest="traceops_core_necessity_enable",
+    )
     ap.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
     ap.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
     ap.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
@@ -189,9 +194,9 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     bundle_id = uuid.uuid4().hex[:8]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    bundle_name = f"goc_traceops_phase17_{ts}_{bundle_id}"
+    bundle_name = f"goc_traceops_phase18_{ts}_{bundle_id}"
     bundle_root = repo_root / "experiment_bundles" / bundle_name
-    phase_root = bundle_root / "phase17"
+    phase_root = bundle_root / "phase18"
     data_root = phase_root / "data"
     runs_root = phase_root / "runs"
     analysis_root = phase_root / "analysis"
@@ -616,7 +621,7 @@ def main() -> None:
             depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
         )
         _run_goc_variant(
-            "goc_phase17_depwalk",
+            "goc_phase18_depwalk",
             method_name="goc",
             seed_enable=True,
             seed_topk=8,
@@ -632,7 +637,7 @@ def main() -> None:
         )
         if args.include_ablations:
             _run_goc_variant(
-                "goc_phase17_depwalk_world",
+                "goc_phase18_depwalk_world",
                 method_name="goc",
                 seed_enable=True,
                 seed_topk=8,
@@ -648,7 +653,7 @@ def main() -> None:
             )
         if args.include_oracle:
             _run_goc_variant(
-                "goc_oracle_phase17_depwalk",
+                "goc_oracle_phase18_depwalk",
                 method_name="goc_oracle",
                 seed_enable=True,
                 seed_topk=8,
@@ -666,7 +671,7 @@ def main() -> None:
     (phase_root / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     idx_lines = [
-        f"# Phase17 TraceOps bundle: {bundle_name}",
+        f"# Phase18 TraceOps bundle: {bundle_name}",
         "",
         f"- model={args.model}",
         f"- traceops_level={int(args.traceops_level)} scenarios={','.join(scenarios)} threads={int(traceops_threads)}",
@@ -700,7 +705,7 @@ def main() -> None:
         ),
         "",
         "## Outputs",
-        f"- phase17_root: {phase_root}",
+        f"- phase18_root: {phase_root}",
         f"- manifest: {phase_root / 'run_manifest.json'}",
         f"- analysis: {analysis_root}",
     ]
@@ -717,7 +722,7 @@ def main() -> None:
         str(analysis_root),
     ]
     _run(analyze_cmd, cwd=repo_root, env=env)
-    _rewrite_phase17_quick_index(phase_root, manifest)
+    _rewrite_phase18_quick_index(phase_root, manifest)
 
     for qd in quick_dirs:
         print(f"Quick access: {qd}")

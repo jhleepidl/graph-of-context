@@ -101,6 +101,63 @@ def _decision_from_state(state: Dict[str, Any], *, force_exception: bool = False
     return "allow"
 
 
+def _flip_decision_label(decision: str) -> str:
+    normalized = str(decision or "").strip().lower()
+    if normalized == "allow":
+        return "deny"
+    if normalized == "deny":
+        return "allow"
+    if normalized == "defer":
+        return "allow"
+    if normalized.startswith("require_") or normalized in {"override_invalidated", "needs_more_info", "unknown"}:
+        return "allow"
+    return "deny"
+
+
+def _oracle_decision_from_evidence(
+    clauses: Dict[str, TraceWorldClause],
+    evidence_ids: Sequence[str],
+    state: Dict[str, Any],
+) -> str:
+    selected = [clauses[cid] for cid in evidence_ids if cid in clauses]
+    if not selected:
+        return "unknown"
+
+    decisions = [c for c in selected if str(c.node_type or "") == "DECISION"]
+    updates = [c for c in selected if str(c.node_type or "") == "UPDATE"]
+    assumptions = [c for c in selected if str(c.node_type or "") == "ASSUMPTION"]
+    exceptions = [c for c in selected if str(c.node_type or "") == "EXCEPTION"]
+    if not decisions or not updates or not assumptions:
+        return "unknown"
+
+    decisions_sorted = sorted(decisions, key=lambda c: (int(c.step_idx), str(c.clause_id)))
+    latest_decision = decisions_sorted[-1]
+    base = str((latest_decision.metadata or {}).get("decision_label", "") or "").strip().lower()
+    if not base or base in {"handle_binding", "unknown"}:
+        base = _decision_from_state(state)
+
+    updates_sorted = sorted(updates, key=lambda c: (int(c.step_idx), str(c.clause_id)))
+    latest_update = updates_sorted[-1]
+    ukey = str(latest_update.state_key or "").strip().lower()
+    uval = str(latest_update.state_value or "").strip().lower()
+    if ukey == "budget" and uval == "low":
+        base = "defer"
+    elif ukey == "deadline" and uval == "tight":
+        base = "deny"
+    elif ukey == "region" and uval == "eu" and str(state.get("residency", "")).strip().lower() != "eu":
+        base = "require_residency"
+    elif ukey == "retention_tier" and uval == "long" and str(state.get("deadline", "")).strip().lower() == "tight":
+        base = "deny"
+    elif ukey and base in {"allow", "deny"}:
+        # Generic update override: preserve compositional pressure in indirect pivots.
+        if str(state.get(ukey, "")).strip().lower() == uval and uval:
+            base = "deny" if base == "allow" else "allow"
+
+    if any(_clause_applicable_like_eval(clause, state) for clause in exceptions):
+        return "require_exception"
+    return str(base or "unknown")
+
+
 def _level_plan(
     level: int,
     rng: random.Random,
@@ -181,6 +238,12 @@ def generate_traceops_threads(
     core_size_max: int = 4,
     alias_chain_len: int = 2,
     indirect_pivot_style: str = "blended",
+    core_necessity_enable: bool = False,
+    core_necessity_require_all: bool = True,
+    trap_decision_flip_enable: bool = False,
+    hidden_core_enable: bool = False,
+    hidden_core_kind: str = "low_overlap_clause",
+    hidden_core_link_mode: str = "depends_on",
 ) -> tuple[List[TraceThread], Dict[str, Any]]:
     rng = random.Random(int(seed))
     levelsafe = max(0, int(level))
@@ -193,6 +256,12 @@ def generate_traceops_threads(
     core_size_min = max(1, int(core_size_min))
     core_size_max = max(core_size_min, int(core_size_max))
     alias_chain_len = max(1, int(alias_chain_len))
+    core_necessity_enable = bool(core_necessity_enable)
+    core_necessity_require_all = bool(core_necessity_require_all)
+    trap_decision_flip_enable = bool(trap_decision_flip_enable)
+    hidden_core_enable = bool(hidden_core_enable)
+    hidden_core_kind = str(hidden_core_kind or "low_overlap_clause").strip().lower() or "low_overlap_clause"
+    hidden_core_link_mode = str(hidden_core_link_mode or "depends_on").strip().lower() or "depends_on"
     indirect_pivot_style = str(indirect_pivot_style or "blended").strip().lower()
     if indirect_pivot_style not in {"ordinal_ref", "alias_handle", "blended"}:
         indirect_pivot_style = "blended"
@@ -489,7 +558,16 @@ def generate_traceops_threads(
 
             step_gold: TraceGold | None = None
             pivot_required_ids: List[str] = []
-            pivot_meta: Dict[str, Any] = {}
+            pivot_meta: Dict[str, Any] = {
+                "core_necessity_enable": bool(core_necessity_enable),
+                "core_necessity_flip_count": 0,
+                "core_necessity_all_required": False,
+                "core_necessity_failed": False,
+                "trap_decision_label": "",
+                "trap_decision_flip": False,
+                "hidden_core_ids": [],
+                "hidden_core_parent_ids": [],
+            }
             if kind == "pivot_check":
                 all_prior_ids = [
                     cid
@@ -608,75 +686,281 @@ def generate_traceops_threads(
                             )
                             trap_clause_ids.append(cid)
 
-                    candidate_core = _unique_strs(
+                    hidden_core_ids: List[str] = []
+                    hidden_core_parent_ids: List[str] = []
+                    if hidden_core_enable and steps:
+                        prev_step = steps[-1]
+                        parent_id = ""
+                        if update_chain:
+                            parent_id = str(update_chain[-1])
+                        elif handle_binding_ids:
+                            parent_id = str(handle_binding_ids[-1])
+                        elif latest_decision_id:
+                            parent_id = str(latest_decision_id)
+                        if parent_id:
+                            hidden_text = (
+                                f"Ledger correlation marker retains {handle_token} continuity index."
+                                if hidden_core_kind == "low_overlap_clause"
+                                else f"{handle_token} alias revision applies without textual restatement."
+                            )
+                            hidden_dep = [parent_id] if hidden_core_link_mode == "depends_on" else []
+                            hidden_id = _new_clause(
+                                step_idx=int(prev_step.step_idx),
+                                node_type="ASSUMPTION",
+                                text=hidden_text,
+                                depends_on=hidden_dep,
+                                tags=["indirect", "hidden_core", hidden_core_kind],
+                                metadata={
+                                    "hidden_core": True,
+                                    "hidden_core_kind": str(hidden_core_kind),
+                                    "hidden_core_link_mode": str(hidden_core_link_mode),
+                                },
+                            )
+                            prev_step.introduced_clause_ids = _unique_strs(
+                                list(prev_step.introduced_clause_ids) + [hidden_id]
+                            )
+                            assumption_ids.append(hidden_id)
+                            hidden_core_ids = [hidden_id]
+                            hidden_core_parent_ids = [parent_id]
+
+                    base_candidate_core = _unique_strs(
                         list(update_chain[-2:])
+                        + list(assumption_ids[-max(1, alias_chain_len):])
                         + list(handle_binding_ids[-max(1, alias_chain_len):])
                         + ([latest_decision_id] if latest_decision_id else [])
+                        + list(hidden_core_ids)
                     )
+                    if core_necessity_enable and core_necessity_require_all:
+                        has_update = any(
+                            clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "UPDATE"
+                            for cid in base_candidate_core
+                        )
+                        if not has_update:
+                            for cid in reversed(all_prior_ids):
+                                clause = clauses.get(cid)
+                                if clause is None or str(clause.node_type or "") != "UPDATE":
+                                    continue
+                                base_candidate_core.append(cid)
+                                break
+                        has_assumption = any(
+                            clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "ASSUMPTION"
+                            for cid in base_candidate_core
+                        )
+                        if not has_assumption:
+                            for cid in reversed(all_prior_ids):
+                                clause = clauses.get(cid)
+                                if clause is None or str(clause.node_type or "") != "ASSUMPTION":
+                                    continue
+                                base_candidate_core.append(cid)
+                                break
                     # Add one applicable exception when available.
                     for cid in reversed(all_prior_ids):
                         clause = clauses.get(cid)
                         if clause is None or str(clause.node_type or "") != "EXCEPTION":
                             continue
                         if _clause_applicable_like_eval(clause, state):
-                            candidate_core.append(cid)
+                            base_candidate_core.append(cid)
                             break
-                    candidate_core = [cid for cid in _unique_strs(candidate_core) if cid in clauses]
-                    desired_core = min(
-                        len(candidate_core),
-                        trng.randint(core_size_min, core_size_max),
-                    )
-                    if desired_core < min(core_size_min, len(candidate_core)):
-                        desired_core = min(core_size_min, len(candidate_core))
-                    if desired_core <= 0 and latest_decision_id:
-                        candidate_core = [latest_decision_id]
-                        desired_core = 1
-                    low_overlap_sorted = sorted(
-                        candidate_core,
-                        key=lambda cid: (
-                            _jaccard_text(message, str(clauses[cid].text or "")),
-                            int(clauses[cid].step_idx),
-                            str(cid),
-                        ),
-                    )
-                    chosen_core: List[str] = []
-                    if low_overlap_sorted:
-                        chosen_core.append(low_overlap_sorted[0])
-                    recency_sorted = sorted(
-                        candidate_core,
-                        key=lambda cid: (
-                            int(clauses[cid].step_idx),
-                            str(cid),
-                        ),
-                        reverse=True,
-                    )
-                    for cid in recency_sorted:
-                        if len(chosen_core) >= desired_core:
-                            break
-                        if cid not in chosen_core:
-                            chosen_core.append(cid)
-                    pivot_required_ids = [cid for cid in _unique_strs(chosen_core) if cid in clauses]
+                    base_candidate_core = [cid for cid in _unique_strs(base_candidate_core) if cid in clauses]
+                    if not base_candidate_core and latest_decision_id:
+                        base_candidate_core = [latest_decision_id]
 
-                    chosen_exception = ""
-                    for cid in pivot_required_ids:
-                        clause = clauses.get(cid)
-                        if clause and str(clause.node_type or "") == "EXCEPTION":
-                            chosen_exception = cid
+                    max_attempts = 6 if (core_necessity_enable and core_necessity_require_all) else 1
+                    accepted_core: List[str] = []
+                    accepted_decision = latest_decision or _decision_from_state(state)
+                    accepted_conditions: List[str] = [f"region={state['region']}", f"budget={state['budget']}"]
+                    accepted_flip_count = 0
+                    accepted_all_required = False
+                    accepted_exception = ""
+
+                    for _attempt in range(max_attempts):
+                        candidate_core = list(base_candidate_core)
+                        desired_core = min(
+                            len(candidate_core),
+                            trng.randint(core_size_min, core_size_max) if candidate_core else 0,
+                        )
+                        if desired_core < min(core_size_min, len(candidate_core)):
+                            desired_core = min(core_size_min, len(candidate_core))
+                        if core_necessity_enable and core_necessity_require_all:
+                            desired_core = max(desired_core, min(3, len(candidate_core)))
+                        if desired_core <= 0 and latest_decision_id:
+                            candidate_core = [latest_decision_id]
+                            desired_core = 1
+
+                        chosen_core: List[str] = []
+                        if core_necessity_enable and core_necessity_require_all:
+                            updates_recent = [
+                                cid
+                                for cid in reversed(candidate_core)
+                                if clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "UPDATE"
+                            ]
+                            decisions_recent = [
+                                cid
+                                for cid in reversed(candidate_core)
+                                if clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "DECISION"
+                            ]
+                            assumptions_recent = [
+                                cid
+                                for cid in reversed(candidate_core)
+                                if clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "ASSUMPTION"
+                            ]
+                            exceptions_recent = [
+                                cid
+                                for cid in reversed(candidate_core)
+                                if clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "EXCEPTION"
+                            ]
+                            preferred_assumption = ""
+                            for hid in hidden_core_ids:
+                                if hid in assumptions_recent:
+                                    preferred_assumption = hid
+                                    break
+                            if not preferred_assumption and assumptions_recent:
+                                preferred_assumption = assumptions_recent[0]
+                            mandatory = []
+                            if updates_recent:
+                                mandatory.append(updates_recent[0])
+                            if decisions_recent:
+                                mandatory.append(decisions_recent[0])
+                            if preferred_assumption:
+                                mandatory.append(preferred_assumption)
+                            if exceptions_recent:
+                                mandatory.append(exceptions_recent[0])
+                            chosen_core = [cid for cid in _unique_strs(mandatory) if cid in clauses]
+                            # Keep compositional core compact to preserve "all pieces required".
+                            if len(chosen_core) > int(core_size_max):
+                                chosen_core = chosen_core[: int(core_size_max)]
+                            desired_core = max(len(chosen_core), min(int(core_size_min), len(candidate_core)))
+                            desired_core = min(desired_core, int(core_size_max), len(candidate_core))
+                            if len(chosen_core) < desired_core:
+                                recency_sorted = sorted(
+                                    candidate_core,
+                                    key=lambda cid: (
+                                        int(clauses[cid].step_idx),
+                                        str(cid),
+                                    ),
+                                    reverse=True,
+                                )
+                                for cid in recency_sorted:
+                                    if len(chosen_core) >= desired_core:
+                                        break
+                                    if cid not in chosen_core:
+                                        chosen_core.append(cid)
+                            chosen_core = [cid for cid in _unique_strs(chosen_core) if cid in clauses][:desired_core]
+                        else:
+                            low_overlap_sorted = sorted(
+                                candidate_core,
+                                key=lambda cid: (
+                                    _jaccard_text(message, str(clauses[cid].text or "")),
+                                    int(clauses[cid].step_idx),
+                                    str(cid),
+                                ),
+                            )
+                            if low_overlap_sorted:
+                                chosen_core.append(low_overlap_sorted[0])
+                            for hid in hidden_core_ids:
+                                if hid in candidate_core and hid not in chosen_core:
+                                    chosen_core.append(hid)
+                            if core_necessity_enable:
+                                for node_type in ("UPDATE", "DECISION", "ASSUMPTION", "EXCEPTION"):
+                                    for cid in reversed(candidate_core):
+                                        clause = clauses.get(cid)
+                                        if clause is None or str(clause.node_type or "") != node_type:
+                                            continue
+                                        if cid not in chosen_core:
+                                            chosen_core.append(cid)
+                                        break
+
+                            recency_sorted = sorted(
+                                candidate_core,
+                                key=lambda cid: (
+                                    int(clauses[cid].step_idx),
+                                    trng.random(),
+                                    str(cid),
+                                ),
+                                reverse=True,
+                            )
+                            for cid in recency_sorted:
+                                if len(chosen_core) >= desired_core:
+                                    break
+                                if cid not in chosen_core:
+                                    chosen_core.append(cid)
+                            chosen_core = [cid for cid in _unique_strs(chosen_core) if cid in clauses][:desired_core]
+
+                        chosen_exception = ""
+                        chosen_updates = []
+                        for cid in chosen_core:
+                            clause = clauses.get(cid)
+                            if clause is None:
+                                continue
+                            if str(clause.node_type or "") == "EXCEPTION" and not chosen_exception:
+                                chosen_exception = cid
+                            if str(clause.node_type or "") == "UPDATE":
+                                chosen_updates.append(cid)
+
+                        fallback_decision = latest_decision or _decision_from_state(state)
+                        fallback_conditions = [f"region={state['region']}", f"budget={state['budget']}"]
+                        if chosen_exception:
+                            fallback_decision = "require_exception"
+                            fallback_conditions = ["apply_latest_update", f"exception={chosen_exception}"]
+                        elif len(chosen_updates) >= 2 or active_invalidated:
+                            fallback_decision = "override_invalidated"
+                            fallback_conditions = ["apply_latest_update"]
+
+                        if core_necessity_enable:
+                            oracle_decision = _oracle_decision_from_evidence(clauses, chosen_core, state)
+                            decision = oracle_decision if oracle_decision else "unknown"
+                            if decision == "require_exception" and chosen_exception:
+                                conditions = ["apply_latest_update", f"exception={chosen_exception}"]
+                            elif decision in {"override_invalidated", "defer", "needs_more_info", "unknown"}:
+                                conditions = ["apply_latest_update"]
+                            else:
+                                conditions = fallback_conditions
+                        else:
+                            decision = fallback_decision
+                            conditions = fallback_conditions
+
+                        flip_count = 0
+                        all_required = False
+                        if core_necessity_enable and chosen_core:
+                            base_decision = _oracle_decision_from_evidence(clauses, chosen_core, state)
+                            for removed_id in chosen_core:
+                                reduced = [cid for cid in chosen_core if cid != removed_id]
+                                reduced_decision = _oracle_decision_from_evidence(clauses, reduced, state)
+                                if reduced_decision == "unknown" or reduced_decision != base_decision:
+                                    flip_count += 1
+                            all_required = bool(base_decision != "unknown" and flip_count == len(chosen_core))
+
+                        accepted_core = chosen_core
+                        accepted_decision = decision
+                        accepted_conditions = list(conditions)
+                        accepted_flip_count = int(flip_count)
+                        accepted_all_required = bool(all_required)
+                        accepted_exception = str(chosen_exception or "")
+                        if not (core_necessity_enable and core_necessity_require_all) or accepted_all_required:
                             break
-                    chosen_updates = [
-                        cid
-                        for cid in pivot_required_ids
-                        if clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "UPDATE"
-                    ]
-                    if chosen_exception:
-                        decision = "require_exception"
-                        conditions = ["apply_latest_update", f"exception={chosen_exception}"]
-                    elif len(chosen_updates) >= 2 or active_invalidated:
-                        decision = "override_invalidated"
-                        conditions = ["apply_latest_update"]
-                    else:
-                        decision = latest_decision or _decision_from_state(state)
-                        conditions = [f"region={state['region']}", f"budget={state['budget']}"]
+
+                    pivot_required_ids = [cid for cid in _unique_strs(accepted_core) if cid in clauses]
+                    decision = accepted_decision
+                    conditions = list(accepted_conditions)
+                    chosen_exception = accepted_exception
+
+                    trap_decision_label = ""
+                    trap_decision_flip = False
+                    if trap_decision_flip_enable:
+                        trap_decision_label = _flip_decision_label(decision)
+                        trap_decision_flip = bool(trap_decision_label and trap_decision_label != str(decision))
+                        if trap_clause_ids:
+                            lead_clause = clauses.get(trap_clause_ids[0])
+                            if lead_clause is not None:
+                                lead_clause.text = (
+                                    f"{lead_clause.text} Recommended outcome: {trap_decision_label}."
+                                )
+                            for cid in trap_clause_ids:
+                                clause = clauses.get(cid)
+                                if clause is None:
+                                    continue
+                                clause.metadata["trap_decision_label"] = trap_decision_label
+                                clause.metadata["trap_decision_flip"] = trap_decision_flip
 
                     gold_text = " ".join(
                         str(clauses[cid].text or "") for cid in pivot_required_ids if cid in clauses
@@ -721,6 +1005,20 @@ def generate_traceops_threads(
                         "trap_present": bool(best_distractor_sim > best_gold_sim and len(trap_clause_ids) > 0),
                         "core_size": int(len(pivot_required_ids)),
                         "trap_distractor_ids": list(trap_clause_ids),
+                        "core_necessity_enable": bool(core_necessity_enable),
+                        "core_necessity_flip_count": int(accepted_flip_count if core_necessity_enable else 0),
+                        "core_necessity_all_required": bool(
+                            accepted_all_required if core_necessity_enable else False
+                        ),
+                        "core_necessity_failed": bool(
+                            core_necessity_enable and core_necessity_require_all and not accepted_all_required
+                        ),
+                        "trap_decision_label": str(trap_decision_label or ""),
+                        "trap_decision_flip": bool(trap_decision_flip),
+                        "hidden_core_ids": list(hidden_core_ids),
+                        "hidden_core_parent_ids": list(hidden_core_parent_ids),
+                        "hidden_core_kind": str(hidden_core_kind),
+                        "hidden_core_link_mode": str(hidden_core_link_mode),
                         "ordinal_key": str(ordinal_key),
                         "handle_token": str(handle_token),
                     }
@@ -818,6 +1116,12 @@ def generate_traceops_threads(
                 "traceops_core_size_max": int(core_size_max),
                 "traceops_alias_chain_len": int(alias_chain_len),
                 "traceops_indirect_pivot_style": str(indirect_pivot_style),
+                "traceops_core_necessity_enable": bool(core_necessity_enable),
+                "traceops_core_necessity_require_all": bool(core_necessity_require_all),
+                "traceops_trap_decision_flip_enable": bool(trap_decision_flip_enable),
+                "traceops_hidden_core_enable": bool(hidden_core_enable),
+                "traceops_hidden_core_kind": str(hidden_core_kind),
+                "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
             },
         )
         result.append(thread)
@@ -841,6 +1145,12 @@ def generate_traceops_threads(
         "traceops_core_size_max": int(core_size_max),
         "traceops_alias_chain_len": int(alias_chain_len),
         "traceops_indirect_pivot_style": str(indirect_pivot_style),
+        "traceops_core_necessity_enable": bool(core_necessity_enable),
+        "traceops_core_necessity_require_all": bool(core_necessity_require_all),
+        "traceops_trap_decision_flip_enable": bool(trap_decision_flip_enable),
+        "traceops_hidden_core_enable": bool(hidden_core_enable),
+        "traceops_hidden_core_kind": str(hidden_core_kind),
+        "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
         "pivots_available_total": int(
             sum(1 for thread in result for step in thread.steps if str(step.kind) == "pivot_check")
         ),

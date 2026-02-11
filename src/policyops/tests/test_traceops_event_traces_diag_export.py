@@ -9,6 +9,7 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
     avoid_ids = [f"C{i:04d}" for i in range(10, 30)]
     missing_ids = [f"M{i:04d}" for i in range(245)]
     missing_keys = [f"k{i:04d}" for i in range(240)]
+    hidden_ids = [f"H{i:04d}" for i in range(222)]
     context_clauses = [
         {
             "id": cid,
@@ -42,6 +43,13 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
         "goc_exception_injected_ids": ["C0002", "C0004"],
         "goc_exception_injected_count": 2,
         "goc_exception_applicable_count": 1,
+        "core_necessity_flip_count": 3,
+        "core_necessity_all_required": True,
+        "core_necessity_failed": False,
+        "trap_decision_label": "deny",
+        "trap_decision_flip": True,
+        "hidden_core_ids": hidden_ids,
+        "hidden_core_parent_ids": ["P0001", "P0002"],
     }
 
     line = build_event_trace_line(record, base, max_list_items=200)
@@ -64,3 +72,16 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
     avoid_diag = line["diag"]["avoid"]
     assert avoid_diag["avoid_target_count"] == 20
     assert avoid_diag["avoid_injected"] is True
+
+    assert line["core_necessity_all_required"] is True
+    assert line["core_necessity_flip_count"] == 3
+    assert line["trap_decision_flip"] is True
+    assert line["trap_decision_label"] == "deny"
+    assert len(line["hidden_core_ids"]) == 200
+    assert line["diag"]["truncation"]["hidden_core_ids_full_count"] == 222
+    assert line["diag"]["truncation"]["hidden_core_ids_truncated"] is True
+
+    scenario = line["diag"]["scenario_metrics"]
+    assert scenario["core_necessity_all_required"] is True
+    assert scenario["trap_decision_flip"] is True
+    assert len(scenario["hidden_core_ids"]) == 200

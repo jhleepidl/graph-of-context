@@ -180,6 +180,10 @@ def _build_failure_taxonomy(
         (("baseline", "full"), ("goc_phase17_depwalk", "goc")),
         (("goc_phase16_depwalk", "goc"), ("baseline", "similarity_only")),
         (("goc_phase17_depwalk", "goc"), ("baseline", "similarity_only")),
+        (("goc_phase13_style", "goc"), ("baseline", "similarity_only")),
+        (("goc_phase13_style", "goc"), ("baseline", "agent_fold")),
+        (("goc_phase17_depwalk", "goc"), ("baseline", "agent_fold")),
+        (("goc_phase13_style", "goc"), ("goc_phase17_depwalk", "goc")),
     ]
 
     for scenario in scenarios:
@@ -199,11 +203,26 @@ def _build_failure_taxonomy(
                 variant_a=variant_a,
                 variant_b=variant_b,
             )
-            if not rows:
-                continue
-            taxonomy_rows.extend(rows)
             case_lines.append(f"## {scenario}: {variant_a} vs {variant_b}")
             case_lines.append("")
+            if not rows:
+                taxonomy_rows.append(
+                    {
+                        "scenario": str(scenario),
+                        "variant_a": str(variant_a),
+                        "variant_b": str(variant_b),
+                        "direction": "no_directional_delta",
+                        "category": "no_failure_delta",
+                        "count": 0,
+                        "rate_over_direction": 0.0,
+                        "example_keys": "",
+                    }
+                )
+                case_lines.append("- no directional correctness delta found for this pair.")
+                case_lines.append("")
+                continue
+
+            taxonomy_rows.extend(rows)
             for direction in ["A_correct_B_wrong", "B_correct_A_wrong"]:
                 buckets = examples.get(direction, {})
                 if not buckets:
@@ -258,6 +277,25 @@ def _build_failure_taxonomy(
                             if isinstance(loser_diag.get("goc"), dict)
                             else {}
                         )
+                        scenario_diag = (
+                            loser_diag.get("scenario_metrics")
+                            if isinstance(loser_diag.get("scenario_metrics"), dict)
+                            else {}
+                        )
+                        def _pick_scenario_value(field: str) -> Any:
+                            direct = ex.get(field)
+                            if isinstance(direct, (int, float, bool, str)):
+                                return direct
+                            return scenario_diag.get(field)
+
+                        indirection_overlap = _pick_scenario_value("indirection_overlap_gold")
+                        trap_present = _pick_scenario_value("trap_present")
+                        trap_gap = _pick_scenario_value("trap_gap")
+                        core_size = _pick_scenario_value("core_size")
+                        trap_ids = ex.get("trap_distractor_ids")
+                        if not isinstance(trap_ids, list):
+                            trap_ids = scenario_diag.get("trap_distractor_ids")
+                        trap_ids_count = len(trap_ids) if isinstance(trap_ids, list) else None
                         case_lines.append("    diag_summary:")
                         case_lines.append(
                             "      - "
@@ -276,6 +314,30 @@ def _build_failure_taxonomy(
                             f"core_covered(strict/equiv)="
                             f"{strict_cov}/{equiv_cov} "
                             f"id_mismatch_but_equiv={mismatch}"
+                        )
+                        case_lines.append(
+                            "      - "
+                            f"scenario(indirection_overlap_gold={indirection_overlap}, "
+                            f"trap_present={trap_present}, trap_gap={trap_gap}, "
+                            f"core_size={core_size}, trap_distractor_ids_count={trap_ids_count})"
+                        )
+                        core_need_all_required = _pick_scenario_value("core_necessity_all_required")
+                        core_need_flip_count = _pick_scenario_value("core_necessity_flip_count")
+                        core_need_failed = _pick_scenario_value("core_necessity_failed")
+                        trap_decision_label = _pick_scenario_value("trap_decision_label")
+                        trap_decision_flip = _pick_scenario_value("trap_decision_flip")
+                        hidden_core_ids = _pick_scenario_value("hidden_core_ids")
+                        hidden_core_count = (
+                            len(hidden_core_ids)
+                            if isinstance(hidden_core_ids, list)
+                            else 0
+                        )
+                        case_lines.append(
+                            "      - "
+                            f"phase18(core_need: all_required={core_need_all_required} "
+                            f"flip_count={core_need_flip_count} failed={core_need_failed}; "
+                            f"trap_flip: trap_decision={trap_decision_label} flip={trap_decision_flip}; "
+                            f"hidden_core: n={hidden_core_count})"
                         )
                         if ctx_snip:
                             case_lines.append("    context_snippet:")
@@ -488,6 +550,27 @@ def main() -> None:
                     "mean_trap_gap": _as_float(metrics.get("mean_trap_gap")),
                     "trap_present_rate": _as_float(metrics.get("trap_present_rate")),
                     "mean_core_size": _as_float(metrics.get("mean_core_size")),
+                    "core_necessity_all_required_rate": _as_float(
+                        metrics.get("core_necessity_all_required_rate")
+                    ),
+                    "mean_core_necessity_flip_count": _as_float(
+                        metrics.get("mean_core_necessity_flip_count")
+                    ),
+                    "core_necessity_failed_rate": _as_float(
+                        metrics.get("core_necessity_failed_rate")
+                    ),
+                    "trap_decision_flip_rate": _as_float(
+                        metrics.get("trap_decision_flip_rate")
+                    ),
+                    "hidden_core_present_rate": _as_float(
+                        metrics.get("hidden_core_present_rate")
+                    ),
+                    "hidden_core_rescued_by_depwalk_rate": _as_float(
+                        metrics.get("hidden_core_rescued_by_depwalk_rate")
+                    ),
+                    "hidden_core_missing_without_depwalk_rate": _as_float(
+                        metrics.get("hidden_core_missing_without_depwalk_rate")
+                    ),
                 }
             )
             rows.append(row)
@@ -665,6 +748,13 @@ def main() -> None:
             "mean_trap_gap",
             "trap_present_rate",
             "mean_core_size",
+            "core_necessity_all_required_rate",
+            "mean_core_necessity_flip_count",
+            "core_necessity_failed_rate",
+            "trap_decision_flip_rate",
+            "hidden_core_present_rate",
+            "hidden_core_rescued_by_depwalk_rate",
+            "hidden_core_missing_without_depwalk_rate",
             "tokens_savings_vs_full",
             "tokens_savings_vs_full_actual",
             "accuracy_delta_vs_full",
@@ -701,6 +791,13 @@ def main() -> None:
             "mean_trap_gap",
             "trap_present_rate",
             "mean_core_size",
+            "core_necessity_all_required_rate",
+            "mean_core_necessity_flip_count",
+            "core_necessity_failed_rate",
+            "trap_decision_flip_rate",
+            "hidden_core_present_rate",
+            "hidden_core_rescued_by_depwalk_rate",
+            "hidden_core_missing_without_depwalk_rate",
         ]
         grouped = (
             df.groupby(group_cols, dropna=False)[agg_cols]

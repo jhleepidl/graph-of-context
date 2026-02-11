@@ -63,6 +63,9 @@ def _exception_applicable_from_event(clause: Dict[str, Any], state: Dict[str, An
 
 
 def _is_correct(record: Dict[str, Any]) -> bool:
+    eval_scope = str(record.get("traceops_llm_eval_scope", "") or "").strip().lower()
+    if eval_scope == "pivots" and isinstance(record.get("decision_correct"), bool):
+        return bool(record.get("decision_correct"))
     if isinstance(record.get("e3_answer_correct"), bool):
         return bool(record.get("e3_answer_correct"))
     if isinstance(record.get("decision_correct"), bool):

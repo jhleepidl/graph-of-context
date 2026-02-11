@@ -67,8 +67,15 @@ def build_event_trace_line(
         "trap_gap",
         "trap_present",
         "core_size",
+        "core_necessity_flip_count",
+        "core_necessity_all_required",
+        "core_necessity_failed",
+        "trap_decision_label",
+        "trap_decision_flip",
     ]:
         line[key] = rec.get(key)
+    line["hidden_core_ids"] = _cap("hidden_core_ids", rec.get("hidden_core_ids"))
+    line["hidden_core_parent_ids"] = _cap("hidden_core_parent_ids", rec.get("hidden_core_parent_ids"))
     line["trap_distractor_ids"] = _cap("trap_distractor_ids", rec.get("trap_distractor_ids"))
 
     raw_context_ids = line.get("context_clause_ids")
@@ -177,6 +184,12 @@ def build_event_trace_line(
         "trap_gap": rec.get("trap_gap"),
         "trap_present": rec.get("trap_present"),
         "core_size": rec.get("core_size"),
+        "core_necessity_flip_count": rec.get("core_necessity_flip_count"),
+        "core_necessity_all_required": rec.get("core_necessity_all_required"),
+        "core_necessity_failed": rec.get("core_necessity_failed"),
+        "trap_decision_label": rec.get("trap_decision_label"),
+        "trap_decision_flip": rec.get("trap_decision_flip"),
+        "hidden_core_ids": _cap("scenario_hidden_core_ids", rec.get("hidden_core_ids")),
         "trap_distractor_ids": _cap("scenario_trap_distractor_ids", rec.get("trap_distractor_ids")),
     }
     if any(v is not None for k, v in scenario_metrics.items() if k != "trap_distractor_ids"):
