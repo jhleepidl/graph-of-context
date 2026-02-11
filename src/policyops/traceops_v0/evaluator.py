@@ -39,6 +39,48 @@ def _tokenize(text: str) -> Set[str]:
     return set(toks)
 
 
+def _normalize_exception_text(text: str) -> str:
+    raw = str(text or "").lower()
+    raw = re.sub(r"\b[a-z]{1,4}\d{2,}\b", " ", raw)
+    raw = re.sub(r"[^a-z0-9\s]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
+
+def _hash_fraction(text: str) -> float:
+    digest = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+    # 64-bit mantissa-style stable fraction in [0,1).
+    intval = int(digest[:16], 16)
+    return float(intval) / float(16 ** 16)
+
+
+def _build_exception_equiv_map(
+    clauses: Dict[str, TraceWorldClause],
+    allowed_clause_ids: Sequence[str],
+) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for cid in _unique_strs(allowed_clause_ids):
+        clause = clauses.get(cid)
+        if clause is None:
+            continue
+        if str(clause.node_type or "") != "EXCEPTION":
+            continue
+        out[str(cid)] = _normalize_exception_text(str(clause.text or ""))
+    return out
+
+
+def _canonicalize_condition_tag(tag: str, ex_equiv_map: Dict[str, str]) -> str:
+    raw = str(tag or "").strip()
+    if not raw.lower().startswith("exception="):
+        return raw
+    _, _, cid = raw.partition("=")
+    cid = str(cid).strip()
+    ex_key = str(ex_equiv_map.get(cid, "") or "")
+    if ex_key:
+        return f"exception_key={ex_key}"
+    return raw
+
+
 def _build_traceops_llm_prompt(
     step: TraceStep,
     thread: TraceThread,
@@ -71,6 +113,10 @@ def _build_traceops_llm_prompt(
     lines.append("You MUST choose one of the 4 decision labels exactly as written.")
     lines.append(
         "For conditions: choose strings ONLY from ALLOWED_CONDITIONS (copy exact); no free-form text."
+    )
+    lines.append(
+        "If you include an EXCEPTION clause id in `evidence`, you MUST include "
+        "`exception=<that_clause_id>` in `conditions`."
     )
     lines.append("Return only a JSON object; no markdown, no explanations.")
     lines.append("")
@@ -161,6 +207,21 @@ def _parse_llm_json(text: str) -> Dict[str, Any]:
 def _clause_applicable(clause: TraceWorldClause, state: Dict[str, Any]) -> bool:
     key = clause.state_key
     val = clause.state_value
+    if (
+        str(getattr(clause, "node_type", "") or "") == "EXCEPTION"
+        and (not key or val is None)
+    ):
+        text = str(getattr(clause, "text", "") or "").lower()
+        m = re.search(r"if\s+(\w+)\s+is\s+(\w+)", text)
+        if m:
+            cond_key = str(m.group(1)).strip()
+            cond_val = str(m.group(2)).strip()
+            state_val = state.get(cond_key) if isinstance(state, dict) else None
+            return str(state_val).strip().lower() == cond_val.lower()
+        if "residency mismatch" in text:
+            if isinstance(state, dict) and "residency" in state and "region" in state:
+                return str(state.get("residency")).strip().lower() != str(state.get("region")).strip().lower()
+        return True
     if not key or val is None:
         return True
     return str(state.get(key)) == str(val)
@@ -302,8 +363,42 @@ def _choose_traceops_context(
                 return cid
             return None
 
+        def _extract_update_key(clause: TraceWorldClause | None) -> str:
+            if clause is None or str(getattr(clause, "node_type", "") or "") != "UPDATE":
+                return ""
+            key = str(getattr(clause, "state_key", "") or "").strip().lower()
+            if key:
+                return key
+            text = str(getattr(clause, "text", "") or "").strip().lower()
+            m = re.search(r"update:\s*([a-z_][a-z0-9_]*)\s+changed\s+to", text)
+            if m:
+                return str(m.group(1)).strip().lower()
+            return ""
+
+        state_keys = {str(k).strip().lower() for k in (step.state or {}).keys()}
+        state_vals = {
+            str(v).strip().lower()
+            for v in (step.state or {}).values()
+            if str(v).strip()
+        }
+
+        def _extract_trigger_keys(clause: TraceWorldClause | None) -> List[str]:
+            if clause is None:
+                return []
+            keys: List[str] = []
+            skey = str(getattr(clause, "state_key", "") or "").strip().lower()
+            if skey:
+                keys.append(skey)
+            text = str(getattr(clause, "text", "") or "").lower()
+            for m in re.finditer(r"if\s+([a-z_][a-z0-9_]*)\s+is\s+([a-z0-9_\-]+)", text):
+                keys.append(str(m.group(1)).strip().lower())
+            for k in state_keys:
+                if k and re.search(rf"\b{re.escape(k)}\b", text):
+                    keys.append(k)
+            return _unique_strs(keys)
+
         anchor_ids: List[str] = []
-        for anchor_type in ("DECISION", "UPDATE", "EXCEPTION"):
+        for anchor_type in ("DECISION", "UPDATE"):
             aid = _latest_of_type(anchor_type)
             if aid:
                 anchor_ids.append(aid)
@@ -322,8 +417,12 @@ def _choose_traceops_context(
                 if not _clause_applicable(clause, step.state):
                     continue
                 score = 1.0
-                if clause.node_type in {"EXCEPTION", "UPDATE"}:
+                if clause.node_type == "UPDATE":
                     score += 0.3
+                if clause.node_type == "EXCEPTION":
+                    score += 0.05
+                    if str(getattr(clause, "metadata", {}).get("salience", "") or "") == "low":
+                        score -= 0.5
                 if clause.node_type == "DECISION":
                     score += 0.2
                 scored.append((score, idx, cid))
@@ -358,11 +457,364 @@ def _choose_traceops_context(
                 clause = clauses.get(cid)
                 if clause is None:
                     continue
-                if _clause_applicable(clause, step.state) or clause.node_type in {"EXCEPTION", "UPDATE"}:
+                if _clause_applicable(clause, step.state):
                     closure_added.append(cid)
                 if len(closure_added) >= topk:
                     break
         context_ids = _unique_strs(anchor_ids + seed_ids + closure_added)
+
+        depwalk_added: List[str] = []
+        depwalk_enable = bool(getattr(args, "goc_depwalk_enable", False))
+        depwalk_hops = max(0, int(getattr(args, "goc_depwalk_hops", 2) or 2))
+        depwalk_topk_per_hop = max(
+            0,
+            int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
+        )
+        if depwalk_enable and depwalk_hops > 0 and depwalk_topk_per_hop > 0:
+            depwalk_history = [
+                cid
+                for cid in context_ordered_history
+                if cid in clauses and int(clauses[cid].step_idx) < int(step.step_idx)
+            ]
+            depwalk_history = [cid for cid in depwalk_history if (not use_avoids or cid not in avoid_set)]
+            depwalk_set = set(depwalk_history)
+            history_rank = {cid: idx for idx, cid in enumerate(depwalk_history)}
+            neighbors: Dict[str, Set[str]] = {cid: set() for cid in depwalk_history}
+
+            def _connect(aid: str, bid: str) -> None:
+                if aid == bid or aid not in depwalk_set or bid not in depwalk_set:
+                    return
+                neighbors.setdefault(aid, set()).add(bid)
+                neighbors.setdefault(bid, set()).add(aid)
+
+            for cid in depwalk_history:
+                clause = clauses.get(cid)
+                if clause is None:
+                    continue
+                for dep in clause.depends_on:
+                    did = str(dep)
+                    if did in depwalk_set:
+                        _connect(cid, did)
+
+            last_update_by_key: Dict[str, str] = {}
+            for cid in depwalk_history:
+                clause = clauses.get(cid)
+                key = _extract_update_key(clause)
+                if not key:
+                    continue
+                prev = last_update_by_key.get(key)
+                if prev:
+                    _connect(cid, prev)
+                last_update_by_key[key] = cid
+
+            for idx, cid in enumerate(depwalk_history):
+                clause = clauses.get(cid)
+                if clause is None:
+                    continue
+                ctype = str(clause.node_type or "")
+                if ctype == "EXCEPTION":
+                    keys = _extract_trigger_keys(clause)
+                    if not keys:
+                        continue
+                    priors = depwalk_history[:idx]
+                    for key in keys:
+                        linked = 0
+                        for pid in reversed(priors):
+                            pclause = clauses.get(pid)
+                            if pclause is None or str(pclause.node_type or "") not in {"UPDATE", "EVIDENCE"}:
+                                continue
+                            pkey = str(getattr(pclause, "state_key", "") or "").strip().lower()
+                            ptext = str(getattr(pclause, "text", "") or "").lower()
+                            if pkey == key or re.search(rf"\b{re.escape(key)}\b", ptext):
+                                _connect(cid, pid)
+                                linked += 1
+                            if linked >= 2:
+                                break
+                elif ctype == "DECISION":
+                    dtoks = _tokenize(clause.text)
+                    priors = depwalk_history[:idx]
+                    linked = 0
+                    for pid in reversed(priors):
+                        pclause = clauses.get(pid)
+                        if pclause is None or str(pclause.node_type or "") not in {"UPDATE", "EVIDENCE"}:
+                            continue
+                        ptoks = _tokenize(pclause.text)
+                        pkey = str(getattr(pclause, "state_key", "") or "").strip().lower()
+                        pval = str(getattr(pclause, "state_value", "") or "").strip().lower()
+                        key_overlap = bool(pkey and pkey in dtoks)
+                        val_overlap = bool(pval and pval in dtoks)
+                        state_token_overlap = bool((dtoks & state_keys) and (ptoks & state_keys))
+                        state_val_overlap = bool((dtoks & state_vals) and (ptoks & state_vals))
+                        if key_overlap or val_overlap or state_token_overlap or state_val_overlap:
+                            _connect(cid, pid)
+                            linked += 1
+                        if linked >= 3:
+                            break
+
+            selected_set = set(_unique_strs(context_ids))
+            frontier = [cid for cid in _unique_strs(anchor_ids + seed_ids) if cid in depwalk_set]
+            if not frontier:
+                frontier = [cid for cid in _unique_strs(context_ids) if cid in depwalk_set]
+            selected_exception_texts = {
+                _normalize_exception_text(str(clauses[cid].text or ""))
+                for cid in selected_set
+                if cid in clauses and str(clauses[cid].node_type or "") == "EXCEPTION"
+            }
+
+            for _ in range(depwalk_hops):
+                if not frontier:
+                    break
+                frontier_set = set(frontier)
+                cand_ids: List[str] = []
+                for fid in frontier:
+                    for nid in neighbors.get(fid, set()):
+                        if nid in frontier_set or nid in selected_set:
+                            continue
+                        if nid in avoid_set:
+                            continue
+                        cand_ids.append(nid)
+                cand_ids = _unique_strs(cand_ids)
+                scored_neighbors: List[Tuple[int, int, int, str]] = []
+                for nid in cand_ids:
+                    clause = clauses.get(nid)
+                    if clause is None:
+                        continue
+                    if not _clause_applicable(clause, step.state):
+                        continue
+                    novelty_ok = 1
+                    if str(clause.node_type or "") == "EXCEPTION":
+                        norm_text = _normalize_exception_text(str(clause.text or ""))
+                        if norm_text and norm_text in selected_exception_texts:
+                            novelty_ok = 0
+                    if novelty_ok == 0:
+                        continue
+                    scored_neighbors.append(
+                        (
+                            novelty_ok,
+                            int(clause.step_idx),
+                            -int(history_rank.get(nid, 10**9)),
+                            nid,
+                        )
+                    )
+                scored_neighbors.sort(reverse=True)
+                hop_added: List[str] = []
+                for _, _, _, nid in scored_neighbors:
+                    if len(hop_added) >= depwalk_topk_per_hop:
+                        break
+                    clause = clauses.get(nid)
+                    if clause is None:
+                        continue
+                    hop_added.append(nid)
+                    selected_set.add(nid)
+                    depwalk_added.append(nid)
+                    if str(clause.node_type or "") == "EXCEPTION":
+                        norm_text = _normalize_exception_text(str(clause.text or ""))
+                        if norm_text:
+                            selected_exception_texts.add(norm_text)
+                frontier = hop_added
+
+            context_ids = _unique_strs(context_ids + depwalk_added)
+
+        update_key_cap = max(
+            1,
+            int(getattr(args, "goc_exception_rescue_recent_update_keys", 4) or 4),
+        )
+        update_key_trace: List[str] = []
+        for cid in context_ordered_history:
+            clause = clauses.get(cid)
+            key = _extract_update_key(clause)
+            if key:
+                update_key_trace.append(key)
+        recent_update_keys = set(_unique_strs(update_key_trace[-update_key_cap:]))
+
+        exception_rescue_ids: List[str] = []
+        exception_rescue_reasons: List[str] = []
+        update_history_rescue_ids: List[str] = []
+        rescue_ran = False
+        rescue_reason_short = "not_needed"
+
+        history_exception_ids = [
+            cid
+            for cid in context_ordered_history
+            if cid in clauses
+            and str(clauses[cid].node_type or "") == "EXCEPTION"
+            and (not use_avoids or cid not in avoid_set)
+        ]
+        included_exception_ids = [
+            cid
+            for cid in context_ids
+            if cid in clauses and str(clauses[cid].node_type or "") == "EXCEPTION"
+        ]
+        proxy_poor = bool(len(depwalk_added) == 0 and len(seed_ids) == 0 and len(closure_added) == 0)
+        active_exceptions_missing = bool(history_exception_ids and not included_exception_ids)
+        if active_exceptions_missing:
+            rescue_ran = True
+            rescue_reason_short = "active_exception_missing"
+        elif proxy_poor:
+            rescue_ran = True
+            rescue_reason_short = "weak_depwalk"
+
+        raw_exception_rescue_topk = getattr(args, "goc_exception_rescue_topk", None)
+        exception_rescue_topk = (
+            2 if raw_exception_rescue_topk is None else max(0, int(raw_exception_rescue_topk))
+        )
+        if rescue_ran and exception_rescue_topk > 0:
+            mismatch = False
+            if isinstance(step.state, dict) and "residency" in step.state and "region" in step.state:
+                mismatch = (
+                    str(step.state.get("residency", "")).strip().lower()
+                    != str(step.state.get("region", "")).strip().lower()
+                )
+
+            def _primary_reason(reasons: Sequence[str]) -> str:
+                ranked = [
+                    "activation",
+                    "latent_mismatch",
+                    "update_key_match",
+                    "state_text_match",
+                    "applicable_hint",
+                ]
+                for label in ranked:
+                    if label in reasons:
+                        return label
+                return str(reasons[0]) if reasons else ""
+
+            scored_exceptions: List[Dict[str, Any]] = []
+            context_set = set(context_ids)
+            for idx, cid in enumerate(context_ordered_history):
+                if cid in context_set:
+                    continue
+                if cid in avoid_set:
+                    continue
+                clause = clauses.get(cid)
+                if clause is None or str(clause.node_type or "") != "EXCEPTION":
+                    continue
+                text = str(clause.text or "").lower()
+                tags = {str(tag).strip().lower() for tag in (clause.tags or [])}
+                reasons: List[str] = []
+                score = 0.0
+
+                if "activation" in tags:
+                    score += 2.0
+                    reasons.append("activation")
+                if "latent" in tags and mismatch:
+                    score += 1.8
+                    reasons.append("latent_mismatch")
+
+                key_matched = False
+                for key in recent_update_keys:
+                    if key and re.search(rf"\b{re.escape(key)}\b", text):
+                        key_matched = True
+                        break
+                if key_matched:
+                    score += 1.0
+                    reasons.append("update_key_match")
+
+                text_hint = False
+                for key in [
+                    "deadline",
+                    "residency",
+                    "mismatch",
+                    "region",
+                    "budget",
+                    "retention",
+                    "tier",
+                ]:
+                    if key in text and isinstance(step.state, dict) and key in step.state:
+                        text_hint = True
+                        break
+                if text_hint:
+                    score += 0.2
+                    reasons.append("state_text_match")
+
+                if _clause_applicable(clause, step.state):
+                    score += 0.2
+                    reasons.append("applicable_hint")
+
+                if (
+                    str(getattr(clause, "metadata", {}).get("salience", "") or "").strip().lower()
+                    == "low"
+                ):
+                    score -= 0.25
+
+                if not reasons:
+                    continue
+                scored_exceptions.append(
+                    {
+                        "cid": str(cid),
+                        "score": float(score),
+                        "idx": int(idx),
+                        "reasons": list(_unique_strs(reasons)),
+                    }
+                )
+
+            scored_exceptions.sort(
+                key=lambda item: (-float(item["score"]), -int(item["idx"]), str(item["cid"]))
+            )
+            activation_cap = min(2, exception_rescue_topk)
+            selected_exception_ids: List[str] = []
+            selected_exception_reasons: List[str] = []
+
+            for item in scored_exceptions:
+                if len(selected_exception_ids) >= activation_cap:
+                    break
+                reasons = set(item.get("reasons") or [])
+                if "activation" not in reasons:
+                    continue
+                cid = str(item.get("cid"))
+                if cid in selected_exception_ids:
+                    continue
+                selected_exception_ids.append(cid)
+                selected_exception_reasons.append(_primary_reason(list(reasons)))
+
+            for item in scored_exceptions:
+                if len(selected_exception_ids) >= exception_rescue_topk:
+                    break
+                cid = str(item.get("cid"))
+                if cid in selected_exception_ids:
+                    continue
+                reasons = list(item.get("reasons") or [])
+                selected_exception_ids.append(cid)
+                selected_exception_reasons.append(_primary_reason(reasons))
+
+            exception_rescue_ids = list(selected_exception_ids)
+            exception_rescue_reasons = list(selected_exception_reasons)
+            context_ids = _unique_strs(context_ids + exception_rescue_ids)
+
+        raw_update_history_rescue_topk = getattr(args, "goc_update_history_rescue_topk", None)
+        update_history_rescue_topk = (
+            4 if raw_update_history_rescue_topk is None else max(0, int(raw_update_history_rescue_topk))
+        )
+        if rescue_ran and update_history_rescue_topk > 0:
+            updates_by_key: Dict[str, List[str]] = {}
+            latest_rank: Dict[str, int] = {}
+            for idx, cid in enumerate(context_ordered_history):
+                clause = clauses.get(cid)
+                key = _extract_update_key(clause)
+                if not key:
+                    continue
+                updates_by_key.setdefault(key, []).append(str(cid))
+                latest_rank[key] = int(idx)
+
+            context_set = set(context_ids)
+            ranked_keys = sorted(
+                [key for key, values in updates_by_key.items() if len(values) >= 2],
+                key=lambda key: (-int(latest_rank.get(key, -1)), str(key)),
+            )
+            for key in ranked_keys:
+                candidate_ids = list(updates_by_key.get(key, []))[-2:]
+                for cid in candidate_ids:
+                    if len(update_history_rescue_ids) >= update_history_rescue_topk:
+                        break
+                    if cid in context_set:
+                        continue
+                    if cid in avoid_set:
+                        continue
+                    update_history_rescue_ids.append(cid)
+                    context_set.add(cid)
+                if len(update_history_rescue_ids) >= update_history_rescue_topk:
+                    break
+            context_ids = _unique_strs(context_ids + update_history_rescue_ids)
 
         base_max = int(getattr(args, "goc_unfold_max_nodes", 0) or 0)
         if base_max <= 0:
@@ -388,10 +840,22 @@ def _choose_traceops_context(
         if len(context_ids) > base_max:
             context_ids = context_ids[:base_max]
 
+        def _goc_sort_key(cid: str) -> Tuple[int, int, str]:
+            clause = clauses.get(cid)
+            if clause is None:
+                return (1, 10**9, str(cid))
+            is_exception = 1 if str(clause.node_type or "") == "EXCEPTION" else 0
+            return (is_exception, int(clause.step_idx), str(cid))
+
+        context_ids = sorted(_unique_strs(context_ids), key=_goc_sort_key)
+
         debug = {
             "goc_anchor_ids": list(anchor_ids),
             "goc_applicability_seed_ids": list(seed_ids),
             "goc_applicability_seed_applicable_rate": _applicable_rate(seed_ids),
+            "goc_depwalk_added_ids": list(depwalk_added),
+            "goc_depwalk_added_count": int(len(depwalk_added)),
+            "goc_depwalk_added_applicable_rate": _applicable_rate(depwalk_added),
             "goc_dependency_closure_added_ids": list(closure_added),
             "goc_dependency_closure_added_applicable_rate": _applicable_rate(closure_added),
             "goc_dependency_closure_universe_effective": (
@@ -404,6 +868,11 @@ def _choose_traceops_context(
             "goc_required_force_included_ids": list(force_ids),
             "goc_required_force_included_but_avoided_ids": list(force_but_avoided),
             "goc_required_force_included_but_inapplicable_ids": list(force_but_inapplicable),
+            "goc_exception_rescue_ids": list(exception_rescue_ids),
+            "goc_exception_rescue_reason": list(exception_rescue_reasons),
+            "goc_rescue_ran": bool(rescue_ran),
+            "goc_rescue_reason_short": str(rescue_reason_short),
+            "goc_update_history_rescue_ids": list(update_history_rescue_ids),
         }
     else:
         context_ids = list(ordered_history)
@@ -456,7 +925,8 @@ def _score_step(
     if gold is None:
         return {}
 
-    context_set = set(_unique_strs(context_ids))
+    context_list = _unique_strs(context_ids)
+    context_set = set(context_list)
     required_ids = _unique_strs(step.pivot_required_ids or gold.evidence_core_ids or gold.evidence_ids)
     required_set = set(required_ids)
 
@@ -464,26 +934,101 @@ def _score_step(
     pred_conditions = _unique_strs(prediction.get("conditions") or [])
     pred_evidence = _unique_strs(prediction.get("evidence") or [])
 
+    def _extract_exception_ids(tags: Sequence[str]) -> List[str]:
+        out: List[str] = []
+        for tag in tags:
+            raw = str(tag or "").strip()
+            if not raw.lower().startswith("exception="):
+                continue
+            _, _, ex_id = raw.partition("=")
+            ex_id = str(ex_id).strip()
+            if ex_id:
+                out.append(ex_id)
+        return _unique_strs(out)
+
+    gold_conditions = _unique_strs(gold.conditions)
+    history_clause_ids = [
+        cid
+        for cid, clause in thread.clauses.items()
+        if int(clause.step_idx) < int(step.step_idx)
+    ]
+    ex_map_inputs = _unique_strs(
+        list(history_clause_ids)
+        + list(context_list)
+        + list(required_ids)
+        + list(pred_evidence)
+        + _extract_exception_ids(gold_conditions)
+        + _extract_exception_ids(pred_conditions)
+    )
+    ex_equiv_map = _build_exception_equiv_map(thread.clauses, ex_map_inputs)
+    context_exception_keys = {
+        str(ex_equiv_map.get(cid, "") or "")
+        for cid in context_list
+        if cid in ex_equiv_map and str(ex_equiv_map.get(cid, "") or "")
+    }
+
     gold_decision = str(gold.decision)
     gold_decision_family = _gold_decision_family(gold_decision)
     decision_correct_exact = bool(pred_decision == gold_decision)
     decision_correct_family = bool(pred_decision == gold_decision_family)
     decision_correct = decision_correct_family if str(eval_mode) == "llm" else decision_correct_exact
-    gold_conditions = _unique_strs(gold.conditions)
     conditions_correct_exact = bool(set(pred_conditions) == set(gold_conditions))
     conditions_correct_subset = bool(set(gold_conditions).issubset(set(pred_conditions)))
+    pred_conditions_equiv = _unique_strs(
+        [_canonicalize_condition_tag(tag, ex_equiv_map) for tag in pred_conditions]
+    )
+    gold_conditions_equiv = _unique_strs(
+        [_canonicalize_condition_tag(tag, ex_equiv_map) for tag in gold_conditions]
+    )
+    conditions_correct_exact_equiv = bool(
+        set(pred_conditions_equiv) == set(gold_conditions_equiv)
+    )
+    conditions_correct_subset_equiv = bool(
+        set(gold_conditions_equiv).issubset(set(pred_conditions_equiv))
+    )
     if str(eval_mode) == "llm":
-        conditions_correct = conditions_correct_subset
+        conditions_correct = conditions_correct_subset_equiv
     else:
         conditions_correct = conditions_correct_exact
     answer_correct = bool(decision_correct and conditions_correct)
     evidence_valid_in_context = bool(all(cid in context_set for cid in pred_evidence))
+
+    required_covered_strict: Set[str] = set()
+    required_covered_equiv: Set[str] = set()
+    evidence_core_missing_ids_strict: List[str] = []
+    evidence_core_missing_equiv_keys: List[str] = []
+    id_mismatch_but_equiv = False
+    for cid in required_ids:
+        clause = thread.clauses.get(cid)
+        if cid in context_set:
+            required_covered_strict.add(cid)
+            required_covered_equiv.add(cid)
+            continue
+        evidence_core_missing_ids_strict.append(cid)
+        if clause is None or str(clause.node_type or "") != "EXCEPTION":
+            continue
+        ex_key = str(ex_equiv_map.get(cid, "") or "")
+        if ex_key and ex_key in context_exception_keys:
+            required_covered_equiv.add(cid)
+            id_mismatch_but_equiv = True
+        elif ex_key:
+            evidence_core_missing_equiv_keys.append(ex_key)
+
+    evidence_core_covered_strict = bool(len(required_covered_strict) == len(required_ids))
+    evidence_core_covered_equiv = bool(len(required_covered_equiv) == len(required_ids))
+
+    if required_set:
+        critical_coverage_strict = float(len(required_covered_strict)) / float(len(required_ids))
+        critical_coverage_equiv = float(len(required_covered_equiv)) / float(len(required_ids))
+    else:
+        critical_coverage_strict = float("nan")
+        critical_coverage_equiv = float("nan")
     critical_coverage = (
-        float(len(required_set & context_set)) / float(len(required_set))
-        if required_set
-        else float("nan")
+        critical_coverage_equiv if str(eval_mode) == "llm" else critical_coverage_strict
     )
-    revive_success = bool(required_set.issubset(context_set)) if required_set else True
+    revive_success_strict = evidence_core_covered_strict if required_ids else True
+    revive_success_equiv = evidence_core_covered_equiv if required_ids else True
+    revive_success = revive_success_equiv if str(eval_mode) == "llm" else revive_success_strict
 
     avoid_set = set(_unique_strs(invalidated_ids))
     stale_set = context_set & avoid_set
@@ -505,10 +1050,21 @@ def _score_step(
         "conditions_correct": conditions_correct,
         "conditions_correct_exact": conditions_correct_exact,
         "conditions_correct_subset": conditions_correct_subset,
+        "conditions_correct_exact_equiv": conditions_correct_exact_equiv,
+        "conditions_correct_subset_equiv": conditions_correct_subset_equiv,
         "answer_correct": answer_correct,
         "evidence_valid_in_context": evidence_valid_in_context,
         "critical_coverage": critical_coverage,
+        "critical_coverage_strict": critical_coverage_strict,
+        "critical_coverage_equiv": critical_coverage_equiv,
+        "evidence_core_covered_strict": evidence_core_covered_strict,
+        "evidence_core_covered_equiv": evidence_core_covered_equiv,
+        "evidence_core_missing_ids_strict": list(_unique_strs(evidence_core_missing_ids_strict)),
+        "evidence_core_missing_equiv_keys": list(_unique_strs(evidence_core_missing_equiv_keys)),
+        "evidence_core_id_mismatch_but_equiv_present": bool(id_mismatch_but_equiv),
         "revive_success": revive_success,
+        "revive_success_strict": revive_success_strict,
+        "revive_success_equiv": revive_success_equiv,
         "avoided_injected": avoided_injected,
         "stale_present": bool(stale_set),
         "stale_count": int(len(stale_set)),
@@ -540,7 +1096,17 @@ def evaluate_traceops_method(
     llm_temperature = float(getattr(args, "traceops_llm_temperature", 0.0) or 0.0)
     llm_max_output_tokens = int(getattr(args, "traceops_llm_max_output_tokens", 256) or 256)
     llm_max_pivots = int(getattr(args, "traceops_llm_max_pivots", 0) or 0)
+    llm_eval_scope = str(getattr(args, "traceops_llm_eval_scope", "pivots") or "pivots").strip().lower()
+    if llm_eval_scope not in {"pivots", "all", "sample"}:
+        llm_eval_scope = "pivots"
+    llm_sample_rate = float(getattr(args, "traceops_llm_sample_rate", 0.2) or 0.2)
+    llm_sample_rate = max(0.0, min(1.0, llm_sample_rate))
+    llm_seed = int(getattr(args, "traceops_llm_seed", 0) or 0)
     llm_pivots_seen = 0
+    llm_steps_seen = 0
+    pivots_available_total = 0
+    steps_available_total = 0
+    sampled_steps_evaluated = 0
 
     cache_dir = Path(str(getattr(args, "traceops_llm_cache_dir", ".cache/traceops_llm") or ".cache/traceops_llm"))
     if use_llm:
@@ -559,28 +1125,39 @@ def evaluate_traceops_method(
         return float(sum(clean) / len(clean))
 
     max_steps = int(getattr(args, "traceops_max_steps", 0) or 0)
-    stop_all = False
     for thread in threads:
-        if stop_all:
-            break
         history_ids: List[str] = []
         invalidated_ids: List[str] = []
         pivot_step_records: List[Dict[str, Any]] = []
 
         for step in thread.steps:
-            if stop_all:
-                break
             if max_steps > 0 and int(step.step_idx) >= max_steps:
                 break
+            steps_available_total += 1
             history_ids = _unique_strs(history_ids + list(step.introduced_clause_ids))
             if step.kind == "update" and step.avoid_target_ids:
                 invalidated_ids = _unique_strs(invalidated_ids + list(step.avoid_target_ids))
 
-            if step.kind != "pivot_check" or step.gold is None:
+            is_scored_pivot = bool(step.kind == "pivot_check" and step.gold is not None)
+            if is_scored_pivot:
+                pivots_available_total += 1
+            sampled_step = False
+            if use_llm:
+                if llm_eval_scope == "all":
+                    sampled_step = True
+                elif llm_eval_scope == "pivots":
+                    sampled_step = is_scored_pivot
+                else:
+                    sample_key = f"{llm_seed}:{thread.thread_id}:{step.step_id}:{step.step_idx}"
+                    sampled_step = _hash_fraction(sample_key) < llm_sample_rate
+
+                if sampled_step and llm_max_pivots > 0 and llm_steps_seen >= llm_max_pivots:
+                    sampled_step = False
+
+            if use_llm and not sampled_step:
                 continue
-            if use_llm and llm_max_pivots > 0 and llm_pivots_seen >= llm_max_pivots:
-                stop_all = True
-                break
+            if not is_scored_pivot and not sampled_step:
+                continue
 
             context_ids, debug = _choose_traceops_context(
                 method,
@@ -593,7 +1170,9 @@ def evaluate_traceops_method(
             llm_output_text = ""
             llm_parse_error = False
             llm_usage: Dict[str, Any] = {}
-            if use_llm:
+            pred: Dict[str, Any] | None = None
+            if use_llm and sampled_step:
+                sampled_steps_evaluated += 1
                 prompt = _build_traceops_llm_prompt(step, thread, context_ids)
                 task_id = f"{thread.thread_id}:{step.step_id}"
                 model_name = str(getattr(args, "model", "") or "")
@@ -632,13 +1211,20 @@ def evaluate_traceops_method(
                     )
                 pred = _parse_llm_json(llm_output_text)
                 llm_parse_error = bool(pred.get("parse_error"))
-                llm_pivots_seen += 1
-            else:
+                llm_steps_seen += 1
+                if is_scored_pivot:
+                    llm_pivots_seen += 1
+            elif is_scored_pivot and not use_llm:
                 pred = _infer_prediction(
                     step=step,
                     context_ids=context_ids,
                     invalidated_ids=invalidated_ids,
                 )
+
+            if not is_scored_pivot:
+                continue
+            if pred is None:
+                continue
 
             score = _score_step(
                 thread=thread,
@@ -659,6 +1245,18 @@ def evaluate_traceops_method(
             ):
                 total_tokens_actual = int(prompt_tokens_actual + completion_tokens_actual)
 
+            exception_injected_ids: List[str] = []
+            exception_applicable_count = 0
+            for cid in list(context_ids):
+                clause = thread.clauses.get(cid)
+                if clause is None:
+                    continue
+                if str(clause.node_type or "") != "EXCEPTION":
+                    continue
+                exception_injected_ids.append(str(cid))
+                if _clause_applicable(clause, step.state):
+                    exception_applicable_count += 1
+
             rec = {
                 "task_id": f"{thread.thread_id}:{step.step_id}",
                 "thread_id": thread.thread_id,
@@ -669,6 +1267,8 @@ def evaluate_traceops_method(
                 "traceops_level": int(thread.level),
                 "traceops_scenario": str(thread.scenario),
                 "traceops_eval_mode": eval_mode,
+                "traceops_llm_eval_scope": llm_eval_scope,
+                "sampled_step": bool(sampled_step),
                 "gold_decision": str(step.gold.decision),
                 "gold_decision_family": str(score.get("gold_decision_family", "")),
                 "gold_conditions": list(step.gold.conditions),
@@ -683,9 +1283,32 @@ def evaluate_traceops_method(
                 "conditions_correct": bool(score.get("conditions_correct", False)),
                 "conditions_correct_exact": bool(score.get("conditions_correct_exact", False)),
                 "conditions_correct_subset": bool(score.get("conditions_correct_subset", False)),
+                "conditions_correct_exact_equiv": bool(
+                    score.get("conditions_correct_exact_equiv", False)
+                ),
+                "conditions_correct_subset_equiv": bool(
+                    score.get("conditions_correct_subset_equiv", False)
+                ),
                 "e3_answer_correct": bool(score.get("answer_correct", False)),
                 "e3_evidence_valid_in_context": bool(score.get("evidence_valid_in_context", False)),
                 "critical_coverage_e3": score.get("critical_coverage"),
+                "critical_coverage_strict_e3": score.get("critical_coverage_strict"),
+                "critical_coverage_equiv_e3": score.get("critical_coverage_equiv"),
+                "evidence_core_covered_strict": bool(
+                    score.get("evidence_core_covered_strict", False)
+                ),
+                "evidence_core_covered_equiv": bool(
+                    score.get("evidence_core_covered_equiv", False)
+                ),
+                "evidence_core_missing_ids_strict": list(
+                    score.get("evidence_core_missing_ids_strict") or []
+                ),
+                "evidence_core_missing_equiv_keys": list(
+                    score.get("evidence_core_missing_equiv_keys") or []
+                ),
+                "evidence_core_id_mismatch_but_equiv_present": bool(
+                    score.get("evidence_core_id_mismatch_but_equiv_present", False)
+                ),
                 "inapplicable_injected_rate_e3": score.get("inapplicable_injected_rate"),
                 "stale_present": bool(score.get("stale_present", False)),
                 "stale_count": int(score.get("stale_count", 0) or 0),
@@ -695,6 +1318,11 @@ def evaluate_traceops_method(
                 "goc_applicability_seed_used": len(list(debug.get("goc_applicability_seed_ids") or [])),
                 "goc_applicability_seed_applicable_rate": debug.get(
                     "goc_applicability_seed_applicable_rate", float("nan")
+                ),
+                "goc_depwalk_added_ids": list(debug.get("goc_depwalk_added_ids") or []),
+                "goc_depwalk_added_count": int(debug.get("goc_depwalk_added_count", 0) or 0),
+                "goc_depwalk_added_applicable_rate": debug.get(
+                    "goc_depwalk_added_applicable_rate", float("nan")
                 ),
                 "goc_dependency_closure_added_ids": list(debug.get("goc_dependency_closure_added_ids") or []),
                 "goc_dependency_closure_added_used": len(list(debug.get("goc_dependency_closure_added_ids") or [])),
@@ -716,7 +1344,23 @@ def evaluate_traceops_method(
                 "goc_required_force_included_but_inapplicable_ids": list(
                     debug.get("goc_required_force_included_but_inapplicable_ids") or []
                 ),
+                "goc_exception_rescue_ids": list(debug.get("goc_exception_rescue_ids") or []),
+                "goc_exception_rescue_reason": list(debug.get("goc_exception_rescue_reason") or []),
+                "goc_exception_rescue_count": len(
+                    list(debug.get("goc_exception_rescue_ids") or [])
+                ),
+                "goc_rescue_ran": bool(debug.get("goc_rescue_ran", False)),
+                "goc_rescue_reason_short": str(debug.get("goc_rescue_reason_short", "not_needed") or "not_needed"),
+                "goc_update_history_rescue_ids": list(
+                    debug.get("goc_update_history_rescue_ids") or []
+                ),
+                "goc_update_history_rescue_count": len(
+                    list(debug.get("goc_update_history_rescue_ids") or [])
+                ),
                 "e3_context_clause_ids": list(context_ids),
+                "goc_exception_injected_ids": list(exception_injected_ids),
+                "goc_exception_injected_count": int(len(exception_injected_ids)),
+                "goc_exception_applicable_count": int(exception_applicable_count),
                 "prompt_tokens_est": int(score.get("token_est", 0) or 0),
                 "prompt_tokens": int(score.get("token_est", 0) or 0),
                 "prompt_tokens_actual": prompt_tokens_actual,
@@ -725,6 +1369,30 @@ def evaluate_traceops_method(
                 "llm_output_text": str(llm_output_text or "")[:2000],
                 "llm_parse_error": bool(llm_parse_error),
                 "revive_success": bool(score.get("revive_success", False)),
+                "indirection_overlap_gold": (
+                    float(step.metadata.get("indirection_overlap_gold"))
+                    if isinstance(step.metadata.get("indirection_overlap_gold"), (int, float))
+                    else float("nan")
+                ),
+                "best_gold_sim": (
+                    float(step.metadata.get("best_gold_sim"))
+                    if isinstance(step.metadata.get("best_gold_sim"), (int, float))
+                    else float("nan")
+                ),
+                "best_distractor_sim": (
+                    float(step.metadata.get("best_distractor_sim"))
+                    if isinstance(step.metadata.get("best_distractor_sim"), (int, float))
+                    else float("nan")
+                ),
+                "trap_gap": (
+                    float(step.metadata.get("trap_gap"))
+                    if isinstance(step.metadata.get("trap_gap"), (int, float))
+                    else float("nan")
+                ),
+                "trap_present": bool(step.metadata.get("trap_present", False)),
+                "core_size": int(step.metadata.get("core_size", len(step.pivot_required_ids)) or 0),
+                "pivot_style": str(step.metadata.get("pivot_style", "")),
+                "trap_distractor_ids": list(_unique_strs(step.metadata.get("trap_distractor_ids") or [])),
             }
             records.append(rec)
             pivot_step_records.append(rec)
@@ -785,6 +1453,22 @@ def evaluate_traceops_method(
     avoid_counts = [len(list(r.get("goc_avoid_target_clause_ids") or [])) for r in pivot_records]
     avoided_injected_vals = [1.0 if r.get("goc_avoided_node_injected") else 0.0 for r in pivot_records]
     revive_vals = [1.0 if r.get("revive_success") else 0.0 for r in pivot_records]
+    exception_injected_counts = [
+        int(r.get("goc_exception_injected_count", 0) or 0) for r in pivot_records
+    ]
+    exception_injected_vals = [1.0 if cnt > 0 else 0.0 for cnt in exception_injected_counts]
+    indirection_vals = [
+        float(r.get("indirection_overlap_gold"))
+        for r in pivot_records
+        if isinstance(r.get("indirection_overlap_gold"), (int, float)) and math.isfinite(float(r.get("indirection_overlap_gold")))
+    ]
+    trap_gap_vals = [
+        float(r.get("trap_gap"))
+        for r in pivot_records
+        if isinstance(r.get("trap_gap"), (int, float)) and math.isfinite(float(r.get("trap_gap")))
+    ]
+    core_size_vals = [float(int(r.get("core_size", 0) or 0)) for r in pivot_records]
+    trap_present_vals = [1.0 if bool(r.get("trap_present", False)) else 0.0 for r in pivot_records]
 
     tokens_pivot_mean_est = _mean(pivot_tokens_est)
     tokens_total_mean_est = _mean(total_tokens_by_thread_est)
@@ -807,11 +1491,29 @@ def evaluate_traceops_method(
         "tokens_total_mean_actual": tokens_total_mean_actual,
         "mean_avoid_targets_per_pivot": _mean([float(v) for v in avoid_counts]),
         "avoided_injected_rate": _mean(avoided_injected_vals),
+        "exception_injected_rate": _mean(exception_injected_vals),
+        "mean_exception_injected_count": _mean([float(v) for v in exception_injected_counts]),
         "revive_success_rate": _mean(revive_vals),
+        "mean_indirection_overlap_gold": _mean(indirection_vals),
+        "mean_trap_gap": _mean(trap_gap_vals),
+        "trap_present_rate": _mean(trap_present_vals),
+        "mean_core_size": _mean(core_size_vals),
         "pivot_records": int(len(pivot_records)),
         "thread_records": int(len(thread_records)),
+        "pivots_available_total": int(pivots_available_total),
+        "pivots_evaluated": int(len(pivot_records)),
+        "steps_available_total": int(steps_available_total),
         "traceops_eval_mode": eval_mode,
+        "traceops_llm_eval_scope": llm_eval_scope,
+        "traceops_llm_sample_rate": llm_sample_rate,
+        "sampled_steps_evaluated": int(sampled_steps_evaluated) if use_llm else 0,
+        "sampled_step_rate": (
+            float(sampled_steps_evaluated) / float(max(1, steps_available_total))
+            if use_llm and llm_eval_scope == "sample"
+            else float("nan")
+        ),
         "llm_pivots_evaluated": int(llm_pivots_seen) if use_llm else 0,
+        "llm_steps_evaluated": int(llm_steps_seen) if use_llm else 0,
     }
 
     return {

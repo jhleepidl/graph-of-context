@@ -7877,6 +7877,13 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
         contradiction_rate=float(getattr(args, "traceops_contradiction_rate", 0.35) or 0.35),
         exception_density=float(getattr(args, "traceops_exception_density", 0.35) or 0.35),
         state_flip_count=int(getattr(args, "traceops_state_flip_count", 1) or 1),
+        indirection_rate=float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
+        trap_distractor_count=int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
+        trap_similarity_boost=float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
+        core_size_min=int(getattr(args, "traceops_core_size_min", 2) or 2),
+        core_size_max=int(getattr(args, "traceops_core_size_max", 4) or 4),
+        alias_chain_len=int(getattr(args, "traceops_alias_chain_len", 2) or 2),
+        indirect_pivot_style=str(getattr(args, "traceops_indirect_pivot_style", "blended") or "blended"),
     )
     data_dir = save_traceops_dataset(base_dir, threads, meta)
     total_steps = sum(len(t.steps) for t in threads)
@@ -7917,6 +7924,20 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             **dict(meta),
             "traceops_eval_mode": str(getattr(args, "traceops_eval_mode", "deterministic") or "deterministic"),
             "traceops_llm_max_pivots": int(getattr(args, "traceops_llm_max_pivots", 0) or 0),
+            "traceops_llm_eval_scope": str(getattr(args, "traceops_llm_eval_scope", "pivots") or "pivots"),
+            "traceops_llm_sample_rate": float(getattr(args, "traceops_llm_sample_rate", 0.2) or 0.2),
+            "traceops_indirection_rate": float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
+            "traceops_trap_distractor_count": int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
+            "traceops_trap_similarity_boost": float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
+            "traceops_core_size_min": int(getattr(args, "traceops_core_size_min", 2) or 2),
+            "traceops_core_size_max": int(getattr(args, "traceops_core_size_max", 4) or 4),
+            "traceops_alias_chain_len": int(getattr(args, "traceops_alias_chain_len", 2) or 2),
+            "traceops_indirect_pivot_style": str(
+                getattr(args, "traceops_indirect_pivot_style", "blended") or "blended"
+            ),
+            "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
+            "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
+            "goc_depwalk_topk_per_hop": int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
         },
         "metrics": dict(report.get("metrics") or {}),
         "records": list(report.get("records") or []),
@@ -7974,6 +7995,12 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "pivot_decision_accuracy": metrics.get("pivot_decision_accuracy"),
             "pivot_e3_only_accuracy": metrics.get("pivot_e3_only_accuracy"),
             "strict_pivot_accuracy": metrics.get("strict_pivot_accuracy"),
+            "pivots_available_total": metrics.get("pivots_available_total"),
+            "pivots_evaluated": metrics.get("pivots_evaluated"),
+            "steps_available_total": metrics.get("steps_available_total"),
+            "traceops_llm_eval_scope": metrics.get("traceops_llm_eval_scope"),
+            "sampled_step_rate": metrics.get("sampled_step_rate"),
+            "sampled_steps_evaluated": metrics.get("sampled_steps_evaluated"),
             "tokens_pivot_mean": metrics.get("tokens_pivot_mean"),
             "tokens_total_mean": metrics.get("tokens_total_mean"),
             "tokens_pivot_mean_est": metrics.get("tokens_pivot_mean_est"),
@@ -7983,6 +8010,10 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "mean_avoid_targets_per_pivot": metrics.get("mean_avoid_targets_per_pivot"),
             "avoided_injected_rate": metrics.get("avoided_injected_rate"),
             "revive_success_rate": metrics.get("revive_success_rate"),
+            "mean_indirection_overlap_gold": metrics.get("mean_indirection_overlap_gold"),
+            "mean_trap_gap": metrics.get("mean_trap_gap"),
+            "trap_present_rate": metrics.get("trap_present_rate"),
+            "mean_core_size": metrics.get("mean_core_size"),
             "decision_accuracy": metrics.get("decision_accuracy"),
             "judge_accuracy": metrics.get("judge_accuracy"),
         }
@@ -8000,6 +8031,20 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "traceops_max_steps": int(getattr(args, "traceops_max_steps", 0) or 0),
             "traceops_eval_mode": str(getattr(args, "traceops_eval_mode", "deterministic") or "deterministic"),
             "traceops_llm_max_pivots": int(getattr(args, "traceops_llm_max_pivots", 0) or 0),
+            "traceops_llm_eval_scope": str(getattr(args, "traceops_llm_eval_scope", "pivots") or "pivots"),
+            "traceops_llm_sample_rate": float(getattr(args, "traceops_llm_sample_rate", 0.2) or 0.2),
+            "traceops_indirection_rate": float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
+            "traceops_trap_distractor_count": int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
+            "traceops_trap_similarity_boost": float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
+            "traceops_core_size_min": int(getattr(args, "traceops_core_size_min", 2) or 2),
+            "traceops_core_size_max": int(getattr(args, "traceops_core_size_max", 4) or 4),
+            "traceops_alias_chain_len": int(getattr(args, "traceops_alias_chain_len", 2) or 2),
+            "traceops_indirect_pivot_style": str(
+                getattr(args, "traceops_indirect_pivot_style", "blended") or "blended"
+            ),
+            "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
+            "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
+            "goc_depwalk_topk_per_hop": int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
         },
         "summary": summary,
         "method_reports": method_reports,
@@ -8436,6 +8481,17 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--traceops_contradiction_rate", type=float, default=0.35)
     gen.add_argument("--traceops_exception_density", type=float, default=0.35)
     gen.add_argument("--traceops_state_flip_count", type=int, default=1)
+    gen.add_argument("--traceops_indirection_rate", type=float, default=0.4)
+    gen.add_argument("--traceops_trap_distractor_count", type=int, default=4)
+    gen.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)
+    gen.add_argument("--traceops_core_size_min", type=int, default=2)
+    gen.add_argument("--traceops_core_size_max", type=int, default=4)
+    gen.add_argument("--traceops_alias_chain_len", type=int, default=2)
+    gen.add_argument(
+        "--traceops_indirect_pivot_style",
+        choices=["ordinal_ref", "alias_handle", "blended"],
+        default="blended",
+    )
     gen.set_defaults(func=cmd_generate)
 
     ev = sub.add_parser("eval", help="Evaluate baselines")
@@ -8584,6 +8640,37 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--traceops_llm_cache_dir", type=str, default=".cache/traceops_llm")
     ev.add_argument("--traceops_llm_seed", type=int, default=0)
     ev.add_argument("--traceops_llm_max_output_tokens", type=int, default=256)
+    ev.add_argument(
+        "--traceops_llm_eval_scope",
+        choices=["pivots", "all", "sample"],
+        default="pivots",
+        help="LLM evaluation scope for TraceOps: pivots only, all steps, or deterministic sampled steps.",
+    )
+    ev.add_argument(
+        "--traceops_llm_sample_rate",
+        type=float,
+        default=0.2,
+        help="Sampling rate for TraceOps llm scope=sample (0..1).",
+    )
+    ev.add_argument(
+        "--goc_depwalk_enable",
+        action="store_true",
+        default=False,
+        help="Enable Phase16 dependency-walk expansion in TraceOps GoC context selection.",
+    )
+    ev.add_argument("--goc_depwalk_hops", type=int, default=2)
+    ev.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    ev.add_argument("--traceops_indirection_rate", type=float, default=0.4)
+    ev.add_argument("--traceops_trap_distractor_count", type=int, default=4)
+    ev.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)
+    ev.add_argument("--traceops_core_size_min", type=int, default=2)
+    ev.add_argument("--traceops_core_size_max", type=int, default=4)
+    ev.add_argument("--traceops_alias_chain_len", type=int, default=2)
+    ev.add_argument(
+        "--traceops_indirect_pivot_style",
+        choices=["ordinal_ref", "alias_handle", "blended"],
+        default="blended",
+    )
     ev.add_argument(
         "--traceops_force_include_required",
         action="store_true",
@@ -8913,6 +9000,37 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--traceops_llm_cache_dir", type=str, default=".cache/traceops_llm")
     cmp.add_argument("--traceops_llm_seed", type=int, default=0)
     cmp.add_argument("--traceops_llm_max_output_tokens", type=int, default=256)
+    cmp.add_argument(
+        "--traceops_llm_eval_scope",
+        choices=["pivots", "all", "sample"],
+        default="pivots",
+        help="LLM evaluation scope for TraceOps: pivots only, all steps, or deterministic sampled steps.",
+    )
+    cmp.add_argument(
+        "--traceops_llm_sample_rate",
+        type=float,
+        default=0.2,
+        help="Sampling rate for TraceOps llm scope=sample (0..1).",
+    )
+    cmp.add_argument(
+        "--goc_depwalk_enable",
+        action="store_true",
+        default=False,
+        help="Enable Phase16 dependency-walk expansion in TraceOps GoC context selection.",
+    )
+    cmp.add_argument("--goc_depwalk_hops", type=int, default=2)
+    cmp.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    cmp.add_argument("--traceops_indirection_rate", type=float, default=0.4)
+    cmp.add_argument("--traceops_trap_distractor_count", type=int, default=4)
+    cmp.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)
+    cmp.add_argument("--traceops_core_size_min", type=int, default=2)
+    cmp.add_argument("--traceops_core_size_max", type=int, default=4)
+    cmp.add_argument("--traceops_alias_chain_len", type=int, default=2)
+    cmp.add_argument(
+        "--traceops_indirect_pivot_style",
+        choices=["ordinal_ref", "alias_handle", "blended"],
+        default="blended",
+    )
     cmp.add_argument(
         "--traceops_force_include_required",
         action="store_true",

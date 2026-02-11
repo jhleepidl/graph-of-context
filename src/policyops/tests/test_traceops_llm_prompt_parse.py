@@ -54,6 +54,7 @@ def test_traceops_llm_prompt_contains_schema_and_clause_ids() -> None:
     assert "You MUST choose one of the 4 decision labels exactly as written." in prompt
     assert "ALLOWED_CONDITIONS:" in prompt
     assert "choose strings ONLY from ALLOWED_CONDITIONS" in prompt
+    assert "If you include an EXCEPTION clause id in `evidence`, you MUST include `exception=<that_clause_id>` in `conditions`." in prompt
     assert "- apply_latest_update" in prompt
     assert "- region=eu" in prompt
     assert "- exception=C0002" in prompt
