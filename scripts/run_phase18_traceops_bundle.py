@@ -111,6 +111,7 @@ class RunEntry:
     traceops_trap_graph_excludable_rate: float
     traceops_trap_graph_excludable_kinds: str
     traceops_trap_invalidation_text_strength: float
+    traceops_defer_budget_rate: float
     traceops_hidden_core_enable: bool
     traceops_hidden_core_kind: str
     traceops_hidden_core_link_mode: str
@@ -178,9 +179,10 @@ def main() -> None:
     ap.add_argument(
         "--traceops_trap_graph_excludable_kinds",
         type=str,
-        default="stale,inapplicable,avoided",
+        default="stale,inapplicable,avoided,decision_checkpoint",
     )
     ap.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
+    ap.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
     ap.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     ap.add_argument(
         "--traceops_hidden_core_kind",
@@ -266,6 +268,7 @@ def main() -> None:
         "traceops_trap_graph_excludable_rate": float(args.traceops_trap_graph_excludable_rate),
         "traceops_trap_graph_excludable_kinds": str(args.traceops_trap_graph_excludable_kinds),
         "traceops_trap_invalidation_text_strength": float(args.traceops_trap_invalidation_text_strength),
+        "traceops_defer_budget_rate": float(args.traceops_defer_budget_rate),
         "traceops_hidden_core_enable": bool(args.traceops_hidden_core_enable),
         "traceops_hidden_core_kind": str(args.traceops_hidden_core_kind),
         "traceops_hidden_core_link_mode": str(args.traceops_hidden_core_link_mode),
@@ -333,6 +336,8 @@ def main() -> None:
             str(args.traceops_trap_graph_excludable_kinds),
             "--traceops_trap_invalidation_text_strength",
             str(args.traceops_trap_invalidation_text_strength),
+            "--traceops_defer_budget_rate",
+            str(args.traceops_defer_budget_rate),
             "--traceops_hidden_core_kind",
             str(args.traceops_hidden_core_kind),
             "--traceops_hidden_core_link_mode",
@@ -386,6 +391,7 @@ def main() -> None:
                     "traceops_trap_graph_excludable_rate",
                     "traceops_trap_graph_excludable_kinds",
                     "traceops_trap_invalidation_text_strength",
+                    "traceops_defer_budget_rate",
                     "traceops_hidden_core_enable",
                     "traceops_hidden_core_kind",
                     "traceops_hidden_core_link_mode",
@@ -432,6 +438,8 @@ def main() -> None:
             str(args.traceops_trap_graph_excludable_kinds),
             "--traceops_trap_invalidation_text_strength",
             str(float(args.traceops_trap_invalidation_text_strength)),
+            "--traceops_defer_budget_rate",
+            str(float(args.traceops_defer_budget_rate)),
             "--traceops_hidden_core_kind",
             str(args.traceops_hidden_core_kind),
             "--traceops_hidden_core_link_mode",
@@ -525,6 +533,7 @@ def main() -> None:
                     traceops_trap_graph_excludable_rate=float(args.traceops_trap_graph_excludable_rate),
                     traceops_trap_graph_excludable_kinds=str(args.traceops_trap_graph_excludable_kinds),
                     traceops_trap_invalidation_text_strength=float(args.traceops_trap_invalidation_text_strength),
+                    traceops_defer_budget_rate=float(args.traceops_defer_budget_rate),
                     traceops_hidden_core_enable=bool(args.traceops_hidden_core_enable),
                     traceops_hidden_core_kind=str(args.traceops_hidden_core_kind),
                     traceops_hidden_core_link_mode=str(args.traceops_hidden_core_link_mode),
@@ -638,6 +647,7 @@ def main() -> None:
                         traceops_trap_graph_excludable_rate=float(args.traceops_trap_graph_excludable_rate),
                         traceops_trap_graph_excludable_kinds=str(args.traceops_trap_graph_excludable_kinds),
                         traceops_trap_invalidation_text_strength=float(args.traceops_trap_invalidation_text_strength),
+                        traceops_defer_budget_rate=float(args.traceops_defer_budget_rate),
                         traceops_hidden_core_enable=bool(args.traceops_hidden_core_enable),
                         traceops_hidden_core_kind=str(args.traceops_hidden_core_kind),
                         traceops_hidden_core_link_mode=str(args.traceops_hidden_core_link_mode),
@@ -753,7 +763,8 @@ def main() -> None:
         ),
         (
             f"- trap_graph_excludable_kinds={str(args.traceops_trap_graph_excludable_kinds)} "
-            f"trap_invalidation_text_strength={float(args.traceops_trap_invalidation_text_strength)}"
+            f"trap_invalidation_text_strength={float(args.traceops_trap_invalidation_text_strength)} "
+            f"defer_budget_rate={float(args.traceops_defer_budget_rate)}"
         ),
         (
             f"- traceops_eval_mode={str(args.traceops_eval_mode)} "

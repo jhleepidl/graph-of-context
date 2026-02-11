@@ -112,7 +112,22 @@ def _build_traceops_llm_prompt(
     lines.append(schema_line)
     lines.append("You MUST choose one of the 4 decision labels exactly as written.")
     lines.append(
+        "For decision=allow|deny|require_condition: `evidence` MUST contain at least 2 DISTINCT clause ids."
+    )
+    lines.append(
+        "Every evidence id MUST be selected from Allowed evidence clause IDs."
+    )
+    lines.append(
+        "If the above evidence requirement is not satisfied, decision MUST be `needs_more_info`, "
+        "conditions MUST be [], and evidence should contain at most one most relevant allowed clause id (or [])."
+    )
+    lines.append(
         "For conditions: choose strings ONLY from ALLOWED_CONDITIONS (copy exact); no free-form text."
+    )
+    lines.append(
+        "Output `needs_more_info` if: (a) decisive evidence is missing, "
+        "(b) UPDATE/EXCEPTION/DECISION conflicts are unresolved, or "
+        "(c) required condition tags cannot be copied exactly from ALLOWED_CONDITIONS."
     )
     lines.append(
         "If you include an EXCEPTION clause id in `evidence`, you MUST include "
@@ -1266,6 +1281,32 @@ def evaluate_traceops_method(
                 if trap_distractor_set
                 else float("nan")
             )
+            decision_checkpoint_trap_ids = _unique_strs(
+                step_meta.get("decision_checkpoint_trap_ids") or []
+            )
+            decision_checkpoint_trap_set = {
+                str(cid) for cid in decision_checkpoint_trap_ids if str(cid).strip()
+            }
+            decision_checkpoint_trap_excludable_ids = _unique_strs(
+                step_meta.get("decision_checkpoint_trap_excludable_ids") or []
+            )
+            decision_checkpoint_trap_excludable_set = {
+                str(cid)
+                for cid in decision_checkpoint_trap_excludable_ids
+                if str(cid).strip()
+            }
+            decision_checkpoint_trap_injected_ids = [
+                str(cid) for cid in list(context_ids) if str(cid) in decision_checkpoint_trap_set
+            ]
+            decision_checkpoint_trap_injected_count = int(
+                len(decision_checkpoint_trap_injected_ids)
+            )
+            decision_checkpoint_trap_injected_rate = (
+                float(decision_checkpoint_trap_injected_count)
+                / float(len(decision_checkpoint_trap_set))
+                if decision_checkpoint_trap_set
+                else float("nan")
+            )
             raw_flip_count = step_meta.get("core_necessity_flip_count")
             core_necessity_flip_count = (
                 int(raw_flip_count)
@@ -1424,6 +1465,24 @@ def evaluate_traceops_method(
                 "trap_flip_target_kind": str(step_meta.get("trap_flip_target_kind", "") or ""),
                 "trap_graph_excludable_count": int(step_meta.get("trap_graph_excludable_count", 0) or 0),
                 "trap_graph_excludable_ids": list(_unique_strs(step_meta.get("trap_graph_excludable_ids") or [])),
+                "decision_checkpoint_trap_count": int(
+                    step_meta.get("decision_checkpoint_trap_count", len(decision_checkpoint_trap_ids))
+                    or 0
+                ),
+                "decision_checkpoint_trap_ids": list(decision_checkpoint_trap_ids),
+                "decision_checkpoint_trap_excludable_ids": list(
+                    decision_checkpoint_trap_excludable_ids
+                ),
+                "decision_checkpoint_trap_excludable_count": int(
+                    len(decision_checkpoint_trap_excludable_set)
+                ),
+                "decision_checkpoint_trap_injected_ids": list(
+                    decision_checkpoint_trap_injected_ids
+                ),
+                "decision_checkpoint_trap_injected_count": int(
+                    decision_checkpoint_trap_injected_count
+                ),
+                "decision_checkpoint_trap_injected_rate": decision_checkpoint_trap_injected_rate,
                 "trap_invalidation_attached_to_update": bool(
                     step_meta.get("trap_invalidation_attached_to_update", False)
                 ),
@@ -1535,6 +1594,16 @@ def evaluate_traceops_method(
     trap_injected_any_vals = [
         1.0 if int(r.get("trap_injected_count", 0) or 0) > 0 else 0.0 for r in pivot_records
     ]
+    decision_checkpoint_trap_injected_count_vals = [
+        float(int(r.get("decision_checkpoint_trap_injected_count", 0) or 0))
+        for r in pivot_records
+    ]
+    decision_checkpoint_trap_injected_rate_vals = [
+        float(r.get("decision_checkpoint_trap_injected_rate"))
+        for r in pivot_records
+        if isinstance(r.get("decision_checkpoint_trap_injected_rate"), (int, float))
+        and math.isfinite(float(r.get("decision_checkpoint_trap_injected_rate")))
+    ]
     core_size_vals = [float(int(r.get("core_size", 0) or 0)) for r in pivot_records]
     trap_present_vals = [1.0 if bool(r.get("trap_present", False)) else 0.0 for r in pivot_records]
     core_need_all_required_vals = [
@@ -1606,6 +1675,12 @@ def evaluate_traceops_method(
         "mean_trap_injected_count": _mean(trap_injected_count_vals),
         "mean_trap_injected_rate": _mean(trap_injected_rate_vals),
         "trap_injected_any_rate": _mean(trap_injected_any_vals),
+        "mean_decision_checkpoint_trap_injected_count": _mean(
+            decision_checkpoint_trap_injected_count_vals
+        ),
+        "decision_checkpoint_trap_injected_rate": _mean(
+            decision_checkpoint_trap_injected_rate_vals
+        ),
         "mean_core_size": _mean(core_size_vals),
         "core_necessity_all_required_rate": _mean(core_need_all_required_vals),
         "mean_core_necessity_flip_count": _mean(core_need_flip_vals),

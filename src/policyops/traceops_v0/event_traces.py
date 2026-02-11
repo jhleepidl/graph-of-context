@@ -69,6 +69,10 @@ def build_event_trace_line(
         "trap_present",
         "trap_injected_count",
         "trap_injected_rate",
+        "decision_checkpoint_trap_count",
+        "decision_checkpoint_trap_excludable_count",
+        "decision_checkpoint_trap_injected_count",
+        "decision_checkpoint_trap_injected_rate",
         "core_size",
         "core_necessity_flip_count",
         "core_necessity_all_required",
@@ -84,6 +88,17 @@ def build_event_trace_line(
     line["hidden_core_ids"] = _cap("hidden_core_ids", rec.get("hidden_core_ids"))
     line["hidden_core_parent_ids"] = _cap("hidden_core_parent_ids", rec.get("hidden_core_parent_ids"))
     line["trap_distractor_ids"] = _cap("trap_distractor_ids", rec.get("trap_distractor_ids"))
+    line["decision_checkpoint_trap_ids"] = _cap(
+        "decision_checkpoint_trap_ids", rec.get("decision_checkpoint_trap_ids")
+    )
+    line["decision_checkpoint_trap_excludable_ids"] = _cap(
+        "decision_checkpoint_trap_excludable_ids",
+        rec.get("decision_checkpoint_trap_excludable_ids"),
+    )
+    line["decision_checkpoint_trap_injected_ids"] = _cap(
+        "decision_checkpoint_trap_injected_ids",
+        rec.get("decision_checkpoint_trap_injected_ids"),
+    )
     line["trap_graph_excludable_ids"] = _cap(
         "trap_graph_excludable_ids", rec.get("trap_graph_excludable_ids")
     )
@@ -195,6 +210,24 @@ def build_event_trace_line(
         "trap_present": rec.get("trap_present"),
         "trap_injected_count": rec.get("trap_injected_count"),
         "trap_injected_rate": rec.get("trap_injected_rate"),
+        "decision_checkpoint_trap_count": rec.get("decision_checkpoint_trap_count"),
+        "decision_checkpoint_trap_ids": _cap(
+            "scenario_decision_checkpoint_trap_ids",
+            rec.get("decision_checkpoint_trap_ids"),
+        ),
+        "decision_checkpoint_trap_excludable_count": rec.get(
+            "decision_checkpoint_trap_excludable_count"
+        ),
+        "decision_checkpoint_trap_excludable_ids": _cap(
+            "scenario_decision_checkpoint_trap_excludable_ids",
+            rec.get("decision_checkpoint_trap_excludable_ids"),
+        ),
+        "decision_checkpoint_trap_injected_count": rec.get(
+            "decision_checkpoint_trap_injected_count"
+        ),
+        "decision_checkpoint_trap_injected_rate": rec.get(
+            "decision_checkpoint_trap_injected_rate"
+        ),
         "trap_flip_target_id": rec.get("trap_flip_target_id"),
         "trap_flip_target_kind": rec.get("trap_flip_target_kind"),
         "trap_graph_excludable_count": rec.get("trap_graph_excludable_count"),

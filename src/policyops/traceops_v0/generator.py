@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
-from .schema import TraceGold, TraceStep, TraceThread, TraceWorldClause
+from .schema import TraceGold, TraceStep, TraceThread, TraceWorldClause, normalize_decision
 
 TRACEOPS_SCENARIOS = {"exception", "contradiction", "latent", "mixed", "indirect"}
 
@@ -244,8 +244,9 @@ def generate_traceops_threads(
     trap_flip_salience: float = 0.25,
     trap_flip_attach_kind: str = "avoided",
     trap_graph_excludable_rate: float = 0.7,
-    trap_graph_excludable_kinds: str = "stale,inapplicable,avoided",
+    trap_graph_excludable_kinds: str = "stale,inapplicable,avoided,decision_checkpoint",
     trap_invalidation_text_strength: float = 0.6,
+    defer_budget_rate: float = 0.15,
     hidden_core_enable: bool = False,
     hidden_core_kind: str = "low_overlap_clause",
     hidden_core_link_mode: str = "depends_on",
@@ -272,15 +273,26 @@ def generate_traceops_threads(
     trap_graph_excludable_rate = max(0.0, min(1.0, float(trap_graph_excludable_rate)))
     trap_graph_excludable_kinds_raw = [
         str(part).strip().lower()
-        for part in str(trap_graph_excludable_kinds or "stale,inapplicable,avoided").split(",")
+        for part in str(
+            trap_graph_excludable_kinds or "stale,inapplicable,avoided,decision_checkpoint"
+        ).split(",")
     ]
+    allowed_trap_excludable_kinds = {"stale", "inapplicable", "avoided", "decision_checkpoint"}
     trap_graph_excludable_kind_set = {
-        part for part in trap_graph_excludable_kinds_raw if part in {"stale", "inapplicable", "avoided"}
+        part for part in trap_graph_excludable_kinds_raw if part in allowed_trap_excludable_kinds
     }
+    trap_graph_excludable_unknown_tokens = sorted(
+        {
+            part
+            for part in trap_graph_excludable_kinds_raw
+            if part and part not in allowed_trap_excludable_kinds
+        }
+    )
     if not trap_graph_excludable_kind_set:
         trap_graph_excludable_kind_set = {"stale", "inapplicable", "avoided"}
     trap_graph_excludable_kinds = ",".join(sorted(trap_graph_excludable_kind_set))
     trap_invalidation_text_strength = max(0.0, min(1.0, float(trap_invalidation_text_strength)))
+    defer_budget_rate = max(0.0, min(1.0, float(defer_budget_rate)))
     hidden_core_enable = bool(hidden_core_enable)
     hidden_core_kind = str(hidden_core_kind or "low_overlap_clause").strip().lower() or "low_overlap_clause"
     hidden_core_link_mode = str(hidden_core_link_mode or "depends_on").strip().lower() or "depends_on"
@@ -595,7 +607,11 @@ def generate_traceops_threads(
                 "trap_flip_target_kind": "",
                 "trap_graph_excludable_count": 0,
                 "trap_graph_excludable_ids": [],
+                "decision_checkpoint_trap_count": 0,
+                "decision_checkpoint_trap_ids": [],
+                "decision_checkpoint_trap_excludable_ids": [],
                 "trap_invalidation_attached_to_update": False,
+                "defer_budget_rate": float(defer_budget_rate),
                 "trap_gap_failed": False,
                 "hidden_core_ids": [],
                 "hidden_core_parent_ids": [],
@@ -615,6 +631,26 @@ def generate_traceops_threads(
                     latest_decision = str(clause.metadata.get("decision_label", "allow"))
                     latest_decision_id = cid
                     break
+
+                def _maybe_calibrate_needs_more_info(
+                    decision_value: str, conditions_value: Sequence[str]
+                ) -> tuple[str, List[str]]:
+                    if normalize_decision(decision_value) != "needs_more_info":
+                        return str(decision_value), list(conditions_value)
+                    if str(state.get("budget", "")).strip().lower() != "low":
+                        return str(decision_value), list(conditions_value)
+                    if trng.random() <= float(defer_budget_rate):
+                        return str(decision_value), list(conditions_value)
+                    if str(state.get("region", "")).strip().lower() == "eu" and str(
+                        state.get("residency", "")
+                    ).strip().lower() != "eu":
+                        return "require_residency", [
+                            f"region={state.get('region')}",
+                            f"residency={state.get('residency')}",
+                        ]
+                    if str(state.get("deadline", "")).strip().lower() == "tight":
+                        return "deny", []
+                    return "allow", []
 
                 indirect_pivot_active = (
                     scenario == "indirect"
@@ -1027,6 +1063,7 @@ def generate_traceops_threads(
                     decision = accepted_decision
                     conditions = list(accepted_conditions)
                     chosen_exception = accepted_exception
+                    decision, conditions = _maybe_calibrate_needs_more_info(decision, conditions)
 
                     trap_decision_label = ""
                     trap_decision_flip = False
@@ -1130,6 +1167,51 @@ def generate_traceops_threads(
                         if trap_gap <= 0.0 and trap_clause_ids:
                             trap_gap_failed = True
 
+                    decision_checkpoint_trap_ids: List[str] = []
+                    if trap_decision_flip_enable and trap_decision_label:
+                        checkpoint_ids: List[str] = []
+                        for cid in decision_ids:
+                            clause = clauses.get(str(cid))
+                            if clause is None:
+                                continue
+                            if str(clause.node_type or "") != "DECISION":
+                                continue
+                            if int(clause.step_idx) >= int(step_idx):
+                                continue
+                            label = str((clause.metadata or {}).get("decision_label", "") or "").strip().lower()
+                            if not label or label == "handle_binding":
+                                continue
+                            checkpoint_ids.append(str(cid))
+
+                        controlling_id = ""
+                        if checkpoint_ids:
+                            controlling_id = max(
+                                checkpoint_ids,
+                                key=lambda cid: (int(clauses[cid].step_idx), str(cid)),
+                            )
+                        trap_label_norm = normalize_decision(trap_decision_label)
+                        for cid in checkpoint_ids:
+                            if controlling_id and str(cid) == str(controlling_id):
+                                continue
+                            clause = clauses.get(str(cid))
+                            if clause is None:
+                                continue
+                            label = str((clause.metadata or {}).get("decision_label", "") or "").strip().lower()
+                            if normalize_decision(label) != trap_label_norm:
+                                continue
+                            clause.metadata["trap"] = True
+                            clause.metadata["trap_kind"] = "decision_checkpoint"
+                            clause.metadata["trap_decision_checkpoint"] = True
+                            clause.metadata["trap_decision_label"] = str(trap_decision_label or "")
+                            clause.metadata["trap_decision_flip"] = bool(trap_decision_flip)
+                            decision_checkpoint_trap_ids.append(str(cid))
+
+                    trap_clause_ids = _unique_strs(list(trap_clause_ids) + list(decision_checkpoint_trap_ids))
+                    if trap_clause_ids:
+                        best_distractor_sim = _best_distractor_similarity(trap_clause_ids)
+                        trap_gap = float(best_distractor_sim - best_gold_sim)
+                        trap_gap_failed = bool(trap_gap <= 0.0)
+
                     trap_graph_excludable_ids: List[str] = []
                     trap_invalidation_attached_to_update = False
                     if trap_clause_ids and trap_graph_excludable_rate > 0.0:
@@ -1144,6 +1226,11 @@ def generate_traceops_threads(
                         if eligible and not trap_graph_excludable_ids:
                             trap_graph_excludable_ids.append(str(eligible[0]))
                         trap_graph_excludable_ids = _unique_strs(trap_graph_excludable_ids)
+                    decision_checkpoint_trap_excludable_ids = [
+                        cid
+                        for cid in trap_graph_excludable_ids
+                        if _trap_kind(str(cid)) == "decision_checkpoint"
+                    ]
 
                     def _ensure_latest_update_step_for_trap() -> TraceStep | None:
                         for s in reversed(steps):
@@ -1225,12 +1312,18 @@ def generate_traceops_threads(
                         "trap_flip_target_kind": str(trap_flip_target_kind or ""),
                         "trap_graph_excludable_count": int(len(trap_graph_excludable_ids)),
                         "trap_graph_excludable_ids": list(trap_graph_excludable_ids),
+                        "decision_checkpoint_trap_count": int(len(decision_checkpoint_trap_ids)),
+                        "decision_checkpoint_trap_ids": list(decision_checkpoint_trap_ids),
+                        "decision_checkpoint_trap_excludable_ids": list(
+                            decision_checkpoint_trap_excludable_ids
+                        ),
                         "trap_invalidation_attached_to_update": bool(trap_invalidation_attached_to_update),
                         "trap_flip_salience": float(trap_flip_salience),
                         "trap_flip_attach_kind": str(trap_flip_attach_kind),
                         "trap_graph_excludable_rate": float(trap_graph_excludable_rate),
                         "trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
                         "trap_invalidation_text_strength": float(trap_invalidation_text_strength),
+                        "defer_budget_rate": float(defer_budget_rate),
                         "core_necessity_enable": bool(core_necessity_enable),
                         "core_necessity_flip_count": int(accepted_flip_count if core_necessity_enable else 0),
                         "core_necessity_all_required": bool(
@@ -1279,6 +1372,8 @@ def generate_traceops_threads(
                         pivot_required_ids = [latest_decision_id] if latest_decision_id else []
                         if latent_clause_id and trng.random() < float(exception_density) * 0.5:
                             pivot_required_ids.append(latent_clause_id)
+
+                    decision, conditions = _maybe_calibrate_needs_more_info(decision, conditions)
 
                 pivot_required_ids = [cid for cid in _unique_strs(pivot_required_ids) if cid in clauses]
                 step_gold = TraceGold(
@@ -1350,7 +1445,11 @@ def generate_traceops_threads(
                 "traceops_trap_flip_attach_kind": str(trap_flip_attach_kind),
                 "traceops_trap_graph_excludable_rate": float(trap_graph_excludable_rate),
                 "traceops_trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
+                "traceops_trap_graph_excludable_unknown_tokens": list(
+                    trap_graph_excludable_unknown_tokens
+                ),
                 "traceops_trap_invalidation_text_strength": float(trap_invalidation_text_strength),
+                "traceops_defer_budget_rate": float(defer_budget_rate),
                 "traceops_hidden_core_enable": bool(hidden_core_enable),
                 "traceops_hidden_core_kind": str(hidden_core_kind),
                 "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
@@ -1385,7 +1484,11 @@ def generate_traceops_threads(
         "traceops_trap_flip_attach_kind": str(trap_flip_attach_kind),
         "traceops_trap_graph_excludable_rate": float(trap_graph_excludable_rate),
         "traceops_trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
+        "traceops_trap_graph_excludable_unknown_tokens": list(
+            trap_graph_excludable_unknown_tokens
+        ),
         "traceops_trap_invalidation_text_strength": float(trap_invalidation_text_strength),
+        "traceops_defer_budget_rate": float(defer_budget_rate),
         "traceops_hidden_core_enable": bool(hidden_core_enable),
         "traceops_hidden_core_kind": str(hidden_core_kind),
         "traceops_hidden_core_link_mode": str(hidden_core_link_mode),

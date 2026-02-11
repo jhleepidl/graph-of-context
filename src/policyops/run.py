@@ -7895,12 +7895,17 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
             getattr(args, "traceops_trap_graph_excludable_rate", 0.7) or 0.7
         ),
         trap_graph_excludable_kinds=str(
-            getattr(args, "traceops_trap_graph_excludable_kinds", "stale,inapplicable,avoided")
-            or "stale,inapplicable,avoided"
+            getattr(
+                args,
+                "traceops_trap_graph_excludable_kinds",
+                "stale,inapplicable,avoided,decision_checkpoint",
+            )
+            or "stale,inapplicable,avoided,decision_checkpoint"
         ),
         trap_invalidation_text_strength=float(
             getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
         ),
+        defer_budget_rate=float(getattr(args, "traceops_defer_budget_rate", 0.15) or 0.15),
         hidden_core_enable=bool(getattr(args, "traceops_hidden_core_enable", False)),
         hidden_core_kind=str(getattr(args, "traceops_hidden_core_kind", "low_overlap_clause") or "low_overlap_clause"),
         hidden_core_link_mode=str(
@@ -7976,11 +7981,18 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
                 getattr(args, "traceops_trap_graph_excludable_rate", 0.7) or 0.7
             ),
             "traceops_trap_graph_excludable_kinds": str(
-                getattr(args, "traceops_trap_graph_excludable_kinds", "stale,inapplicable,avoided")
-                or "stale,inapplicable,avoided"
+                getattr(
+                    args,
+                    "traceops_trap_graph_excludable_kinds",
+                    "stale,inapplicable,avoided,decision_checkpoint",
+                )
+                or "stale,inapplicable,avoided,decision_checkpoint"
             ),
             "traceops_trap_invalidation_text_strength": float(
                 getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
+            ),
+            "traceops_defer_budget_rate": float(
+                getattr(args, "traceops_defer_budget_rate", 0.15) or 0.15
             ),
             "traceops_hidden_core_enable": bool(getattr(args, "traceops_hidden_core_enable", False)),
             "traceops_hidden_core_kind": str(
@@ -8070,6 +8082,12 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "mean_trap_injected_count": metrics.get("mean_trap_injected_count"),
             "mean_trap_injected_rate": metrics.get("mean_trap_injected_rate"),
             "trap_injected_any_rate": metrics.get("trap_injected_any_rate"),
+            "decision_checkpoint_trap_injected_rate": metrics.get(
+                "decision_checkpoint_trap_injected_rate"
+            ),
+            "mean_decision_checkpoint_trap_injected_count": metrics.get(
+                "mean_decision_checkpoint_trap_injected_count"
+            ),
             "mean_core_size": metrics.get("mean_core_size"),
             "decision_accuracy": metrics.get("decision_accuracy"),
             "judge_accuracy": metrics.get("judge_accuracy"),
@@ -8118,11 +8136,18 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
                 getattr(args, "traceops_trap_graph_excludable_rate", 0.7) or 0.7
             ),
             "traceops_trap_graph_excludable_kinds": str(
-                getattr(args, "traceops_trap_graph_excludable_kinds", "stale,inapplicable,avoided")
-                or "stale,inapplicable,avoided"
+                getattr(
+                    args,
+                    "traceops_trap_graph_excludable_kinds",
+                    "stale,inapplicable,avoided,decision_checkpoint",
+                )
+                or "stale,inapplicable,avoided,decision_checkpoint"
             ),
             "traceops_trap_invalidation_text_strength": float(
                 getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
+            ),
+            "traceops_defer_budget_rate": float(
+                getattr(args, "traceops_defer_budget_rate", 0.15) or 0.15
             ),
             "traceops_hidden_core_enable": bool(getattr(args, "traceops_hidden_core_enable", False)),
             "traceops_hidden_core_kind": str(
@@ -8595,9 +8620,10 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument(
         "--traceops_trap_graph_excludable_kinds",
         type=str,
-        default="stale,inapplicable,avoided",
+        default="stale,inapplicable,avoided,decision_checkpoint",
     )
     gen.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
+    gen.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
     gen.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     gen.add_argument(
         "--traceops_hidden_core_kind",
@@ -8802,9 +8828,10 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument(
         "--traceops_trap_graph_excludable_kinds",
         type=str,
-        default="stale,inapplicable,avoided",
+        default="stale,inapplicable,avoided,decision_checkpoint",
     )
     ev.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
+    ev.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
     ev.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     ev.add_argument(
         "--traceops_hidden_core_kind",
@@ -9190,9 +9217,10 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument(
         "--traceops_trap_graph_excludable_kinds",
         type=str,
-        default="stale,inapplicable,avoided",
+        default="stale,inapplicable,avoided,decision_checkpoint",
     )
     cmp.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
+    cmp.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
     cmp.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     cmp.add_argument(
         "--traceops_hidden_core_kind",
