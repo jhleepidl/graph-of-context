@@ -241,9 +241,15 @@ def generate_traceops_threads(
     core_necessity_enable: bool = False,
     core_necessity_require_all: bool = True,
     trap_decision_flip_enable: bool = False,
+    trap_flip_salience: float = 0.25,
+    trap_flip_attach_kind: str = "avoided",
+    trap_graph_excludable_rate: float = 0.7,
+    trap_graph_excludable_kinds: str = "stale,inapplicable,avoided",
+    trap_invalidation_text_strength: float = 0.6,
     hidden_core_enable: bool = False,
     hidden_core_kind: str = "low_overlap_clause",
     hidden_core_link_mode: str = "depends_on",
+    trap_require_avoided: bool = False,
 ) -> tuple[List[TraceThread], Dict[str, Any]]:
     rng = random.Random(int(seed))
     levelsafe = max(0, int(level))
@@ -259,9 +265,28 @@ def generate_traceops_threads(
     core_necessity_enable = bool(core_necessity_enable)
     core_necessity_require_all = bool(core_necessity_require_all)
     trap_decision_flip_enable = bool(trap_decision_flip_enable)
+    trap_flip_salience = max(0.0, min(1.0, float(trap_flip_salience)))
+    trap_flip_attach_kind = str(trap_flip_attach_kind or "avoided").strip().lower() or "avoided"
+    if trap_flip_attach_kind not in {"stale", "inapplicable", "avoided", "random", "none"}:
+        trap_flip_attach_kind = "avoided"
+    trap_graph_excludable_rate = max(0.0, min(1.0, float(trap_graph_excludable_rate)))
+    trap_graph_excludable_kinds_raw = [
+        str(part).strip().lower()
+        for part in str(trap_graph_excludable_kinds or "stale,inapplicable,avoided").split(",")
+    ]
+    trap_graph_excludable_kind_set = {
+        part for part in trap_graph_excludable_kinds_raw if part in {"stale", "inapplicable", "avoided"}
+    }
+    if not trap_graph_excludable_kind_set:
+        trap_graph_excludable_kind_set = {"stale", "inapplicable", "avoided"}
+    trap_graph_excludable_kinds = ",".join(sorted(trap_graph_excludable_kind_set))
+    trap_invalidation_text_strength = max(0.0, min(1.0, float(trap_invalidation_text_strength)))
     hidden_core_enable = bool(hidden_core_enable)
     hidden_core_kind = str(hidden_core_kind or "low_overlap_clause").strip().lower() or "low_overlap_clause"
     hidden_core_link_mode = str(hidden_core_link_mode or "depends_on").strip().lower() or "depends_on"
+    trap_require_avoided = bool(trap_require_avoided)
+    core_necessity_max_tries = 16
+    trap_gap_max_tries = 8
     indirect_pivot_style = str(indirect_pivot_style or "blended").strip().lower()
     if indirect_pivot_style not in {"ordinal_ref", "alias_handle", "blended"}:
         indirect_pivot_style = "blended"
@@ -563,8 +588,15 @@ def generate_traceops_threads(
                 "core_necessity_flip_count": 0,
                 "core_necessity_all_required": False,
                 "core_necessity_failed": False,
+                "core_necessity_tries_used": 0,
                 "trap_decision_label": "",
                 "trap_decision_flip": False,
+                "trap_flip_target_id": "",
+                "trap_flip_target_kind": "",
+                "trap_graph_excludable_count": 0,
+                "trap_graph_excludable_ids": [],
+                "trap_invalidation_attached_to_update": False,
+                "trap_gap_failed": False,
                 "hidden_core_ids": [],
                 "hidden_core_parent_ids": [],
             }
@@ -630,19 +662,52 @@ def generate_traceops_threads(
                         )
 
                     trap_clause_ids: List[str] = []
-                    if steps and trap_distractor_count > 0:
-                        prev_step = steps[-1]
-                        prev_step_idx = int(prev_step.step_idx)
+                    prev_step_for_trap = next(
+                        (s for s in reversed(steps) if str(s.kind) != "pivot_check"),
+                        None,
+                    )
+
+                    def _cleanup_trap_clause_ids(ids: Sequence[str]) -> None:
+                        if prev_step_for_trap is None:
+                            return
+                        id_set = {str(cid) for cid in ids if str(cid).strip()}
+                        if not id_set:
+                            return
+                        prev_step_for_trap.introduced_clause_ids = [
+                            cid for cid in list(prev_step_for_trap.introduced_clause_ids) if cid not in id_set
+                        ]
+                        prev_step_for_trap.avoid_target_ids = [
+                            cid for cid in list(prev_step_for_trap.avoid_target_ids) if cid not in id_set
+                        ]
+                        for cid in id_set:
+                            active_invalidated.discard(cid)
+                            clauses.pop(cid, None)
+
+                    def _make_trap_clause_set(attempt_idx: int) -> List[str]:
+                        if prev_step_for_trap is None or int(trap_distractor_count) <= 0:
+                            return []
+                        prev_step_idx = int(prev_step_for_trap.step_idx)
                         stale_val = str(state.get(ordinal_key, "unknown"))
                         if len(update_chain) >= 2:
                             prev_upd = clauses.get(update_chain[-2])
                             if prev_upd is not None and prev_upd.state_value is not None:
                                 stale_val = str(prev_upd.state_value)
                         mismatch_value = "tight" if str(state.get("deadline", "")).lower() != "tight" else "flex"
-                        for didx in range(int(trap_distractor_count)):
-                            if didx % 3 == 0:
+
+                        out_ids: List[str] = []
+                        trap_count = max(0, int(trap_distractor_count))
+                        forced_avoided_idx = trap_count - 1 if (trap_require_avoided and trap_count > 0) else -1
+                        for didx in range(trap_count):
+                            mode = didx % 3
+                            if didx == forced_avoided_idx:
+                                mode = 2
+                            lexical_boost = ""
+                            if int(attempt_idx) > 0:
+                                lexical_boost = " Final policy note: latest change reference."
+                            if mode == 0:
                                 text = (
                                     f"{message} Historical note: {ordinal_key}={stale_val} remains the reference policy."
+                                    f"{lexical_boost}"
                                 )
                                 cid = _new_clause(
                                     step_idx=prev_step_idx,
@@ -651,11 +716,12 @@ def generate_traceops_threads(
                                     state_key=str(ordinal_key),
                                     state_value=str(stale_val),
                                     tags=["distractor", "trap", "stale"],
-                                    metadata={"trap": True, "trap_kind": "stale"},
+                                    metadata={"trap": True, "trap_kind": "stale", "trap_attempt": int(attempt_idx)},
                                 )
-                            elif didx % 3 == 1:
+                            elif mode == 1:
                                 text = (
                                     f"{message} Exception note: allow override if deadline is {mismatch_value}."
+                                    f"{lexical_boost}"
                                 )
                                 cid = _new_clause(
                                     step_idx=prev_step_idx,
@@ -664,27 +730,31 @@ def generate_traceops_threads(
                                     state_key="deadline",
                                     state_value=str(mismatch_value),
                                     tags=["distractor", "trap", "inapplicable"],
-                                    metadata={"trap": True, "trap_kind": "inapplicable"},
+                                    metadata={"trap": True, "trap_kind": "inapplicable", "trap_attempt": int(attempt_idx)},
                                 )
                             else:
                                 text = (
                                     f"{message} Archived binding says {handle_token} keeps prior rule without update."
+                                    f"{lexical_boost}"
                                 )
                                 cid = _new_clause(
                                     step_idx=prev_step_idx,
                                     node_type="ASSUMPTION",
                                     text=text,
                                     tags=["distractor", "trap", "avoided"],
-                                    metadata={"trap": True, "trap_kind": "avoided"},
+                                    metadata={"trap": True, "trap_kind": "avoided", "trap_attempt": int(attempt_idx)},
                                 )
-                                prev_step.avoid_target_ids = _unique_strs(
-                                    list(prev_step.avoid_target_ids) + [cid]
+                                prev_step_for_trap.avoid_target_ids = _unique_strs(
+                                    list(prev_step_for_trap.avoid_target_ids) + [cid]
                                 )
                                 active_invalidated.add(cid)
-                            prev_step.introduced_clause_ids = _unique_strs(
-                                list(prev_step.introduced_clause_ids) + [cid]
+                            prev_step_for_trap.introduced_clause_ids = _unique_strs(
+                                list(prev_step_for_trap.introduced_clause_ids) + [cid]
                             )
-                            trap_clause_ids.append(cid)
+                            out_ids.append(cid)
+                        return out_ids
+
+                    trap_clause_ids = _make_trap_clause_set(0)
 
                     hidden_core_ids: List[str] = []
                     hidden_core_parent_ids: List[str] = []
@@ -765,16 +835,18 @@ def generate_traceops_threads(
                     if not base_candidate_core and latest_decision_id:
                         base_candidate_core = [latest_decision_id]
 
-                    max_attempts = 6 if (core_necessity_enable and core_necessity_require_all) else 1
-                    accepted_core: List[str] = []
+                    max_attempts = core_necessity_max_tries if core_necessity_enable else 1
+                    accepted_core_required_ids: List[str] = []
                     accepted_decision = latest_decision or _decision_from_state(state)
                     accepted_conditions: List[str] = [f"region={state['region']}", f"budget={state['budget']}"]
                     accepted_flip_count = 0
                     accepted_all_required = False
                     accepted_exception = ""
+                    accepted_tries_used = 0
 
-                    for _attempt in range(max_attempts):
+                    for attempt_idx in range(1, max_attempts + 1):
                         candidate_core = list(base_candidate_core)
+                        trng.shuffle(candidate_core)
                         desired_core = min(
                             len(candidate_core),
                             trng.randint(core_size_min, core_size_max) if candidate_core else 0,
@@ -787,7 +859,7 @@ def generate_traceops_threads(
                             candidate_core = [latest_decision_id]
                             desired_core = 1
 
-                        chosen_core: List[str] = []
+                        core_required_ids: List[str] = []
                         if core_necessity_enable and core_necessity_require_all:
                             updates_recent = [
                                 cid
@@ -825,13 +897,13 @@ def generate_traceops_threads(
                                 mandatory.append(preferred_assumption)
                             if exceptions_recent:
                                 mandatory.append(exceptions_recent[0])
-                            chosen_core = [cid for cid in _unique_strs(mandatory) if cid in clauses]
+                            core_required_ids = [cid for cid in _unique_strs(mandatory) if cid in clauses]
                             # Keep compositional core compact to preserve "all pieces required".
-                            if len(chosen_core) > int(core_size_max):
-                                chosen_core = chosen_core[: int(core_size_max)]
-                            desired_core = max(len(chosen_core), min(int(core_size_min), len(candidate_core)))
+                            if len(core_required_ids) > int(core_size_max):
+                                core_required_ids = core_required_ids[: int(core_size_max)]
+                            desired_core = max(len(core_required_ids), min(int(core_size_min), len(candidate_core)))
                             desired_core = min(desired_core, int(core_size_max), len(candidate_core))
-                            if len(chosen_core) < desired_core:
+                            if len(core_required_ids) < desired_core:
                                 recency_sorted = sorted(
                                     candidate_core,
                                     key=lambda cid: (
@@ -841,11 +913,13 @@ def generate_traceops_threads(
                                     reverse=True,
                                 )
                                 for cid in recency_sorted:
-                                    if len(chosen_core) >= desired_core:
+                                    if len(core_required_ids) >= desired_core:
                                         break
-                                    if cid not in chosen_core:
-                                        chosen_core.append(cid)
-                            chosen_core = [cid for cid in _unique_strs(chosen_core) if cid in clauses][:desired_core]
+                                    if cid not in core_required_ids:
+                                        core_required_ids.append(cid)
+                            core_required_ids = [
+                                cid for cid in _unique_strs(core_required_ids) if cid in clauses
+                            ][:desired_core]
                         else:
                             low_overlap_sorted = sorted(
                                 candidate_core,
@@ -856,18 +930,18 @@ def generate_traceops_threads(
                                 ),
                             )
                             if low_overlap_sorted:
-                                chosen_core.append(low_overlap_sorted[0])
+                                core_required_ids.append(low_overlap_sorted[0])
                             for hid in hidden_core_ids:
-                                if hid in candidate_core and hid not in chosen_core:
-                                    chosen_core.append(hid)
+                                if hid in candidate_core and hid not in core_required_ids:
+                                    core_required_ids.append(hid)
                             if core_necessity_enable:
                                 for node_type in ("UPDATE", "DECISION", "ASSUMPTION", "EXCEPTION"):
                                     for cid in reversed(candidate_core):
                                         clause = clauses.get(cid)
                                         if clause is None or str(clause.node_type or "") != node_type:
                                             continue
-                                        if cid not in chosen_core:
-                                            chosen_core.append(cid)
+                                        if cid not in core_required_ids:
+                                            core_required_ids.append(cid)
                                         break
 
                             recency_sorted = sorted(
@@ -880,15 +954,17 @@ def generate_traceops_threads(
                                 reverse=True,
                             )
                             for cid in recency_sorted:
-                                if len(chosen_core) >= desired_core:
+                                if len(core_required_ids) >= desired_core:
                                     break
-                                if cid not in chosen_core:
-                                    chosen_core.append(cid)
-                            chosen_core = [cid for cid in _unique_strs(chosen_core) if cid in clauses][:desired_core]
+                                if cid not in core_required_ids:
+                                    core_required_ids.append(cid)
+                            core_required_ids = [
+                                cid for cid in _unique_strs(core_required_ids) if cid in clauses
+                            ][:desired_core]
 
                         chosen_exception = ""
                         chosen_updates = []
-                        for cid in chosen_core:
+                        for cid in core_required_ids:
                             clause = clauses.get(cid)
                             if clause is None:
                                 continue
@@ -907,7 +983,7 @@ def generate_traceops_threads(
                             fallback_conditions = ["apply_latest_update"]
 
                         if core_necessity_enable:
-                            oracle_decision = _oracle_decision_from_evidence(clauses, chosen_core, state)
+                            oracle_decision = _oracle_decision_from_evidence(clauses, core_required_ids, state)
                             decision = oracle_decision if oracle_decision else "unknown"
                             if decision == "require_exception" and chosen_exception:
                                 conditions = ["apply_latest_update", f"exception={chosen_exception}"]
@@ -921,25 +997,33 @@ def generate_traceops_threads(
 
                         flip_count = 0
                         all_required = False
-                        if core_necessity_enable and chosen_core:
-                            base_decision = _oracle_decision_from_evidence(clauses, chosen_core, state)
-                            for removed_id in chosen_core:
-                                reduced = [cid for cid in chosen_core if cid != removed_id]
+                        if core_necessity_enable and core_required_ids:
+                            base_decision = _oracle_decision_from_evidence(clauses, core_required_ids, state)
+                            for removed_id in core_required_ids:
+                                reduced = [cid for cid in core_required_ids if cid != removed_id]
                                 reduced_decision = _oracle_decision_from_evidence(clauses, reduced, state)
                                 if reduced_decision == "unknown" or reduced_decision != base_decision:
                                     flip_count += 1
-                            all_required = bool(base_decision != "unknown" and flip_count == len(chosen_core))
+                            all_required = bool(flip_count == len(core_required_ids))
 
-                        accepted_core = chosen_core
+                        accepted_core_required_ids = list(core_required_ids)
                         accepted_decision = decision
                         accepted_conditions = list(conditions)
                         accepted_flip_count = int(flip_count)
                         accepted_all_required = bool(all_required)
                         accepted_exception = str(chosen_exception or "")
-                        if not (core_necessity_enable and core_necessity_require_all) or accepted_all_required:
+                        accepted_tries_used = int(attempt_idx)
+                        if not core_necessity_enable:
+                            break
+                        if core_necessity_require_all:
+                            if accepted_all_required:
+                                break
+                        else:
                             break
 
-                    pivot_required_ids = [cid for cid in _unique_strs(accepted_core) if cid in clauses]
+                    pivot_required_ids = [
+                        cid for cid in _unique_strs(accepted_core_required_ids) if cid in clauses
+                    ]
                     decision = accepted_decision
                     conditions = list(accepted_conditions)
                     chosen_exception = accepted_exception
@@ -949,18 +1033,6 @@ def generate_traceops_threads(
                     if trap_decision_flip_enable:
                         trap_decision_label = _flip_decision_label(decision)
                         trap_decision_flip = bool(trap_decision_label and trap_decision_label != str(decision))
-                        if trap_clause_ids:
-                            lead_clause = clauses.get(trap_clause_ids[0])
-                            if lead_clause is not None:
-                                lead_clause.text = (
-                                    f"{lead_clause.text} Recommended outcome: {trap_decision_label}."
-                                )
-                            for cid in trap_clause_ids:
-                                clause = clauses.get(cid)
-                                if clause is None:
-                                    continue
-                                clause.metadata["trap_decision_label"] = trap_decision_label
-                                clause.metadata["trap_decision_flip"] = trap_decision_flip
 
                     gold_text = " ".join(
                         str(clauses[cid].text or "") for cid in pivot_required_ids if cid in clauses
@@ -972,29 +1044,172 @@ def generate_traceops_threads(
                         if clause is None:
                             continue
                         best_gold_sim = max(best_gold_sim, _jaccard_text(message, str(clause.text or "")))
-                    best_distractor_sim = 0.0
-                    for cid in trap_clause_ids:
-                        clause = clauses.get(cid)
+
+                    def _best_distractor_similarity(ids: Sequence[str]) -> float:
+                        best = 0.0
+                        for dcid in ids:
+                            dclause = clauses.get(dcid)
+                            if dclause is None:
+                                continue
+                            best = max(best, _jaccard_text(message, str(dclause.text or "")))
+                        return float(best)
+
+                    def _trap_kind(cid: str) -> str:
+                        clause = clauses.get(str(cid))
                         if clause is None:
-                            continue
-                        best_distractor_sim = max(
-                            best_distractor_sim,
-                            _jaccard_text(message, str(clause.text or "")),
+                            return ""
+                        return str((clause.metadata or {}).get("trap_kind", "") or "").strip().lower()
+
+                    def _pick_trap_flip_target(ids: Sequence[str]) -> tuple[str, str]:
+                        ordered_ids = [str(cid) for cid in ids if str(cid).strip()]
+                        if not ordered_ids or trap_flip_attach_kind == "none":
+                            return "", ""
+                        if trap_flip_attach_kind == "random":
+                            chosen = str(trng.choice(ordered_ids))
+                            return chosen, _trap_kind(chosen)
+                        preferred = [
+                            cid
+                            for cid in ordered_ids
+                            if _trap_kind(cid) == str(trap_flip_attach_kind)
+                        ]
+                        target_id = str(preferred[0] if preferred else ordered_ids[0])
+                        return target_id, _trap_kind(target_id)
+
+                    def _flip_suffix(decision_label: str) -> str:
+                        if not decision_label:
+                            return ""
+                        if trap_flip_salience >= 0.75:
+                            return f"Recommended outcome: {decision_label}."
+                        if trap_flip_salience >= 0.35:
+                            return f"Some notes suggest outcome: {decision_label}."
+                        if trap_flip_salience > 0.0:
+                            return f"A minority view once favored: {decision_label}."
+                        return ""
+
+                    def _annotate_trap_flip(
+                        ids: Sequence[str], decision_label: str, flip_flag: bool
+                    ) -> tuple[str, str]:
+                        target_id, target_kind = _pick_trap_flip_target(ids)
+                        suffix = _flip_suffix(decision_label)
+                        if target_id and suffix:
+                            tclause = clauses.get(str(target_id))
+                            if tclause is not None:
+                                tclause.text = f"{tclause.text} {suffix}"
+                        for dcid in ids:
+                            dclause = clauses.get(str(dcid))
+                            if dclause is None:
+                                continue
+                            dclause.metadata["trap_decision_label"] = decision_label
+                            dclause.metadata["trap_decision_flip"] = bool(flip_flag)
+                            if target_id and str(dcid) == str(target_id):
+                                dclause.metadata["trap_flip_target"] = True
+                        return str(target_id), str(target_kind)
+
+                    trap_flip_target_id = ""
+                    trap_flip_target_kind = ""
+                    if trap_decision_flip_enable:
+                        trap_flip_target_id, trap_flip_target_kind = _annotate_trap_flip(
+                            trap_clause_ids, trap_decision_label, trap_decision_flip
                         )
+
+                    trap_gap_failed = False
+                    best_distractor_sim = _best_distractor_similarity(trap_clause_ids)
                     trap_gap = float(best_distractor_sim - best_gold_sim)
-                    trap_required = bool(trap_clause_ids) and trng.random() < float(trap_similarity_boost)
-                    if trap_required and trap_gap <= 0.0 and trap_clause_ids:
-                        boosted_id = trap_clause_ids[0]
-                        boosted_clause = clauses.get(boosted_id)
-                        if boosted_clause is not None:
-                            boosted_clause.text = (
-                                f"{message} {message} stale stale legacy legacy binding."
+                    if trap_clause_ids and trap_gap <= 0.0:
+                        for trap_try in range(1, int(trap_gap_max_tries) + 1):
+                            if trap_gap > 0.0:
+                                break
+                            _cleanup_trap_clause_ids(trap_clause_ids)
+                            trap_clause_ids = _make_trap_clause_set(trap_try)
+                            if trap_decision_flip_enable:
+                                trap_flip_target_id, trap_flip_target_kind = _annotate_trap_flip(
+                                    trap_clause_ids, trap_decision_label, trap_decision_flip
+                                )
+                            best_distractor_sim = _best_distractor_similarity(trap_clause_ids)
+                            trap_gap = float(best_distractor_sim - best_gold_sim)
+                        if trap_gap <= 0.0 and trap_clause_ids:
+                            trap_gap_failed = True
+
+                    trap_graph_excludable_ids: List[str] = []
+                    trap_invalidation_attached_to_update = False
+                    if trap_clause_ids and trap_graph_excludable_rate > 0.0:
+                        eligible = [
+                            str(cid)
+                            for cid in trap_clause_ids
+                            if _trap_kind(str(cid)) in trap_graph_excludable_kind_set
+                        ]
+                        for cid in eligible:
+                            if trng.random() <= float(trap_graph_excludable_rate):
+                                trap_graph_excludable_ids.append(str(cid))
+                        if eligible and not trap_graph_excludable_ids:
+                            trap_graph_excludable_ids.append(str(eligible[0]))
+                        trap_graph_excludable_ids = _unique_strs(trap_graph_excludable_ids)
+
+                    def _ensure_latest_update_step_for_trap() -> TraceStep | None:
+                        for s in reversed(steps):
+                            if str(s.kind) == "update":
+                                return s
+                        if not steps:
+                            return None
+                        fallback_step = steps[-1]
+                        fallback_step.kind = "update"
+                        if "update" not in str(fallback_step.message or "").lower():
+                            base_message = str(fallback_step.message or "").strip()
+                            fallback_step.message = (
+                                f"{base_message} User update reconciles earlier conflicting notes.".strip()
                             )
-                        best_distractor_sim = max(
-                            best_distractor_sim,
-                            _jaccard_text(message, str(clauses[boosted_id].text or "")),
+                        noop_key = str(ordinal_key)
+                        noop_val = str(state.get(noop_key, ""))
+                        noop_id = _new_clause(
+                            step_idx=int(fallback_step.step_idx),
+                            node_type="UPDATE",
+                            text=f"Update: {noop_key} remains {noop_val}.",
+                            state_key=noop_key,
+                            state_value=noop_val,
+                            tags=["update", "graph_excludable_noop"],
+                            metadata={"noop_update": True},
                         )
-                        trap_gap = float(best_distractor_sim - best_gold_sim)
+                        fallback_step.introduced_clause_ids = _unique_strs(
+                            list(fallback_step.introduced_clause_ids) + [noop_id]
+                        )
+                        update_ids.append(noop_id)
+                        update_ids_by_key.setdefault(noop_key, []).append(noop_id)
+                        return fallback_step
+
+                    if trap_graph_excludable_ids:
+                        update_step_for_trap = _ensure_latest_update_step_for_trap()
+                        if update_step_for_trap is not None:
+                            update_step_for_trap.avoid_target_ids = _unique_strs(
+                                list(update_step_for_trap.avoid_target_ids) + list(trap_graph_excludable_ids)
+                            )
+                            active_invalidated.update(trap_graph_excludable_ids)
+                            hint_ids = ",".join(list(trap_graph_excludable_ids)[:3])
+                            hint_suffix = ""
+                            if trap_invalidation_text_strength >= 0.75:
+                                hint_suffix = (
+                                    f"This update supersedes earlier notes, including: {hint_ids}."
+                                )
+                            elif trap_invalidation_text_strength >= 0.35:
+                                hint_suffix = (
+                                    f"Earlier notes ({hint_ids}) are not controlling under current state."
+                                )
+                            elif trap_invalidation_text_strength > 0.0:
+                                hint_suffix = (
+                                    f"Cross-check: prior note IDs ({hint_ids}) may no longer control."
+                                )
+                            if hint_suffix:
+                                for uid in reversed(list(update_step_for_trap.introduced_clause_ids or [])):
+                                    uclause = clauses.get(str(uid))
+                                    if uclause is None or str(uclause.node_type or "") != "UPDATE":
+                                        continue
+                                    if hint_suffix not in str(uclause.text or ""):
+                                        uclause.text = f"{uclause.text} {hint_suffix}"
+                                    uclause.metadata["trap_graph_excludable_ids"] = list(
+                                        trap_graph_excludable_ids
+                                    )
+                                    trap_invalidation_attached_to_update = True
+                                    break
+
                     pivot_meta = {
                         "indirect_active": True,
                         "pivot_style": str(style_choice),
@@ -1002,9 +1217,20 @@ def generate_traceops_threads(
                         "best_gold_sim": float(best_gold_sim),
                         "best_distractor_sim": float(best_distractor_sim),
                         "trap_gap": float(trap_gap),
-                        "trap_present": bool(best_distractor_sim > best_gold_sim and len(trap_clause_ids) > 0),
+                        "trap_present": bool(trap_gap > 0.0 and len(trap_clause_ids) > 0),
+                        "trap_gap_failed": bool(trap_gap_failed),
                         "core_size": int(len(pivot_required_ids)),
                         "trap_distractor_ids": list(trap_clause_ids),
+                        "trap_flip_target_id": str(trap_flip_target_id or ""),
+                        "trap_flip_target_kind": str(trap_flip_target_kind or ""),
+                        "trap_graph_excludable_count": int(len(trap_graph_excludable_ids)),
+                        "trap_graph_excludable_ids": list(trap_graph_excludable_ids),
+                        "trap_invalidation_attached_to_update": bool(trap_invalidation_attached_to_update),
+                        "trap_flip_salience": float(trap_flip_salience),
+                        "trap_flip_attach_kind": str(trap_flip_attach_kind),
+                        "trap_graph_excludable_rate": float(trap_graph_excludable_rate),
+                        "trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
+                        "trap_invalidation_text_strength": float(trap_invalidation_text_strength),
                         "core_necessity_enable": bool(core_necessity_enable),
                         "core_necessity_flip_count": int(accepted_flip_count if core_necessity_enable else 0),
                         "core_necessity_all_required": bool(
@@ -1013,6 +1239,7 @@ def generate_traceops_threads(
                         "core_necessity_failed": bool(
                             core_necessity_enable and core_necessity_require_all and not accepted_all_required
                         ),
+                        "core_necessity_tries_used": int(accepted_tries_used if core_necessity_enable else 0),
                         "trap_decision_label": str(trap_decision_label or ""),
                         "trap_decision_flip": bool(trap_decision_flip),
                         "hidden_core_ids": list(hidden_core_ids),
@@ -1119,9 +1346,15 @@ def generate_traceops_threads(
                 "traceops_core_necessity_enable": bool(core_necessity_enable),
                 "traceops_core_necessity_require_all": bool(core_necessity_require_all),
                 "traceops_trap_decision_flip_enable": bool(trap_decision_flip_enable),
+                "traceops_trap_flip_salience": float(trap_flip_salience),
+                "traceops_trap_flip_attach_kind": str(trap_flip_attach_kind),
+                "traceops_trap_graph_excludable_rate": float(trap_graph_excludable_rate),
+                "traceops_trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
+                "traceops_trap_invalidation_text_strength": float(trap_invalidation_text_strength),
                 "traceops_hidden_core_enable": bool(hidden_core_enable),
                 "traceops_hidden_core_kind": str(hidden_core_kind),
                 "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
+                "traceops_trap_require_avoided": bool(trap_require_avoided),
             },
         )
         result.append(thread)
@@ -1148,9 +1381,15 @@ def generate_traceops_threads(
         "traceops_core_necessity_enable": bool(core_necessity_enable),
         "traceops_core_necessity_require_all": bool(core_necessity_require_all),
         "traceops_trap_decision_flip_enable": bool(trap_decision_flip_enable),
+        "traceops_trap_flip_salience": float(trap_flip_salience),
+        "traceops_trap_flip_attach_kind": str(trap_flip_attach_kind),
+        "traceops_trap_graph_excludable_rate": float(trap_graph_excludable_rate),
+        "traceops_trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
+        "traceops_trap_invalidation_text_strength": float(trap_invalidation_text_strength),
         "traceops_hidden_core_enable": bool(hidden_core_enable),
         "traceops_hidden_core_kind": str(hidden_core_kind),
         "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
+        "traceops_trap_require_avoided": bool(trap_require_avoided),
         "pivots_available_total": int(
             sum(1 for thread in result for step in thread.steps if str(step.kind) == "pivot_check")
         ),

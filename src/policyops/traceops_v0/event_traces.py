@@ -41,6 +41,7 @@ def build_event_trace_line(
 
     # Correctness/evidence diagnostics (top-level)
     for key in [
+        "decision_correct_strict_raw",
         "decision_correct_exact",
         "decision_correct_family",
         "conditions_correct_exact",
@@ -66,17 +67,26 @@ def build_event_trace_line(
         "best_distractor_sim",
         "trap_gap",
         "trap_present",
+        "trap_injected_count",
+        "trap_injected_rate",
         "core_size",
         "core_necessity_flip_count",
         "core_necessity_all_required",
         "core_necessity_failed",
         "trap_decision_label",
         "trap_decision_flip",
+        "trap_flip_target_id",
+        "trap_flip_target_kind",
+        "trap_graph_excludable_count",
+        "trap_invalidation_attached_to_update",
     ]:
         line[key] = rec.get(key)
     line["hidden_core_ids"] = _cap("hidden_core_ids", rec.get("hidden_core_ids"))
     line["hidden_core_parent_ids"] = _cap("hidden_core_parent_ids", rec.get("hidden_core_parent_ids"))
     line["trap_distractor_ids"] = _cap("trap_distractor_ids", rec.get("trap_distractor_ids"))
+    line["trap_graph_excludable_ids"] = _cap(
+        "trap_graph_excludable_ids", rec.get("trap_graph_excludable_ids")
+    )
 
     raw_context_ids = line.get("context_clause_ids")
     context_clause_ids = _cap("context_clause_ids", raw_context_ids)
@@ -183,6 +193,20 @@ def build_event_trace_line(
         "best_distractor_sim": rec.get("best_distractor_sim"),
         "trap_gap": rec.get("trap_gap"),
         "trap_present": rec.get("trap_present"),
+        "trap_injected_count": rec.get("trap_injected_count"),
+        "trap_injected_rate": rec.get("trap_injected_rate"),
+        "trap_flip_target_id": rec.get("trap_flip_target_id"),
+        "trap_flip_target_kind": rec.get("trap_flip_target_kind"),
+        "trap_graph_excludable_count": rec.get("trap_graph_excludable_count"),
+        "trap_graph_excludable_ids": _cap(
+            "scenario_trap_graph_excludable_ids", rec.get("trap_graph_excludable_ids")
+        ),
+        "trap_invalidation_attached_to_update": rec.get("trap_invalidation_attached_to_update"),
+        "trap_flip_salience": rec.get("trap_flip_salience"),
+        "trap_flip_attach_kind": rec.get("trap_flip_attach_kind"),
+        "trap_graph_excludable_rate": rec.get("trap_graph_excludable_rate"),
+        "trap_graph_excludable_kinds": rec.get("trap_graph_excludable_kinds"),
+        "trap_invalidation_text_strength": rec.get("trap_invalidation_text_strength"),
         "core_size": rec.get("core_size"),
         "core_necessity_flip_count": rec.get("core_necessity_flip_count"),
         "core_necessity_all_required": rec.get("core_necessity_all_required"),

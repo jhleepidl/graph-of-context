@@ -4,6 +4,24 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+def normalize_decision(decision: str) -> str:
+    value = str(decision or "").strip().lower()
+    if value == "allow":
+        return "allow"
+    if value == "deny":
+        return "deny"
+    if value in {
+        "require_exception",
+        "require_residency",
+        "require_condition",
+        "override_invalidated",
+    }:
+        return "require_condition"
+    if value in {"defer", "unknown", "needs_more_info"}:
+        return "needs_more_info"
+    return "needs_more_info"
+
+
 @dataclass
 class TraceGold:
     decision: str

@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from policyops.traceops_v0.failure_taxonomy import compare_pair
 from policyops.traceops_v0.event_traces import build_event_trace_line
+from policyops.traceops_v0.schema import normalize_decision
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -57,18 +58,7 @@ def _resolve_report_path(phase15_root: Path, run: Dict[str, Any]) -> Path | None
 
 
 def _gold_decision_family(gold_decision: str) -> str:
-    decision = str(gold_decision or "")
-    if decision == "allow":
-        return "allow"
-    if decision == "deny":
-        return "deny"
-    if decision == "defer":
-        return "needs_more_info"
-    if decision.startswith("require_"):
-        return "require_condition"
-    if decision == "override_invalidated":
-        return "require_condition"
-    return decision
+    return normalize_decision(gold_decision)
 
 
 def _as_float(value: Any) -> float:
@@ -501,6 +491,9 @@ def main() -> None:
                     "pivot_decision_accuracy": _as_float(
                         metrics.get("pivot_decision_accuracy")
                     ),
+                    "pivot_decision_accuracy_strict_raw": _as_float(
+                        metrics.get("pivot_decision_accuracy_strict_raw")
+                    ),
                     "pivot_e3_only_accuracy": _as_float(
                         metrics.get("pivot_e3_only_accuracy")
                     ),
@@ -549,6 +542,15 @@ def main() -> None:
                     ),
                     "mean_trap_gap": _as_float(metrics.get("mean_trap_gap")),
                     "trap_present_rate": _as_float(metrics.get("trap_present_rate")),
+                    "mean_trap_injected_count": _as_float(
+                        metrics.get("mean_trap_injected_count")
+                    ),
+                    "mean_trap_injected_rate": _as_float(
+                        metrics.get("mean_trap_injected_rate")
+                    ),
+                    "trap_injected_any_rate": _as_float(
+                        metrics.get("trap_injected_any_rate")
+                    ),
                     "mean_core_size": _as_float(metrics.get("mean_core_size")),
                     "core_necessity_all_required_rate": _as_float(
                         metrics.get("core_necessity_all_required_rate")
@@ -618,8 +620,16 @@ def main() -> None:
                     if isinstance(cobj, dict) and int(cobj.get("step_idx", 0) or 0) < int(step_idx)
                 ]
 
-                gold_decision = str(rec.get("gold_decision", "") or "")
-                gold_family = str(rec.get("gold_decision_family") or _gold_decision_family(gold_decision))
+                gold_decision_raw = str(
+                    rec.get("gold_decision_raw", rec.get("gold_decision", "")) or ""
+                )
+                gold_decision = normalize_decision(
+                    str(rec.get("gold_decision", gold_decision_raw) or gold_decision_raw)
+                )
+                gold_family = str(
+                    rec.get("gold_decision_family")
+                    or _gold_decision_family(gold_decision_raw or gold_decision)
+                )
                 gold_core_ids = list(
                     rec.get("pivot_required_clause_ids")
                     or rec.get("gold_evidence_ids")
@@ -651,17 +661,22 @@ def main() -> None:
                     ),
                     "pivot_question": pivot_question,
                     "gold": {
+                        "decision_raw": gold_decision_raw,
                         "decision": gold_decision,
                         "decision_family": gold_family,
                         "conditions": list(rec.get("gold_conditions") or []),
                         "evidence_core_ids": list(gold_core_ids),
                     },
                     "pred": {
+                        "decision_raw": str(rec.get("pred_decision_raw", rec.get("pred_decision", "")) or ""),
                         "decision": str(rec.get("pred_decision", "") or ""),
                         "conditions": list(rec.get("pred_conditions") or []),
                         "evidence": list(rec.get("pred_evidence") or []),
                     },
                     "decision_correct": bool(rec.get("decision_correct", False)),
+                    "decision_correct_strict_raw": bool(
+                        rec.get("decision_correct_strict_raw", rec.get("decision_correct_exact", False))
+                    ),
                     "conditions_correct": bool(rec.get("conditions_correct", False)),
                     "conditions_correct_exact": bool(rec.get("conditions_correct_exact", False)),
                     "conditions_correct_subset": bool(rec.get("conditions_correct_subset", False)),
@@ -723,6 +738,7 @@ def main() -> None:
             "traceops_scenario",
             "method",
             "pivot_decision_accuracy",
+            "pivot_decision_accuracy_strict_raw",
             "pivot_e3_only_accuracy",
             "strict_pivot_accuracy",
             "pivots_available_total",
@@ -747,6 +763,9 @@ def main() -> None:
             "mean_indirection_overlap_gold",
             "mean_trap_gap",
             "trap_present_rate",
+            "mean_trap_injected_count",
+            "mean_trap_injected_rate",
+            "trap_injected_any_rate",
             "mean_core_size",
             "core_necessity_all_required_rate",
             "mean_core_necessity_flip_count",
@@ -766,6 +785,7 @@ def main() -> None:
         group_cols = ["traceops_level", "traceops_scenario", "method"]
         agg_cols = [
             "pivot_decision_accuracy",
+            "pivot_decision_accuracy_strict_raw",
             "pivot_e3_only_accuracy",
             "strict_pivot_accuracy",
             "pivots_available_total",
@@ -790,6 +810,9 @@ def main() -> None:
             "mean_indirection_overlap_gold",
             "mean_trap_gap",
             "trap_present_rate",
+            "mean_trap_injected_count",
+            "mean_trap_injected_rate",
+            "trap_injected_any_rate",
             "mean_core_size",
             "core_necessity_all_required_rate",
             "mean_core_necessity_flip_count",

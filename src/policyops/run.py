@@ -7887,6 +7887,20 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
         core_necessity_enable=bool(getattr(args, "traceops_core_necessity_enable", False)),
         core_necessity_require_all=bool(getattr(args, "traceops_core_necessity_require_all", True)),
         trap_decision_flip_enable=bool(getattr(args, "traceops_trap_decision_flip_enable", False)),
+        trap_flip_salience=float(getattr(args, "traceops_trap_flip_salience", 0.25) or 0.25),
+        trap_flip_attach_kind=str(
+            getattr(args, "traceops_trap_flip_attach_kind", "avoided") or "avoided"
+        ),
+        trap_graph_excludable_rate=float(
+            getattr(args, "traceops_trap_graph_excludable_rate", 0.7) or 0.7
+        ),
+        trap_graph_excludable_kinds=str(
+            getattr(args, "traceops_trap_graph_excludable_kinds", "stale,inapplicable,avoided")
+            or "stale,inapplicable,avoided"
+        ),
+        trap_invalidation_text_strength=float(
+            getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
+        ),
         hidden_core_enable=bool(getattr(args, "traceops_hidden_core_enable", False)),
         hidden_core_kind=str(getattr(args, "traceops_hidden_core_kind", "low_overlap_clause") or "low_overlap_clause"),
         hidden_core_link_mode=str(
@@ -7951,6 +7965,22 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             ),
             "traceops_trap_decision_flip_enable": bool(
                 getattr(args, "traceops_trap_decision_flip_enable", False)
+            ),
+            "traceops_trap_flip_salience": float(
+                getattr(args, "traceops_trap_flip_salience", 0.25) or 0.25
+            ),
+            "traceops_trap_flip_attach_kind": str(
+                getattr(args, "traceops_trap_flip_attach_kind", "avoided") or "avoided"
+            ),
+            "traceops_trap_graph_excludable_rate": float(
+                getattr(args, "traceops_trap_graph_excludable_rate", 0.7) or 0.7
+            ),
+            "traceops_trap_graph_excludable_kinds": str(
+                getattr(args, "traceops_trap_graph_excludable_kinds", "stale,inapplicable,avoided")
+                or "stale,inapplicable,avoided"
+            ),
+            "traceops_trap_invalidation_text_strength": float(
+                getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
             ),
             "traceops_hidden_core_enable": bool(getattr(args, "traceops_hidden_core_enable", False)),
             "traceops_hidden_core_kind": str(
@@ -8037,6 +8067,9 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "mean_indirection_overlap_gold": metrics.get("mean_indirection_overlap_gold"),
             "mean_trap_gap": metrics.get("mean_trap_gap"),
             "trap_present_rate": metrics.get("trap_present_rate"),
+            "mean_trap_injected_count": metrics.get("mean_trap_injected_count"),
+            "mean_trap_injected_rate": metrics.get("mean_trap_injected_rate"),
+            "trap_injected_any_rate": metrics.get("trap_injected_any_rate"),
             "mean_core_size": metrics.get("mean_core_size"),
             "decision_accuracy": metrics.get("decision_accuracy"),
             "judge_accuracy": metrics.get("judge_accuracy"),
@@ -8074,6 +8107,22 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             ),
             "traceops_trap_decision_flip_enable": bool(
                 getattr(args, "traceops_trap_decision_flip_enable", False)
+            ),
+            "traceops_trap_flip_salience": float(
+                getattr(args, "traceops_trap_flip_salience", 0.25) or 0.25
+            ),
+            "traceops_trap_flip_attach_kind": str(
+                getattr(args, "traceops_trap_flip_attach_kind", "avoided") or "avoided"
+            ),
+            "traceops_trap_graph_excludable_rate": float(
+                getattr(args, "traceops_trap_graph_excludable_rate", 0.7) or 0.7
+            ),
+            "traceops_trap_graph_excludable_kinds": str(
+                getattr(args, "traceops_trap_graph_excludable_kinds", "stale,inapplicable,avoided")
+                or "stale,inapplicable,avoided"
+            ),
+            "traceops_trap_invalidation_text_strength": float(
+                getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
             ),
             "traceops_hidden_core_enable": bool(getattr(args, "traceops_hidden_core_enable", False)),
             "traceops_hidden_core_kind": str(
@@ -8536,6 +8585,19 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
     gen.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
     gen.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    gen.add_argument("--traceops_trap_flip_salience", type=float, default=0.25)
+    gen.add_argument(
+        "--traceops_trap_flip_attach_kind",
+        choices=["stale", "inapplicable", "avoided", "random", "none"],
+        default="avoided",
+    )
+    gen.add_argument("--traceops_trap_graph_excludable_rate", type=float, default=0.7)
+    gen.add_argument(
+        "--traceops_trap_graph_excludable_kinds",
+        type=str,
+        default="stale,inapplicable,avoided",
+    )
+    gen.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     gen.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     gen.add_argument(
         "--traceops_hidden_core_kind",
@@ -8730,6 +8792,19 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
     ev.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
     ev.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    ev.add_argument("--traceops_trap_flip_salience", type=float, default=0.25)
+    ev.add_argument(
+        "--traceops_trap_flip_attach_kind",
+        choices=["stale", "inapplicable", "avoided", "random", "none"],
+        default="avoided",
+    )
+    ev.add_argument("--traceops_trap_graph_excludable_rate", type=float, default=0.7)
+    ev.add_argument(
+        "--traceops_trap_graph_excludable_kinds",
+        type=str,
+        default="stale,inapplicable,avoided",
+    )
+    ev.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     ev.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     ev.add_argument(
         "--traceops_hidden_core_kind",
@@ -9105,6 +9180,19 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
     cmp.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
     cmp.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    cmp.add_argument("--traceops_trap_flip_salience", type=float, default=0.25)
+    cmp.add_argument(
+        "--traceops_trap_flip_attach_kind",
+        choices=["stale", "inapplicable", "avoided", "random", "none"],
+        default="avoided",
+    )
+    cmp.add_argument("--traceops_trap_graph_excludable_rate", type=float, default=0.7)
+    cmp.add_argument(
+        "--traceops_trap_graph_excludable_kinds",
+        type=str,
+        default="stale,inapplicable,avoided",
+    )
+    cmp.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     cmp.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     cmp.add_argument(
         "--traceops_hidden_core_kind",

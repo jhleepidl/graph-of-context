@@ -86,8 +86,12 @@ def test_llm_mode_uses_family_correctness_for_primary_metric(tmp_path) -> None:
     )
     rec = report["records"][0]
 
+    assert rec["gold_decision_raw"] == "require_exception"
+    assert rec["gold_decision"] == "require_condition"
     assert rec["gold_decision_family"] == "require_condition"
+    assert rec["decision_correct_strict_raw"] is False
     assert rec["decision_correct_exact"] is False
     assert rec["decision_correct_family"] is True
     assert rec["decision_correct"] is True
     assert report["metrics"]["pivot_decision_accuracy"] == 1.0
+    assert report["metrics"]["pivot_decision_accuracy_strict_raw"] == 0.0

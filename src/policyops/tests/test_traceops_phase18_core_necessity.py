@@ -19,6 +19,11 @@ def test_phase18_generator_records_core_necessity_and_hidden_core_metadata() -> 
         core_necessity_enable=True,
         core_necessity_require_all=True,
         trap_decision_flip_enable=True,
+        trap_flip_salience=0.25,
+        trap_flip_attach_kind="avoided",
+        trap_graph_excludable_rate=1.0,
+        trap_graph_excludable_kinds="stale,inapplicable,avoided",
+        trap_invalidation_text_strength=0.6,
         hidden_core_enable=True,
         hidden_core_kind="low_overlap_clause",
         hidden_core_link_mode="depends_on",
@@ -27,6 +32,11 @@ def test_phase18_generator_records_core_necessity_and_hidden_core_metadata() -> 
     assert meta.get("traceops_core_necessity_enable") is True
     assert meta.get("traceops_core_necessity_require_all") is True
     assert meta.get("traceops_trap_decision_flip_enable") is True
+    assert float(meta.get("traceops_trap_flip_salience", -1.0)) == 0.25
+    assert meta.get("traceops_trap_flip_attach_kind") == "avoided"
+    assert float(meta.get("traceops_trap_graph_excludable_rate", -1.0)) == 1.0
+    assert meta.get("traceops_trap_graph_excludable_kinds") == "avoided,inapplicable,stale"
+    assert float(meta.get("traceops_trap_invalidation_text_strength", -1.0)) == 0.6
     assert meta.get("traceops_hidden_core_enable") is True
     assert meta.get("traceops_hidden_core_kind") == "low_overlap_clause"
     assert meta.get("traceops_hidden_core_link_mode") == "depends_on"
@@ -54,6 +64,11 @@ def test_phase18_generator_records_core_necessity_and_hidden_core_metadata() -> 
             assert "core_necessity_failed" in md
             assert "trap_decision_label" in md
             assert "trap_decision_flip" in md
+            assert "trap_flip_target_id" in md
+            assert "trap_flip_target_kind" in md
+            assert "trap_graph_excludable_count" in md
+            assert "trap_graph_excludable_ids" in md
+            assert "trap_invalidation_attached_to_update" in md
             assert "hidden_core_ids" in md
             assert "hidden_core_parent_ids" in md
 
@@ -74,4 +89,3 @@ def test_phase18_generator_records_core_necessity_and_hidden_core_metadata() -> 
     assert has_all_required
     assert has_trap_flip
     assert has_hidden_core
-

@@ -106,6 +106,11 @@ class RunEntry:
     traceops_core_necessity_enable: bool
     traceops_core_necessity_require_all: bool
     traceops_trap_decision_flip_enable: bool
+    traceops_trap_flip_salience: float
+    traceops_trap_flip_attach_kind: str
+    traceops_trap_graph_excludable_rate: float
+    traceops_trap_graph_excludable_kinds: str
+    traceops_trap_invalidation_text_strength: float
     traceops_hidden_core_enable: bool
     traceops_hidden_core_kind: str
     traceops_hidden_core_link_mode: str
@@ -163,6 +168,19 @@ def main() -> None:
     ap.add_argument("--traceops_core_necessity_require_all", action="store_true", default=True)
     ap.add_argument("--no_traceops_core_necessity_require_all", action="store_false", dest="traceops_core_necessity_require_all")
     ap.add_argument("--traceops_trap_decision_flip_enable", action="store_true", default=False)
+    ap.add_argument("--traceops_trap_flip_salience", type=float, default=0.25)
+    ap.add_argument(
+        "--traceops_trap_flip_attach_kind",
+        choices=["stale", "inapplicable", "avoided", "random", "none"],
+        default="avoided",
+    )
+    ap.add_argument("--traceops_trap_graph_excludable_rate", type=float, default=0.7)
+    ap.add_argument(
+        "--traceops_trap_graph_excludable_kinds",
+        type=str,
+        default="stale,inapplicable,avoided",
+    )
+    ap.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     ap.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
     ap.add_argument(
         "--traceops_hidden_core_kind",
@@ -243,6 +261,11 @@ def main() -> None:
         "traceops_core_necessity_enable": bool(args.traceops_core_necessity_enable),
         "traceops_core_necessity_require_all": bool(args.traceops_core_necessity_require_all),
         "traceops_trap_decision_flip_enable": bool(args.traceops_trap_decision_flip_enable),
+        "traceops_trap_flip_salience": float(args.traceops_trap_flip_salience),
+        "traceops_trap_flip_attach_kind": str(args.traceops_trap_flip_attach_kind),
+        "traceops_trap_graph_excludable_rate": float(args.traceops_trap_graph_excludable_rate),
+        "traceops_trap_graph_excludable_kinds": str(args.traceops_trap_graph_excludable_kinds),
+        "traceops_trap_invalidation_text_strength": float(args.traceops_trap_invalidation_text_strength),
         "traceops_hidden_core_enable": bool(args.traceops_hidden_core_enable),
         "traceops_hidden_core_kind": str(args.traceops_hidden_core_kind),
         "traceops_hidden_core_link_mode": str(args.traceops_hidden_core_link_mode),
@@ -300,6 +323,16 @@ def main() -> None:
             str(args.traceops_alias_chain_len),
             "--traceops_indirect_pivot_style",
             str(args.traceops_indirect_pivot_style),
+            "--traceops_trap_flip_salience",
+            str(args.traceops_trap_flip_salience),
+            "--traceops_trap_flip_attach_kind",
+            str(args.traceops_trap_flip_attach_kind),
+            "--traceops_trap_graph_excludable_rate",
+            str(args.traceops_trap_graph_excludable_rate),
+            "--traceops_trap_graph_excludable_kinds",
+            str(args.traceops_trap_graph_excludable_kinds),
+            "--traceops_trap_invalidation_text_strength",
+            str(args.traceops_trap_invalidation_text_strength),
             "--traceops_hidden_core_kind",
             str(args.traceops_hidden_core_kind),
             "--traceops_hidden_core_link_mode",
@@ -348,6 +381,11 @@ def main() -> None:
                     "traceops_core_necessity_enable",
                     "traceops_core_necessity_require_all",
                     "traceops_trap_decision_flip_enable",
+                    "traceops_trap_flip_salience",
+                    "traceops_trap_flip_attach_kind",
+                    "traceops_trap_graph_excludable_rate",
+                    "traceops_trap_graph_excludable_kinds",
+                    "traceops_trap_invalidation_text_strength",
                     "traceops_hidden_core_enable",
                     "traceops_hidden_core_kind",
                     "traceops_hidden_core_link_mode",
@@ -384,6 +422,16 @@ def main() -> None:
             str(int(args.traceops_alias_chain_len)),
             "--traceops_indirect_pivot_style",
             str(args.traceops_indirect_pivot_style),
+            "--traceops_trap_flip_salience",
+            str(float(args.traceops_trap_flip_salience)),
+            "--traceops_trap_flip_attach_kind",
+            str(args.traceops_trap_flip_attach_kind),
+            "--traceops_trap_graph_excludable_rate",
+            str(float(args.traceops_trap_graph_excludable_rate)),
+            "--traceops_trap_graph_excludable_kinds",
+            str(args.traceops_trap_graph_excludable_kinds),
+            "--traceops_trap_invalidation_text_strength",
+            str(float(args.traceops_trap_invalidation_text_strength)),
             "--traceops_hidden_core_kind",
             str(args.traceops_hidden_core_kind),
             "--traceops_hidden_core_link_mode",
@@ -472,6 +520,11 @@ def main() -> None:
                     traceops_core_necessity_enable=bool(args.traceops_core_necessity_enable),
                     traceops_core_necessity_require_all=bool(args.traceops_core_necessity_require_all),
                     traceops_trap_decision_flip_enable=bool(args.traceops_trap_decision_flip_enable),
+                    traceops_trap_flip_salience=float(args.traceops_trap_flip_salience),
+                    traceops_trap_flip_attach_kind=str(args.traceops_trap_flip_attach_kind),
+                    traceops_trap_graph_excludable_rate=float(args.traceops_trap_graph_excludable_rate),
+                    traceops_trap_graph_excludable_kinds=str(args.traceops_trap_graph_excludable_kinds),
+                    traceops_trap_invalidation_text_strength=float(args.traceops_trap_invalidation_text_strength),
                     traceops_hidden_core_enable=bool(args.traceops_hidden_core_enable),
                     traceops_hidden_core_kind=str(args.traceops_hidden_core_kind),
                     traceops_hidden_core_link_mode=str(args.traceops_hidden_core_link_mode),
@@ -580,6 +633,11 @@ def main() -> None:
                         traceops_core_necessity_enable=bool(args.traceops_core_necessity_enable),
                         traceops_core_necessity_require_all=bool(args.traceops_core_necessity_require_all),
                         traceops_trap_decision_flip_enable=bool(args.traceops_trap_decision_flip_enable),
+                        traceops_trap_flip_salience=float(args.traceops_trap_flip_salience),
+                        traceops_trap_flip_attach_kind=str(args.traceops_trap_flip_attach_kind),
+                        traceops_trap_graph_excludable_rate=float(args.traceops_trap_graph_excludable_rate),
+                        traceops_trap_graph_excludable_kinds=str(args.traceops_trap_graph_excludable_kinds),
+                        traceops_trap_invalidation_text_strength=float(args.traceops_trap_invalidation_text_strength),
                         traceops_hidden_core_enable=bool(args.traceops_hidden_core_enable),
                         traceops_hidden_core_kind=str(args.traceops_hidden_core_kind),
                         traceops_hidden_core_link_mode=str(args.traceops_hidden_core_link_mode),
@@ -687,6 +745,15 @@ def main() -> None:
             f"- core_size=[{int(args.traceops_core_size_min)},{int(args.traceops_core_size_max)}] "
             f"alias_chain_len={int(args.traceops_alias_chain_len)} "
             f"indirect_pivot_style={str(args.traceops_indirect_pivot_style)}"
+        ),
+        (
+            f"- trap_flip_salience={float(args.traceops_trap_flip_salience)} "
+            f"trap_flip_attach_kind={str(args.traceops_trap_flip_attach_kind)} "
+            f"trap_graph_excludable_rate={float(args.traceops_trap_graph_excludable_rate)}"
+        ),
+        (
+            f"- trap_graph_excludable_kinds={str(args.traceops_trap_graph_excludable_kinds)} "
+            f"trap_invalidation_text_strength={float(args.traceops_trap_invalidation_text_strength)}"
         ),
         (
             f"- traceops_eval_mode={str(args.traceops_eval_mode)} "

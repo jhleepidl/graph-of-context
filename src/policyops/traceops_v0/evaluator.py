@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Set, Tuple
 
-from .schema import TraceGold, TraceStep, TraceThread, TraceWorldClause
+from .schema import TraceGold, TraceStep, TraceThread, TraceWorldClause, normalize_decision
 
 if TYPE_CHECKING:
     from ..baselines import LLMClient
@@ -228,18 +228,7 @@ def _clause_applicable(clause: TraceWorldClause, state: Dict[str, Any]) -> bool:
 
 
 def _gold_decision_family(gold_decision: str) -> str:
-    decision = str(gold_decision or "")
-    if decision == "allow":
-        return "allow"
-    if decision == "deny":
-        return "deny"
-    if decision == "defer":
-        return "needs_more_info"
-    if decision.startswith("require_"):
-        return "require_condition"
-    if decision == "override_invalidated":
-        return "require_condition"
-    return decision
+    return normalize_decision(gold_decision)
 
 
 def _dependency_closure(
@@ -930,7 +919,8 @@ def _score_step(
     required_ids = _unique_strs(step.pivot_required_ids or gold.evidence_core_ids or gold.evidence_ids)
     required_set = set(required_ids)
 
-    pred_decision = str(prediction.get("decision", ""))
+    pred_decision_raw = str(prediction.get("decision", ""))
+    pred_decision = normalize_decision(pred_decision_raw)
     pred_conditions = _unique_strs(prediction.get("conditions") or [])
     pred_evidence = _unique_strs(prediction.get("evidence") or [])
 
@@ -967,11 +957,13 @@ def _score_step(
         if cid in ex_equiv_map and str(ex_equiv_map.get(cid, "") or "")
     }
 
-    gold_decision = str(gold.decision)
-    gold_decision_family = _gold_decision_family(gold_decision)
-    decision_correct_exact = bool(pred_decision == gold_decision)
+    gold_decision_raw = str(gold.decision)
+    gold_decision = normalize_decision(gold_decision_raw)
+    gold_decision_family = _gold_decision_family(gold_decision_raw)
+    decision_correct_strict_raw = bool(pred_decision_raw == gold_decision_raw)
+    decision_correct_exact = bool(decision_correct_strict_raw)
     decision_correct_family = bool(pred_decision == gold_decision_family)
-    decision_correct = decision_correct_family if str(eval_mode) == "llm" else decision_correct_exact
+    decision_correct = bool(pred_decision == gold_decision)
     conditions_correct_exact = bool(set(pred_conditions) == set(gold_conditions))
     conditions_correct_subset = bool(set(gold_conditions).issubset(set(pred_conditions)))
     pred_conditions_equiv = _unique_strs(
@@ -1044,7 +1036,10 @@ def _score_step(
 
     return {
         "decision_correct": decision_correct,
+        "gold_decision": gold_decision,
+        "gold_decision_raw": gold_decision_raw,
         "gold_decision_family": gold_decision_family,
+        "decision_correct_strict_raw": decision_correct_strict_raw,
         "decision_correct_exact": decision_correct_exact,
         "decision_correct_family": decision_correct_family,
         "conditions_correct": conditions_correct,
@@ -1070,6 +1065,7 @@ def _score_step(
         "stale_count": int(len(stale_set)),
         "inapplicable_injected_rate": inapplicable_rate,
         "pred_decision": pred_decision,
+        "pred_decision_raw": pred_decision_raw,
         "pred_conditions": pred_conditions,
         "pred_evidence": pred_evidence,
         "token_est": token_est,
@@ -1259,6 +1255,17 @@ def evaluate_traceops_method(
             step_meta = dict(step.metadata or {})
             hidden_core_ids = _unique_strs(step_meta.get("hidden_core_ids") or [])
             hidden_core_parent_ids = _unique_strs(step_meta.get("hidden_core_parent_ids") or [])
+            trap_distractor_ids = _unique_strs(step_meta.get("trap_distractor_ids") or [])
+            trap_distractor_set = {str(cid) for cid in trap_distractor_ids if str(cid).strip()}
+            trap_injected_ids = [
+                str(cid) for cid in list(context_ids) if str(cid) in trap_distractor_set
+            ]
+            trap_injected_count = int(len(trap_injected_ids))
+            trap_injected_rate = (
+                float(trap_injected_count) / float(len(trap_distractor_set))
+                if trap_distractor_set
+                else float("nan")
+            )
             raw_flip_count = step_meta.get("core_necessity_flip_count")
             core_necessity_flip_count = (
                 int(raw_flip_count)
@@ -1278,15 +1285,18 @@ def evaluate_traceops_method(
                 "traceops_eval_mode": eval_mode,
                 "traceops_llm_eval_scope": llm_eval_scope,
                 "sampled_step": bool(sampled_step),
-                "gold_decision": str(step.gold.decision),
+                "gold_decision_raw": str(score.get("gold_decision_raw", str(step.gold.decision))),
+                "gold_decision": str(score.get("gold_decision", normalize_decision(step.gold.decision))),
                 "gold_decision_family": str(score.get("gold_decision_family", "")),
                 "gold_conditions": list(step.gold.conditions),
                 "gold_evidence_ids": list(step.gold.evidence_ids),
                 "pivot_required_clause_ids": list(step.pivot_required_ids),
-                "pred_decision": score.get("pred_decision"),
+                "pred_decision_raw": str(score.get("pred_decision_raw", pred.get("decision", ""))),
+                "pred_decision": str(score.get("pred_decision", normalize_decision(pred.get("decision", "")))),
                 "pred_conditions": score.get("pred_conditions"),
                 "pred_evidence": score.get("pred_evidence"),
                 "decision_correct": bool(score.get("decision_correct", False)),
+                "decision_correct_strict_raw": bool(score.get("decision_correct_strict_raw", False)),
                 "decision_correct_exact": bool(score.get("decision_correct_exact", False)),
                 "decision_correct_family": bool(score.get("decision_correct_family", False)),
                 "conditions_correct": bool(score.get("conditions_correct", False)),
@@ -1401,12 +1411,39 @@ def evaluate_traceops_method(
                 "trap_present": bool(step.metadata.get("trap_present", False)),
                 "core_size": int(step.metadata.get("core_size", len(step.pivot_required_ids)) or 0),
                 "pivot_style": str(step.metadata.get("pivot_style", "")),
-                "trap_distractor_ids": list(_unique_strs(step.metadata.get("trap_distractor_ids") or [])),
+                "trap_distractor_ids": list(trap_distractor_ids),
+                "trap_injected_ids": list(trap_injected_ids),
+                "trap_injected_count": int(trap_injected_count),
+                "trap_injected_rate": trap_injected_rate,
                 "core_necessity_flip_count": core_necessity_flip_count,
                 "core_necessity_all_required": bool(step_meta.get("core_necessity_all_required", False)),
                 "core_necessity_failed": bool(step_meta.get("core_necessity_failed", False)),
                 "trap_decision_label": str(step_meta.get("trap_decision_label", "") or ""),
                 "trap_decision_flip": bool(step_meta.get("trap_decision_flip", False)),
+                "trap_flip_target_id": str(step_meta.get("trap_flip_target_id", "") or ""),
+                "trap_flip_target_kind": str(step_meta.get("trap_flip_target_kind", "") or ""),
+                "trap_graph_excludable_count": int(step_meta.get("trap_graph_excludable_count", 0) or 0),
+                "trap_graph_excludable_ids": list(_unique_strs(step_meta.get("trap_graph_excludable_ids") or [])),
+                "trap_invalidation_attached_to_update": bool(
+                    step_meta.get("trap_invalidation_attached_to_update", False)
+                ),
+                "trap_flip_salience": (
+                    float(step_meta.get("trap_flip_salience"))
+                    if isinstance(step_meta.get("trap_flip_salience"), (int, float))
+                    else float("nan")
+                ),
+                "trap_flip_attach_kind": str(step_meta.get("trap_flip_attach_kind", "") or ""),
+                "trap_graph_excludable_rate": (
+                    float(step_meta.get("trap_graph_excludable_rate"))
+                    if isinstance(step_meta.get("trap_graph_excludable_rate"), (int, float))
+                    else float("nan")
+                ),
+                "trap_graph_excludable_kinds": str(step_meta.get("trap_graph_excludable_kinds", "") or ""),
+                "trap_invalidation_text_strength": (
+                    float(step_meta.get("trap_invalidation_text_strength"))
+                    if isinstance(step_meta.get("trap_invalidation_text_strength"), (int, float))
+                    else float("nan")
+                ),
                 "hidden_core_ids": list(hidden_core_ids),
                 "hidden_core_parent_ids": list(hidden_core_parent_ids),
             }
@@ -1449,6 +1486,9 @@ def evaluate_traceops_method(
 
     pivot_records = list(records)
     decision_vals = [1.0 if r.get("decision_correct") else 0.0 for r in pivot_records]
+    decision_strict_raw_vals = [
+        1.0 if r.get("decision_correct_strict_raw") else 0.0 for r in pivot_records
+    ]
     e3_only_vals = [
         1.0 if (r.get("e3_answer_correct") and r.get("e3_evidence_valid_in_context")) else 0.0
         for r in pivot_records
@@ -1482,6 +1522,18 @@ def evaluate_traceops_method(
         float(r.get("trap_gap"))
         for r in pivot_records
         if isinstance(r.get("trap_gap"), (int, float)) and math.isfinite(float(r.get("trap_gap")))
+    ]
+    trap_injected_count_vals = [
+        float(int(r.get("trap_injected_count", 0) or 0)) for r in pivot_records
+    ]
+    trap_injected_rate_vals = [
+        float(r.get("trap_injected_rate"))
+        for r in pivot_records
+        if isinstance(r.get("trap_injected_rate"), (int, float))
+        and math.isfinite(float(r.get("trap_injected_rate")))
+    ]
+    trap_injected_any_vals = [
+        1.0 if int(r.get("trap_injected_count", 0) or 0) > 0 else 0.0 for r in pivot_records
     ]
     core_size_vals = [float(int(r.get("core_size", 0) or 0)) for r in pivot_records]
     trap_present_vals = [1.0 if bool(r.get("trap_present", False)) else 0.0 for r in pivot_records]
@@ -1531,8 +1583,10 @@ def evaluate_traceops_method(
 
     metrics = {
         "decision_accuracy": _mean(decision_vals),
+        "decision_accuracy_strict_raw": _mean(decision_strict_raw_vals),
         "judge_accuracy": _mean(e3_only_vals),
         "pivot_decision_accuracy": _mean(decision_vals),
+        "pivot_decision_accuracy_strict_raw": _mean(decision_strict_raw_vals),
         "pivot_e3_only_accuracy": _mean(e3_only_vals),
         "strict_pivot_accuracy": _mean(strict_vals),
         "tokens_pivot_mean": tokens_pivot_mean,
@@ -1549,6 +1603,9 @@ def evaluate_traceops_method(
         "mean_indirection_overlap_gold": _mean(indirection_vals),
         "mean_trap_gap": _mean(trap_gap_vals),
         "trap_present_rate": _mean(trap_present_vals),
+        "mean_trap_injected_count": _mean(trap_injected_count_vals),
+        "mean_trap_injected_rate": _mean(trap_injected_rate_vals),
+        "trap_injected_any_rate": _mean(trap_injected_any_vals),
         "mean_core_size": _mean(core_size_vals),
         "core_necessity_all_required_rate": _mean(core_need_all_required_vals),
         "mean_core_necessity_flip_count": _mean(core_need_flip_vals),
