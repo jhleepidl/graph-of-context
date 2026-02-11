@@ -12,3 +12,4 @@ trace/
 runs/
 experiment_bundles/
 .tmp/
+.cache/

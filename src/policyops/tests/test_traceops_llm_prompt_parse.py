@@ -45,6 +45,8 @@ def test_traceops_llm_prompt_contains_schema_and_clause_ids() -> None:
     prompt = _build_traceops_llm_prompt(step, thread, ["C0001", "C0002"])
 
     assert "Output STRICT JSON only" in prompt
+    assert '"decision":"allow|deny|require_condition|needs_more_info"' in prompt
+    assert "You MUST choose one of the 4 decision labels exactly as written." in prompt
     assert "CLAUSE C0001 (DECISION)" in prompt
     assert "CLAUSE C0002 (EXCEPTION)" in prompt
     assert "Allowed evidence clause IDs" in prompt

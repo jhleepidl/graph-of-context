@@ -14,6 +14,41 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_threads_by_scenario(phase15_root: Path, scenario: str) -> Dict[str, Any]:
+    threads_path = phase15_root / "data" / scenario / "data" / "traceops" / "threads.jsonl"
+    if not threads_path.exists():
+        return {}
+    out: Dict[str, Any] = {}
+    with threads_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                continue
+            tid = str(obj.get("thread_id", "") or "")
+            if not tid:
+                continue
+            out[tid] = obj
+    return out
+
+
+def _gold_decision_family(gold_decision: str) -> str:
+    decision = str(gold_decision or "")
+    if decision == "allow":
+        return "allow"
+    if decision == "deny":
+        return "deny"
+    if decision == "defer":
+        return "needs_more_info"
+    if decision.startswith("require_"):
+        return "require_condition"
+    if decision == "override_invalidated":
+        return "require_condition"
+    return decision
+
+
 def _as_float(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -74,6 +109,10 @@ def main() -> None:
 
     manifest = _load_json(phase15_root / "run_manifest.json")
     runs = list(manifest.get("runs") or [])
+    quick_event_dir = phase15_root / "quick_access" / "event_traces"
+    quick_event_dir.mkdir(parents=True, exist_ok=True)
+    scenario_threads_cache: Dict[str, Dict[str, Any]] = {}
+    event_trace_by_file: Dict[str, List[Dict[str, Any]]] = {}
 
     rows: List[Dict[str, Any]] = []
     for run in runs:
@@ -83,6 +122,15 @@ def main() -> None:
         report = _load_json(report_path)
         method_reports = report.get("method_reports") or {}
         scenario_params = report.get("scenario_params") or {}
+        scenario_name = str(
+            run.get("traceops_scenario")
+            or scenario_params.get("traceops_scenario")
+            or "mixed"
+        )
+        if scenario_name not in scenario_threads_cache:
+            scenario_threads_cache[scenario_name] = _load_threads_by_scenario(phase15_root, scenario_name)
+        thread_lookup = scenario_threads_cache.get(scenario_name, {})
+        variant_name = str(run.get("variant") or "variant")
         for method, mr in method_reports.items():
             metrics = dict(mr.get("metrics") or {})
             records = list(mr.get("records") or [])
@@ -177,6 +225,82 @@ def main() -> None:
                 }
             )
             rows.append(row)
+
+            event_file_key = f"{scenario_name}__{variant_name}__{method}__event_traces.jsonl"
+            event_rows = event_trace_by_file.setdefault(event_file_key, [])
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                thread_id = str(rec.get("thread_id", "") or "")
+                step_idx = int(rec.get("step_idx", 0) or 0)
+                thread_obj = thread_lookup.get(thread_id) if isinstance(thread_lookup, dict) else None
+                steps = thread_obj.get("steps") if isinstance(thread_obj, dict) else []
+                step_obj = None
+                if isinstance(steps, list):
+                    for s in steps:
+                        if not isinstance(s, dict):
+                            continue
+                        if int(s.get("step_idx", -1) or -1) == step_idx:
+                            step_obj = s
+                            break
+                clauses_map = thread_obj.get("clauses") if isinstance(thread_obj, dict) else {}
+                clauses_map = clauses_map if isinstance(clauses_map, dict) else {}
+                context_clause_ids = rec.get("e3_context_clause_ids") or []
+                if not isinstance(context_clause_ids, list):
+                    context_clause_ids = []
+                context_clause_ids = [str(cid) for cid in context_clause_ids]
+                context_clauses: List[Dict[str, Any]] = []
+                for cid in context_clause_ids[:80]:
+                    clause = clauses_map.get(cid)
+                    if not isinstance(clause, dict):
+                        continue
+                    context_clauses.append(
+                        {
+                            "id": str(cid),
+                            "type": str(clause.get("node_type", "") or ""),
+                            "text": str(clause.get("text", "") or ""),
+                        }
+                    )
+
+                gold_decision = str(rec.get("gold_decision", "") or "")
+                gold_family = str(rec.get("gold_decision_family") or _gold_decision_family(gold_decision))
+                event_rows.append(
+                    {
+                        "task_id": str(rec.get("task_id", "") or ""),
+                        "thread_id": thread_id,
+                        "step_idx": step_idx,
+                        "pivot_question": str(
+                            (step_obj or {}).get("message", "")
+                            if isinstance(step_obj, dict)
+                            else ""
+                        ),
+                        "gold": {
+                            "decision": gold_decision,
+                            "decision_family": gold_family,
+                            "conditions": list(rec.get("gold_conditions") or []),
+                            "evidence_core_ids": list(
+                                rec.get("pivot_required_clause_ids")
+                                or rec.get("gold_evidence_ids")
+                                or []
+                            ),
+                        },
+                        "pred": {
+                            "decision": str(rec.get("pred_decision", "") or ""),
+                            "conditions": list(rec.get("pred_conditions") or []),
+                            "evidence": list(rec.get("pred_evidence") or []),
+                        },
+                        "context_clause_ids": list(context_clause_ids),
+                        "context_clauses": context_clauses,
+                        "llm_output_text": str(rec.get("llm_output_text", "") or ""),
+                        "llm_parse_error": bool(rec.get("llm_parse_error", False)),
+                        "tokens": {
+                            "prompt_actual": rec.get("prompt_tokens_actual"),
+                            "completion_actual": rec.get("completion_tokens_actual"),
+                            "total_actual": rec.get("total_tokens_actual"),
+                            "prompt_est": rec.get("prompt_tokens_est", rec.get("prompt_tokens")),
+                        },
+                    }
+                )
 
     df = _attach_vs_full(pd.DataFrame(rows))
     csv_path = out_dir / "phase15_traceops_summary.csv"
@@ -290,8 +414,15 @@ def main() -> None:
     md_path = out_dir / "phase15_traceops_summary.md"
     md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
+    for filename, lines in event_trace_by_file.items():
+        out_path = quick_event_dir / filename
+        with out_path.open("w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(json.dumps(line, ensure_ascii=True) + "\n")
+
     print(f"Wrote: {csv_path}")
     print(f"Wrote: {md_path}")
+    print(f"Wrote: {quick_event_dir}")
 
 
 if __name__ == "__main__":

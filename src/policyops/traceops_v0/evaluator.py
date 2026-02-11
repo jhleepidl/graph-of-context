@@ -49,8 +49,9 @@ def _build_traceops_llm_prompt(
         "Use ONLY the provided CONTEXT. Output STRICT JSON only."
     )
     lines.append(
-        'JSON schema: {"decision":"allow|deny|require_condition|needs_more_info","conditions":[<strings>],"evidence":[<clause_id strings>]}'
+        'JSON schema: {"decision":"allow|deny|require_condition|needs_more_info","conditions":["<condition_string>"],"evidence":["<clause_id>"]}'
     )
+    lines.append("You MUST choose one of the 4 decision labels exactly as written.")
     lines.append("Return only a JSON object; no markdown, no explanations.")
     lines.append("")
     lines.append(f"Pivot question: {step.message}")
@@ -136,6 +137,21 @@ def _clause_applicable(clause: TraceWorldClause, state: Dict[str, Any]) -> bool:
     if not key or val is None:
         return True
     return str(state.get(key)) == str(val)
+
+
+def _gold_decision_family(gold_decision: str) -> str:
+    decision = str(gold_decision or "")
+    if decision == "allow":
+        return "allow"
+    if decision == "deny":
+        return "deny"
+    if decision == "defer":
+        return "needs_more_info"
+    if decision.startswith("require_"):
+        return "require_condition"
+    if decision == "override_invalidated":
+        return "require_condition"
+    return decision
 
 
 def _dependency_closure(
@@ -407,6 +423,7 @@ def _score_step(
     prediction: Dict[str, Any],
     context_ids: Sequence[str],
     invalidated_ids: Sequence[str],
+    eval_mode: str = "deterministic",
 ) -> Dict[str, Any]:
     gold = step.gold
     if gold is None:
@@ -420,7 +437,11 @@ def _score_step(
     pred_conditions = _unique_strs(prediction.get("conditions") or [])
     pred_evidence = _unique_strs(prediction.get("evidence") or [])
 
-    decision_correct = bool(pred_decision == str(gold.decision))
+    gold_decision = str(gold.decision)
+    gold_decision_family = _gold_decision_family(gold_decision)
+    decision_correct_exact = bool(pred_decision == gold_decision)
+    decision_correct_family = bool(pred_decision == gold_decision_family)
+    decision_correct = decision_correct_family if str(eval_mode) == "llm" else decision_correct_exact
     gold_conditions = _unique_strs(gold.conditions)
     conditions_correct = bool(set(pred_conditions) == set(gold_conditions))
     answer_correct = bool(decision_correct and conditions_correct)
@@ -446,6 +467,9 @@ def _score_step(
 
     return {
         "decision_correct": decision_correct,
+        "gold_decision_family": gold_decision_family,
+        "decision_correct_exact": decision_correct_exact,
+        "decision_correct_family": decision_correct_family,
         "conditions_correct": conditions_correct,
         "answer_correct": answer_correct,
         "evidence_valid_in_context": evidence_valid_in_context,
@@ -588,6 +612,7 @@ def evaluate_traceops_method(
                 prediction=pred,
                 context_ids=context_ids,
                 invalidated_ids=invalidated_ids,
+                eval_mode=eval_mode,
             )
 
             prompt_tokens_actual = _usage_int(llm_usage, "input_tokens")
@@ -611,6 +636,7 @@ def evaluate_traceops_method(
                 "traceops_scenario": str(thread.scenario),
                 "traceops_eval_mode": eval_mode,
                 "gold_decision": str(step.gold.decision),
+                "gold_decision_family": str(score.get("gold_decision_family", "")),
                 "gold_conditions": list(step.gold.conditions),
                 "gold_evidence_ids": list(step.gold.evidence_ids),
                 "pivot_required_clause_ids": list(step.pivot_required_ids),
@@ -618,6 +644,8 @@ def evaluate_traceops_method(
                 "pred_conditions": score.get("pred_conditions"),
                 "pred_evidence": score.get("pred_evidence"),
                 "decision_correct": bool(score.get("decision_correct", False)),
+                "decision_correct_exact": bool(score.get("decision_correct_exact", False)),
+                "decision_correct_family": bool(score.get("decision_correct_family", False)),
                 "conditions_correct": bool(score.get("conditions_correct", False)),
                 "e3_answer_correct": bool(score.get("answer_correct", False)),
                 "e3_evidence_valid_in_context": bool(score.get("evidence_valid_in_context", False)),
