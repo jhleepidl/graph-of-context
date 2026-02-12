@@ -548,6 +548,34 @@ def main() -> None:
                     "noop_update_dropped_rate": _as_float(
                         metrics.get("noop_update_dropped_rate")
                     ),
+                    "gate_forced_needs_more_info_rate": _as_float(
+                        metrics.get("gate_forced_needs_more_info_rate")
+                    ),
+                    "allow_deny_commit_without_valid_update_rate": _as_float(
+                        metrics.get("allow_deny_commit_without_valid_update_rate")
+                    ),
+                    "gate_forced_reason_allow_deny_missing_update_evidence_rate": _as_float(
+                        metrics.get(
+                            "gate_forced_reason_allow_deny_missing_update_evidence_rate"
+                        )
+                    ),
+                    "gate_forced_reason_allow_deny_update_is_noop_rate": _as_float(
+                        metrics.get("gate_forced_reason_allow_deny_update_is_noop_rate")
+                    ),
+                    "gate_forced_reason_allow_deny_update_wrong_key_rate": _as_float(
+                        metrics.get("gate_forced_reason_allow_deny_update_wrong_key_rate")
+                    ),
+                    "gate_forced_reason_require_condition_missing_rule_evidence_rate": _as_float(
+                        metrics.get(
+                            "gate_forced_reason_require_condition_missing_rule_evidence_rate"
+                        )
+                    ),
+                    "gate_forced_reason_evidence_distinct_lt_2_rate": _as_float(
+                        metrics.get("gate_forced_reason_evidence_distinct_lt_2_rate")
+                    ),
+                    "gate_forced_reason_evidence_id_out_of_allowlist_rate": _as_float(
+                        metrics.get("gate_forced_reason_evidence_id_out_of_allowlist_rate")
+                    ),
                     "mean_goc_stable_update_count": _as_float(
                         metrics.get("mean_goc_stable_update_count")
                     ),
@@ -827,6 +855,14 @@ def main() -> None:
             "commit_when_gold_unknown_rate",
             "noop_update_in_context_rate",
             "noop_update_dropped_rate",
+            "gate_forced_needs_more_info_rate",
+            "allow_deny_commit_without_valid_update_rate",
+            "gate_forced_reason_allow_deny_missing_update_evidence_rate",
+            "gate_forced_reason_allow_deny_update_is_noop_rate",
+            "gate_forced_reason_allow_deny_update_wrong_key_rate",
+            "gate_forced_reason_require_condition_missing_rule_evidence_rate",
+            "gate_forced_reason_evidence_distinct_lt_2_rate",
+            "gate_forced_reason_evidence_id_out_of_allowlist_rate",
             "mean_goc_stable_update_count",
             "mean_goc_recent_update_count",
             "stable_update_present_rate",
@@ -895,6 +931,14 @@ def main() -> None:
             "commit_when_gold_unknown_rate",
             "noop_update_in_context_rate",
             "noop_update_dropped_rate",
+            "gate_forced_needs_more_info_rate",
+            "allow_deny_commit_without_valid_update_rate",
+            "gate_forced_reason_allow_deny_missing_update_evidence_rate",
+            "gate_forced_reason_allow_deny_update_is_noop_rate",
+            "gate_forced_reason_allow_deny_update_wrong_key_rate",
+            "gate_forced_reason_require_condition_missing_rule_evidence_rate",
+            "gate_forced_reason_evidence_distinct_lt_2_rate",
+            "gate_forced_reason_evidence_id_out_of_allowlist_rate",
             "mean_goc_stable_update_count",
             "mean_goc_recent_update_count",
             "stable_update_present_rate",

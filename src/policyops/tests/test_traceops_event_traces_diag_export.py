@@ -38,6 +38,9 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
         "gold_needs_more_info": True,
         "pred_needs_more_info": True,
         "commit_when_gold_unknown": False,
+        "gate_forced_needs_more_info": True,
+        "gate_forced_reason": "allow_deny_update_is_noop",
+        "allow_deny_commit_without_valid_update": True,
         "noop_update_in_context": True,
         "noop_update_in_context_count": 3,
         "evidence_core_missing_ids_strict": missing_ids,
@@ -111,6 +114,9 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
     assert line["gold_needs_more_info"] is True
     assert line["pred_needs_more_info"] is True
     assert line["commit_when_gold_unknown"] is False
+    assert line["gate_forced_needs_more_info"] is True
+    assert line["gate_forced_reason"] == "allow_deny_update_is_noop"
+    assert line["allow_deny_commit_without_valid_update"] is True
     assert line["noop_update_in_context"] is True
     assert line["noop_update_in_context_count"] == 3
 

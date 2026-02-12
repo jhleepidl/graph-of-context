@@ -118,13 +118,23 @@ def _build_traceops_llm_prompt(
     lines.append(schema_line)
     lines.append("You MUST choose one of the 4 decision labels exactly as written.")
     lines.append(
-        "For decision=allow|deny|require_condition: `evidence` MUST contain at least 2 DISTINCT clause ids."
+        "For decision=allow|deny: `evidence` MUST contain at least 2 DISTINCT clause ids."
+    )
+    lines.append(
+        "For decision=require_condition: `evidence` MUST contain at least 2 DISTINCT clause ids."
     )
     lines.append(
         "Every evidence id MUST be selected from Allowed evidence clause IDs."
     )
     lines.append(
-        "For decision=allow|deny|require_condition: `evidence` MUST include at least 1 UPDATE clause id."
+        "For decision=allow|deny: `evidence` MUST include at least 1 non-noop UPDATE clause id."
+    )
+    lines.append(
+        "For decision=allow|deny: prefer UPDATE evidence whose state_key matches the decision target binding_key."
+    )
+    lines.append(
+        "For decision=require_condition: UPDATE evidence is optional, but evidence MUST include rule support "
+        "(policy_anchor, policy_codebook, or DECISION clause)."
     )
     lines.append(
         "If the above evidence requirement is not satisfied, decision MUST be `needs_more_info`, "
@@ -378,38 +388,142 @@ def _is_noop_update_clause(clause: TraceWorldClause | None) -> bool:
     return bool(meta.get("noop_update", False))
 
 
+def _infer_binding_key_for_gate(
+    *,
+    step: TraceStep,
+    evidence_ids: Sequence[str],
+    clauses: Dict[str, TraceWorldClause],
+) -> str | None:
+    step_meta = step.metadata if isinstance(step.metadata, dict) else {}
+    for meta_key in ["binding_key", "ordinal_key"]:
+        raw = str(step_meta.get(meta_key, "") or "").strip().lower()
+        if raw:
+            return raw
+    for cid in _unique_strs(evidence_ids):
+        clause = clauses.get(cid)
+        if clause is None or str(clause.node_type or "") != "DECISION":
+            continue
+        meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+        for meta_key in ["binding_key", "ordinal_key"]:
+            raw = str(meta.get(meta_key, "") or "").strip().lower()
+            if raw:
+                return raw
+    return None
+
+
 def _apply_llm_update_evidence_gate(
     *,
     prediction: Dict[str, Any],
+    step: TraceStep,
     context_ids: Sequence[str],
     clauses: Dict[str, TraceWorldClause],
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     pred = dict(prediction or {})
     decision = str(pred.get("decision", "needs_more_info") or "needs_more_info")
     if decision not in {"allow", "deny", "require_condition", "needs_more_info"}:
         decision = "needs_more_info"
     evidence_ids = _unique_strs(pred.get("evidence") or [])
-    if decision == "needs_more_info":
-        pred["decision"] = decision
-        pred["evidence"] = list(evidence_ids[:1])
-        return pred
+
+    gate_info: Dict[str, Any] = {
+        "gate_forced_needs_more_info": False,
+        "gate_forced_reason": "",
+        "allow_deny_commit_without_valid_update": False,
+    }
+
+    def _force(reason: str, *, mark_allowdeny_without_valid_update: bool = False) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        gate_info["gate_forced_needs_more_info"] = True
+        gate_info["gate_forced_reason"] = str(reason)
+        gate_info["allow_deny_commit_without_valid_update"] = bool(
+            mark_allowdeny_without_valid_update
+        )
+        allowed_ids_local = set(_unique_strs(context_ids))
+        evidence_allowed_local = [cid for cid in evidence_ids if cid in allowed_ids_local]
+        pred["decision"] = "needs_more_info"
+        pred["conditions"] = []
+        pred["evidence"] = list(evidence_allowed_local[:1])
+        return pred, gate_info
 
     allowed_ids = set(_unique_strs(context_ids))
-    evidence_allowed = [cid for cid in evidence_ids if cid in allowed_ids]
-    has_min_two = len(set(evidence_allowed)) >= 2
-    has_update = any(
-        str((clauses.get(cid).node_type if clauses.get(cid) is not None else "") or "") == "UPDATE"
-        for cid in evidence_allowed
-    )
-    if has_min_two and has_update:
-        pred["decision"] = decision
-        pred["evidence"] = list(evidence_allowed)
-        return pred
+    if any(cid not in allowed_ids for cid in evidence_ids):
+        return _force("evidence_id_out_of_allowlist")
 
-    pred["decision"] = "needs_more_info"
-    pred["conditions"] = []
-    pred["evidence"] = list(evidence_allowed[:1])
-    return pred
+    evidence_allowed = [cid for cid in evidence_ids if cid in allowed_ids]
+    distinct_count = len(set(evidence_allowed))
+
+    if decision == "needs_more_info":
+        pred["decision"] = decision
+        pred["conditions"] = []
+        pred["evidence"] = list(evidence_allowed[:1])
+        return pred, gate_info
+
+    if distinct_count < 2:
+        return _force("evidence_distinct_lt_2")
+
+    if decision in {"allow", "deny"}:
+        binding_key = _infer_binding_key_for_gate(
+            step=step, evidence_ids=evidence_allowed, clauses=clauses
+        )
+        update_evidence_ids = [
+            cid
+            for cid in evidence_allowed
+            if str((clauses.get(cid).node_type if clauses.get(cid) is not None else "") or "")
+            == "UPDATE"
+        ]
+        if not update_evidence_ids:
+            return _force(
+                "allow_deny_missing_update_evidence",
+                mark_allowdeny_without_valid_update=True,
+            )
+        update_evidence_clauses = [clauses.get(cid) for cid in update_evidence_ids]
+        non_noop_updates = [
+            cid
+            for cid, clause in zip(update_evidence_ids, update_evidence_clauses)
+            if clause is not None and not _is_noop_update_clause(clause)
+        ]
+        if not non_noop_updates:
+            return _force(
+                "allow_deny_update_is_noop",
+                mark_allowdeny_without_valid_update=True,
+            )
+        if binding_key:
+            key_matched = [
+                cid
+                for cid in non_noop_updates
+                if _traceops_clause_state_key(clauses.get(cid)) == str(binding_key)
+            ]
+            if not key_matched:
+                return _force(
+                    "allow_deny_update_wrong_key",
+                    mark_allowdeny_without_valid_update=True,
+                )
+
+    if decision == "require_condition":
+        non_update_evidence_ids = [
+            cid
+            for cid in evidence_allowed
+            if str((clauses.get(cid).node_type if clauses.get(cid) is not None else "") or "")
+            != "UPDATE"
+        ]
+        if not non_update_evidence_ids:
+            return _force("require_condition_missing_rule_evidence")
+        has_rule_support = False
+        for cid in non_update_evidence_ids:
+            clause = clauses.get(cid)
+            if clause is None:
+                continue
+            if str(clause.node_type or "") == "DECISION":
+                has_rule_support = True
+                break
+            meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+            if bool(meta.get("policy_anchor", False)) or bool(meta.get("policy_codebook", False)):
+                has_rule_support = True
+                break
+        if not has_rule_support:
+            return _force("require_condition_missing_rule_evidence")
+
+    pred["decision"] = decision
+    pred["evidence"] = list(evidence_allowed)
+    return pred, gate_info
 
 
 def _goc_overlap_count(message_tokens: Set[str], clause: TraceWorldClause | None) -> int:
@@ -1897,6 +2011,11 @@ def evaluate_traceops_method(
             llm_parse_error = False
             llm_usage: Dict[str, Any] = {}
             pred: Dict[str, Any] | None = None
+            gate_info: Dict[str, Any] = {
+                "gate_forced_needs_more_info": False,
+                "gate_forced_reason": "",
+                "allow_deny_commit_without_valid_update": False,
+            }
             if use_llm and sampled_step:
                 sampled_steps_evaluated += 1
                 prompt = _build_traceops_llm_prompt(step, thread, context_ids)
@@ -1936,8 +2055,9 @@ def evaluate_traceops_method(
                         encoding="utf-8",
                     )
                 pred = _parse_llm_json(llm_output_text)
-                pred = _apply_llm_update_evidence_gate(
+                pred, gate_info = _apply_llm_update_evidence_gate(
                     prediction=pred,
+                    step=step,
                     context_ids=context_ids,
                     clauses=thread.clauses,
                 )
@@ -2120,6 +2240,13 @@ def evaluate_traceops_method(
                     str(score.get("gold_decision", "") or "") == "needs_more_info"
                     and str(score.get("pred_decision", "") or "")
                     in {"allow", "deny", "require_condition"}
+                ),
+                "gate_forced_needs_more_info": bool(
+                    gate_info.get("gate_forced_needs_more_info", False)
+                ),
+                "gate_forced_reason": str(gate_info.get("gate_forced_reason", "") or ""),
+                "allow_deny_commit_without_valid_update": bool(
+                    gate_info.get("allow_deny_commit_without_valid_update", False)
                 ),
                 "e3_evidence_valid_in_context": bool(score.get("evidence_valid_in_context", False)),
                 "critical_coverage_e3": score.get("critical_coverage"),
@@ -2429,6 +2556,9 @@ def evaluate_traceops_method(
     gold_needs_more_info_vals: List[float] = []
     pred_needs_more_info_vals: List[float] = []
     commit_when_gold_unknown_vals: List[float] = []
+    gate_forced_needs_more_info_vals: List[float] = []
+    allow_deny_commit_without_valid_update_vals: List[float] = []
+    gate_reason_counts: Dict[str, int] = {}
     for rec in pivot_records:
         noop_update_in_context_vals.append(
             1.0 if bool(rec.get("noop_update_in_context", False)) else 0.0
@@ -2442,6 +2572,14 @@ def evaluate_traceops_method(
         commit_when_gold_unknown_vals.append(
             1.0 if bool(rec.get("commit_when_gold_unknown", False)) else 0.0
         )
+        gate_forced = bool(rec.get("gate_forced_needs_more_info", False))
+        gate_forced_needs_more_info_vals.append(1.0 if gate_forced else 0.0)
+        allow_deny_commit_without_valid_update_vals.append(
+            1.0 if bool(rec.get("allow_deny_commit_without_valid_update", False)) else 0.0
+        )
+        gate_reason = str(rec.get("gate_forced_reason", "") or "").strip()
+        if gate_forced and gate_reason:
+            gate_reason_counts[gate_reason] = int(gate_reason_counts.get(gate_reason, 0) + 1)
         if bool(rec.get("goc_smart_enable", False)):
             noop_update_dropped_vals.append(
                 1.0 if int(rec.get("goc_noop_update_dropped_count", 0) or 0) > 0 else 0.0
@@ -2573,6 +2711,10 @@ def evaluate_traceops_method(
     tokens_total_mean_actual = _mean(total_tokens_by_thread_actual)
     tokens_pivot_mean = tokens_pivot_mean_actual if math.isfinite(tokens_pivot_mean_actual) else tokens_pivot_mean_est
     tokens_total_mean = tokens_total_mean_actual if math.isfinite(tokens_total_mean_actual) else tokens_total_mean_est
+    reason_den = max(1, int(sum(gate_reason_counts.values())))
+
+    def _gate_reason_rate(reason: str) -> float:
+        return float(gate_reason_counts.get(reason, 0)) / float(reason_den)
 
     metrics = {
         "decision_accuracy": _mean(decision_vals),
@@ -2598,6 +2740,28 @@ def evaluate_traceops_method(
         "noop_update_in_context_rate": _mean(noop_update_in_context_vals),
         "noop_update_dropped_rate": (
             _mean(noop_update_dropped_vals) if noop_update_dropped_vals else float("nan")
+        ),
+        "gate_forced_needs_more_info_rate": _mean(gate_forced_needs_more_info_vals),
+        "allow_deny_commit_without_valid_update_rate": _mean(
+            allow_deny_commit_without_valid_update_vals
+        ),
+        "gate_forced_reason_allow_deny_missing_update_evidence_rate": _gate_reason_rate(
+            "allow_deny_missing_update_evidence"
+        ),
+        "gate_forced_reason_allow_deny_update_is_noop_rate": _gate_reason_rate(
+            "allow_deny_update_is_noop"
+        ),
+        "gate_forced_reason_allow_deny_update_wrong_key_rate": _gate_reason_rate(
+            "allow_deny_update_wrong_key"
+        ),
+        "gate_forced_reason_require_condition_missing_rule_evidence_rate": _gate_reason_rate(
+            "require_condition_missing_rule_evidence"
+        ),
+        "gate_forced_reason_evidence_distinct_lt_2_rate": _gate_reason_rate(
+            "evidence_distinct_lt_2"
+        ),
+        "gate_forced_reason_evidence_id_out_of_allowlist_rate": _gate_reason_rate(
+            "evidence_id_out_of_allowlist"
         ),
         "mean_goc_stable_update_count": _mean(stable_update_count_vals),
         "mean_goc_recent_update_count": _mean(recent_update_count_vals),

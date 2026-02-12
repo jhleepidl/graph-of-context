@@ -52,8 +52,10 @@ def test_traceops_llm_prompt_contains_schema_and_clause_ids() -> None:
     assert expected_schema in prompt
     assert "..." not in prompt
     assert "You MUST choose one of the 4 decision labels exactly as written." in prompt
-    assert "For decision=allow|deny|require_condition: `evidence` MUST contain at least 2 DISTINCT clause ids." in prompt
-    assert "For decision=allow|deny|require_condition: `evidence` MUST include at least 1 UPDATE clause id." in prompt
+    assert "For decision=allow|deny: `evidence` MUST contain at least 2 DISTINCT clause ids." in prompt
+    assert "For decision=require_condition: `evidence` MUST contain at least 2 DISTINCT clause ids." in prompt
+    assert "For decision=allow|deny: `evidence` MUST include at least 1 non-noop UPDATE clause id." in prompt
+    assert "For decision=require_condition: UPDATE evidence is optional, but evidence MUST include rule support" in prompt
     assert "Every evidence id MUST be selected from Allowed evidence clause IDs." in prompt
     assert "decision MUST be `needs_more_info`, conditions MUST be [], and evidence should contain at most one most relevant allowed clause id (or [])." in prompt
     assert "ALLOWED_CONDITIONS:" in prompt
