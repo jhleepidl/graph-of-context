@@ -290,6 +290,338 @@ def _dependency_closure(
     return sorted(list(visited), key=lambda cid: (uni_rank.get(cid, 10**9), cid))
 
 
+def _is_decision_checkpoint_clause(clause: TraceWorldClause | None) -> bool:
+    if clause is None or str(clause.node_type or "") != "DECISION":
+        return False
+    text = str(clause.text or "").strip().lower()
+    if text.startswith("decision checkpoint:"):
+        return True
+    meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+    return bool(
+        str(meta.get("trap_kind", "") or "").strip().lower() == "decision_checkpoint"
+        or bool(meta.get("trap_decision_checkpoint", False))
+    )
+
+
+def _smart_norm_text_prefix(text: str, max_len: int = 80) -> str:
+    norm = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if max_len <= 0:
+        return norm
+    return norm[:max_len]
+
+
+def _goc_clause_type(clause: TraceWorldClause | None) -> str:
+    if clause is None:
+        return "UNKNOWN"
+    return str(clause.node_type or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+
+def _goc_type_counts(ids: Sequence[str], clauses: Dict[str, TraceWorldClause]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for cid in _unique_strs(ids):
+        ctype = _goc_clause_type(clauses.get(cid))
+        out[ctype] = int(out.get(ctype, 0) + 1)
+    return out
+
+
+def _is_update_invalidation_clause(clause: TraceWorldClause | None) -> bool:
+    if clause is None or _goc_clause_type(clause) != "UPDATE":
+        return False
+    text = str(clause.text or "").strip().lower()
+    meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+    if "not controlling" in text:
+        return True
+    if "supersedes earlier notes" in text:
+        return True
+    if "supersedes" in text and "earlier" in text:
+        return True
+    if "no longer controlling" in text:
+        return True
+    if bool(meta.get("invalidates")):
+        return True
+    if bool(meta.get("trap_graph_excludable_ids")):
+        return True
+    if bool(meta.get("trap_invalidation")) or bool(meta.get("invalidation")):
+        return True
+    return False
+
+
+def _goc_overlap_count(message_tokens: Set[str], clause: TraceWorldClause | None) -> int:
+    if clause is None:
+        return 0
+    return int(len(message_tokens & _tokenize(str(clause.text or ""))))
+
+
+def _goc_smart_pack_context_ids(
+    *,
+    context_ids: Sequence[str],
+    ordered_history: Sequence[str],
+    candidates: Sequence[str],
+    step: TraceStep,
+    clauses: Dict[str, TraceWorldClause],
+    avoid_set: Set[str],
+    args: Any,
+) -> Tuple[List[str], Dict[str, Any]]:
+    ordered_history_ids = _unique_strs(ordered_history)
+    ordered_history_rank = {cid: idx for idx, cid in enumerate(ordered_history_ids)}
+    message_tokens = _tokenize(step.message)
+
+    initial_ids = [
+        cid
+        for cid in _unique_strs(context_ids)
+        if cid in clauses and cid not in avoid_set
+    ]
+    keep_set: Set[str] = set(initial_ids)
+    dropped_reason_by_id: Dict[str, str] = {}
+    injected_ids: List[str] = []
+
+    def _drop(cid: str, reason: str) -> None:
+        if cid not in keep_set:
+            return
+        keep_set.remove(cid)
+        dropped_reason_by_id.setdefault(str(cid), str(reason))
+
+    def _ordered(ids: Sequence[str]) -> List[str]:
+        return sorted(
+            _unique_strs(ids),
+            key=lambda cid: (
+                int(clauses[cid].step_idx) if cid in clauses else -1,
+                int(ordered_history_rank.get(cid, 10**9)),
+                str(cid),
+            ),
+        )
+
+    def _rank_ids(ids: Sequence[str]) -> List[str]:
+        ranked: List[Tuple[int, int, int, int, str]] = []
+        for cid in _unique_strs(ids):
+            clause = clauses.get(cid)
+            if clause is None:
+                continue
+            applicable = 1 if _clause_applicable(clause, step.state) else 0
+            recency = int(clause.step_idx)
+            overlap = _goc_overlap_count(message_tokens, clause)
+            history_idx = int(ordered_history_rank.get(cid, -1))
+            ranked.append((applicable, recency, overlap, history_idx, str(cid)))
+        ranked.sort(reverse=True)
+        return [cid for _, _, _, _, cid in ranked]
+
+    def _apply_type_quotas(*, protect_ids: Set[str]) -> None:
+        def _cap_value(name: str, default: int) -> int:
+            raw = getattr(args, name, default)
+            if raw is None:
+                return int(default)
+            return int(raw)
+
+        caps = {
+            "OPTION": _cap_value("goc_smart_cap_option", 0),
+            "ASSUMPTION": _cap_value("goc_smart_cap_assumption", 2),
+            "UPDATE": _cap_value("goc_smart_cap_update", 4),
+            "EXCEPTION": _cap_value("goc_smart_cap_exception", 2),
+            "EVIDENCE": _cap_value("goc_smart_cap_evidence", 2),
+        }
+        for ctype, cap in caps.items():
+            type_ids = [
+                cid
+                for cid in ordered_history_ids
+                if cid in keep_set and _goc_clause_type(clauses.get(cid)) == ctype
+            ]
+            if not type_ids:
+                continue
+            protected = {cid for cid in type_ids if cid in protect_ids}
+            ranked = _rank_ids(type_ids)
+            keep_type: Set[str] = set(protected)
+            remaining = max(0, int(cap) - len(keep_type))
+            for cid in ranked:
+                if cid in keep_type:
+                    continue
+                if remaining <= 0:
+                    break
+                keep_type.add(cid)
+                remaining -= 1
+            for cid in type_ids:
+                if cid in keep_type:
+                    continue
+                _drop(cid, f"quota_drop_{ctype.lower()}")
+
+    # Rule 1) OPTION drop unless referenced by a non-OPTION clause.
+    referenced_options: Set[str] = set()
+    for cid in list(keep_set):
+        clause = clauses.get(cid)
+        if clause is None:
+            continue
+        if _goc_clause_type(clause) == "OPTION":
+            continue
+        for dep in _unique_strs(getattr(clause, "depends_on", []) or []):
+            if dep not in keep_set:
+                continue
+            dep_clause = clauses.get(dep)
+            if _goc_clause_type(dep_clause) == "OPTION":
+                referenced_options.add(dep)
+    for cid in list(keep_set):
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) != "OPTION":
+            continue
+        if cid not in referenced_options:
+            _drop(cid, "drop_option_unreferenced")
+
+    # Rule 2) UPDATE dedup by state_key: latest + invalidation updates.
+    updates_by_key: Dict[str, List[str]] = {}
+    for cid in ordered_history_ids:
+        if cid not in keep_set:
+            continue
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) != "UPDATE":
+            continue
+        key = str(getattr(clause, "state_key", "") or "").strip().lower()
+        if not key:
+            continue
+        updates_by_key.setdefault(key, []).append(cid)
+    for key, group_ids in updates_by_key.items():
+        ranked_group = _ordered(group_ids)
+        if not ranked_group:
+            continue
+        latest_id = ranked_group[-1]
+        keep_updates = {latest_id}
+        for cid in ranked_group:
+            if _is_update_invalidation_clause(clauses.get(cid)):
+                keep_updates.add(cid)
+        for cid in ranked_group:
+            if cid in keep_updates:
+                continue
+            _drop(cid, "dedup_update_keep_latest")
+
+    # Rule 3) ASSUMPTION dedup.
+    assumptions_by_group: Dict[str, List[str]] = {}
+    for cid in ordered_history_ids:
+        if cid not in keep_set:
+            continue
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) != "ASSUMPTION":
+            continue
+        skey = str(getattr(clause, "state_key", "") or "").strip().lower()
+        sval = str(getattr(clause, "state_value", "") or "").strip().lower()
+        if skey and sval:
+            group_key = f"sv:{skey}={sval}"
+        else:
+            group_key = f"txt:{_smart_norm_text_prefix(str(getattr(clause, 'text', '') or ''))}"
+        assumptions_by_group.setdefault(group_key, []).append(cid)
+    for _, group_ids in assumptions_by_group.items():
+        ranked_group = _ordered(group_ids)
+        if not ranked_group:
+            continue
+        keep_id = ranked_group[-1]
+        for cid in ranked_group:
+            if cid == keep_id:
+                continue
+            _drop(cid, "dedup_assumption_keep_latest")
+
+    # Recompute OPTION references after dedup.
+    referenced_options = set()
+    for cid in list(keep_set):
+        clause = clauses.get(cid)
+        if clause is None or _goc_clause_type(clause) == "OPTION":
+            continue
+        for dep in _unique_strs(getattr(clause, "depends_on", []) or []):
+            if dep not in keep_set:
+                continue
+            dep_clause = clauses.get(dep)
+            if _goc_clause_type(dep_clause) == "OPTION":
+                referenced_options.add(dep)
+    for cid in list(keep_set):
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) != "OPTION":
+            continue
+        if cid not in referenced_options:
+            _drop(cid, "drop_option_unreferenced")
+
+    # Rule 4) Type quotas.
+    _apply_type_quotas(protect_ids=set(referenced_options))
+
+    # Rule 5 + SmartUnfold: fill missing critical types.
+    candidate_pool = [
+        cid
+        for cid in _unique_strs(candidates)
+        if cid in clauses
+        and cid not in avoid_set
+        and int(clauses[cid].step_idx) < int(step.step_idx)
+    ]
+    def _pick_missing(
+        *,
+        pred,
+        reason: str,
+    ) -> None:
+        nonlocal injected_ids
+        available = [cid for cid in candidate_pool if pred(clauses.get(cid))]
+        if not available:
+            return
+        present = [cid for cid in keep_set if pred(clauses.get(cid))]
+        if present:
+            return
+        ranked = _rank_ids([cid for cid in available if cid not in keep_set])
+        if not ranked:
+            return
+        chosen = ranked[0]
+        keep_set.add(chosen)
+        injected_ids.append(chosen)
+        dropped_reason_by_id.setdefault(str(chosen), str(reason))
+
+    applicable_exception_exists = any(
+        _goc_clause_type(clauses.get(cid)) == "EXCEPTION"
+        and _clause_applicable(clauses.get(cid), step.state)
+        for cid in candidate_pool
+    )
+    evidence_exists = any(_goc_clause_type(clauses.get(cid)) == "EVIDENCE" for cid in candidate_pool)
+
+    _pick_missing(
+        pred=lambda c: _goc_clause_type(c) == "DECISION" and not _is_decision_checkpoint_clause(c),
+        reason="unfold_inject_decision_missing",
+    )
+    _pick_missing(
+        pred=lambda c: _goc_clause_type(c) == "UPDATE",
+        reason="unfold_inject_update_missing",
+    )
+    if applicable_exception_exists:
+        _pick_missing(
+            pred=lambda c: _goc_clause_type(c) == "EXCEPTION" and _clause_applicable(c, step.state),
+            reason="unfold_inject_exception_missing",
+        )
+    if evidence_exists:
+        _pick_missing(
+            pred=lambda c: _goc_clause_type(c) == "EVIDENCE",
+            reason="unfold_inject_evidence_missing",
+        )
+
+    protected_unfold_ids = set(referenced_options)
+    protected_unfold_ids.update(injected_ids)
+    _apply_type_quotas(protect_ids=protected_unfold_ids)
+
+    final_ids = [cid for cid in ordered_history_ids if cid in keep_set]
+    if len(final_ids) < len(keep_set):
+        remainder = sorted(
+            [cid for cid in keep_set if cid not in set(final_ids)],
+            key=lambda cid: (int(clauses[cid].step_idx), str(cid)),
+        )
+        final_ids.extend(remainder)
+    final_ids = _unique_strs(final_ids)
+
+    dropped_ids_ordered = [
+        cid
+        for cid in ordered_history_ids
+        if cid in dropped_reason_by_id and cid not in set(final_ids)
+    ]
+    dropped_reasons_ordered = [str(dropped_reason_by_id[cid]) for cid in dropped_ids_ordered]
+
+    debug = {
+        "goc_smart_enable": True,
+        "goc_smart_dropped_ids": list(dropped_ids_ordered),
+        "goc_smart_dropped_reasons": list(dropped_reasons_ordered),
+        "goc_smart_injected_ids": list(_unique_strs(injected_ids)),
+        "goc_smart_type_counts_before": _goc_type_counts(initial_ids, clauses),
+        "goc_smart_type_counts_after": _goc_type_counts(final_ids, clauses),
+    }
+    return final_ids, debug
+
+
 def _choose_traceops_context(
     method: str,
     *,
@@ -841,6 +1173,26 @@ def _choose_traceops_context(
                     force_but_inapplicable.append(cid)
             context_ids = _unique_strs(context_ids + force_ids)
 
+        smart_enable = bool(getattr(args, "goc_smart_context_enable", False))
+        smart_debug: Dict[str, Any] = {
+            "goc_smart_enable": bool(smart_enable),
+            "goc_smart_dropped_ids": [],
+            "goc_smart_dropped_reasons": [],
+            "goc_smart_injected_ids": [],
+            "goc_smart_type_counts_before": {},
+            "goc_smart_type_counts_after": {},
+        }
+        if smart_enable:
+            context_ids, smart_debug = _goc_smart_pack_context_ids(
+                context_ids=context_ids,
+                ordered_history=ordered_history,
+                candidates=candidates,
+                step=step,
+                clauses=clauses,
+                avoid_set=avoid_set if use_avoids else set(),
+                args=args,
+            )
+
         if len(context_ids) > base_max:
             context_ids = context_ids[:base_max]
 
@@ -851,7 +1203,10 @@ def _choose_traceops_context(
             is_exception = 1 if str(clause.node_type or "") == "EXCEPTION" else 0
             return (is_exception, int(clause.step_idx), str(cid))
 
-        context_ids = sorted(_unique_strs(context_ids), key=_goc_sort_key)
+        if not smart_enable:
+            context_ids = sorted(_unique_strs(context_ids), key=_goc_sort_key)
+        else:
+            context_ids = _unique_strs(context_ids)
 
         debug = {
             "goc_anchor_ids": list(anchor_ids),
@@ -877,6 +1232,16 @@ def _choose_traceops_context(
             "goc_rescue_ran": bool(rescue_ran),
             "goc_rescue_reason_short": str(rescue_reason_short),
             "goc_update_history_rescue_ids": list(update_history_rescue_ids),
+            "goc_smart_enable": bool(smart_debug.get("goc_smart_enable", False)),
+            "goc_smart_dropped_ids": list(smart_debug.get("goc_smart_dropped_ids") or []),
+            "goc_smart_dropped_reasons": list(smart_debug.get("goc_smart_dropped_reasons") or []),
+            "goc_smart_injected_ids": list(smart_debug.get("goc_smart_injected_ids") or []),
+            "goc_smart_type_counts_before": dict(
+                smart_debug.get("goc_smart_type_counts_before") or {}
+            ),
+            "goc_smart_type_counts_after": dict(
+                smart_debug.get("goc_smart_type_counts_after") or {}
+            ),
         }
     else:
         context_ids = list(ordered_history)
@@ -1439,6 +1804,18 @@ def evaluate_traceops_method(
                 ),
                 "goc_update_history_rescue_count": len(
                     list(debug.get("goc_update_history_rescue_ids") or [])
+                ),
+                "goc_smart_enable": bool(debug.get("goc_smart_enable", False)),
+                "goc_smart_dropped_ids": list(debug.get("goc_smart_dropped_ids") or []),
+                "goc_smart_dropped_reasons": list(
+                    debug.get("goc_smart_dropped_reasons") or []
+                ),
+                "goc_smart_injected_ids": list(debug.get("goc_smart_injected_ids") or []),
+                "goc_smart_type_counts_before": dict(
+                    debug.get("goc_smart_type_counts_before") or {}
+                ),
+                "goc_smart_type_counts_after": dict(
+                    debug.get("goc_smart_type_counts_after") or {}
                 ),
                 "e3_context_clause_ids": list(context_ids),
                 "goc_exception_injected_ids": list(exception_injected_ids),

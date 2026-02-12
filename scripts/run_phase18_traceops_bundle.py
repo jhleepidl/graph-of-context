@@ -134,6 +134,12 @@ class RunEntry:
     goc_depwalk_enable: bool
     goc_depwalk_hops: int
     goc_depwalk_topk_per_hop: int
+    goc_smart_context_enable: bool
+    goc_smart_cap_option: int
+    goc_smart_cap_assumption: int
+    goc_smart_cap_update: int
+    goc_smart_cap_exception: int
+    goc_smart_cap_evidence: int
     report_json: str
     compare_root: str
 
@@ -230,6 +236,11 @@ def main() -> None:
     ap.add_argument("--traceops_llm_sample_rate", type=float, default=0.2)
     ap.add_argument("--goc_depwalk_hops", type=int, default=2)
     ap.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    ap.add_argument("--goc_smart_cap_option", type=int, default=0)
+    ap.add_argument("--goc_smart_cap_assumption", type=int, default=2)
+    ap.add_argument("--goc_smart_cap_update", type=int, default=4)
+    ap.add_argument("--goc_smart_cap_exception", type=int, default=2)
+    ap.add_argument("--goc_smart_cap_evidence", type=int, default=2)
     ap.add_argument("--include_ablations", action="store_true")
     ap.add_argument("--include_oracle", action="store_true")
     ap.add_argument("--smoke", action="store_true")
@@ -312,6 +323,11 @@ def main() -> None:
         "traceops_llm_sample_rate": float(args.traceops_llm_sample_rate),
         "goc_depwalk_hops": int(args.goc_depwalk_hops),
         "goc_depwalk_topk_per_hop": int(args.goc_depwalk_topk_per_hop),
+        "goc_smart_cap_option": int(args.goc_smart_cap_option),
+        "goc_smart_cap_assumption": int(args.goc_smart_cap_assumption),
+        "goc_smart_cap_update": int(args.goc_smart_cap_update),
+        "goc_smart_cap_exception": int(args.goc_smart_cap_exception),
+        "goc_smart_cap_evidence": int(args.goc_smart_cap_evidence),
         "max_steps": int(args.max_steps),
         "runs": [],
     }
@@ -614,6 +630,12 @@ def main() -> None:
                     goc_depwalk_enable=False,
                     goc_depwalk_hops=0,
                     goc_depwalk_topk_per_hop=0,
+                    goc_smart_context_enable=False,
+                    goc_smart_cap_option=int(args.goc_smart_cap_option),
+                    goc_smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                    goc_smart_cap_update=int(args.goc_smart_cap_update),
+                    goc_smart_cap_exception=int(args.goc_smart_cap_exception),
+                    goc_smart_cap_evidence=int(args.goc_smart_cap_evidence),
                     report_json=str(rep_base.relative_to(phase_root)),
                     compare_root=str(out_base.relative_to(phase_root)),
                 )
@@ -635,6 +657,12 @@ def main() -> None:
             depwalk_enable: bool,
             depwalk_hops: int,
             depwalk_topk_per_hop: int,
+            smart_enable: bool,
+            smart_cap_option: int,
+            smart_cap_assumption: int,
+            smart_cap_update: int,
+            smart_cap_exception: int,
+            smart_cap_evidence: int,
         ) -> None:
             out_dir = runs_root / scenario / variant
             _ensure_dir(out_dir)
@@ -666,6 +694,16 @@ def main() -> None:
                 str(depwalk_hops),
                 "--goc_depwalk_topk_per_hop",
                 str(depwalk_topk_per_hop),
+                "--goc_smart_cap_option",
+                str(int(smart_cap_option)),
+                "--goc_smart_cap_assumption",
+                str(int(smart_cap_assumption)),
+                "--goc_smart_cap_update",
+                str(int(smart_cap_update)),
+                "--goc_smart_cap_exception",
+                str(int(smart_cap_exception)),
+                "--goc_smart_cap_evidence",
+                str(int(smart_cap_evidence)),
                 "--dotenv",
                 args.dotenv,
                 "--out_dir",
@@ -677,6 +715,8 @@ def main() -> None:
                 cmd += ["--goc_dependency_closure_enable"]
             if depwalk_enable:
                 cmd += ["--goc_depwalk_enable"]
+            if smart_enable:
+                cmd += ["--goc_smart_context_enable"]
             _run(cmd, cwd=repo_root, env=env)
             rep = _discover_report_json(out_dir)
             if not rep:
@@ -735,6 +775,12 @@ def main() -> None:
                         goc_depwalk_enable=bool(depwalk_enable),
                         goc_depwalk_hops=int(depwalk_hops),
                         goc_depwalk_topk_per_hop=int(depwalk_topk_per_hop),
+                        goc_smart_context_enable=bool(smart_enable),
+                        goc_smart_cap_option=int(smart_cap_option),
+                        goc_smart_cap_assumption=int(smart_cap_assumption),
+                        goc_smart_cap_update=int(smart_cap_update),
+                        goc_smart_cap_exception=int(smart_cap_exception),
+                        goc_smart_cap_evidence=int(smart_cap_evidence),
                         report_json=str(rep.relative_to(phase_root)),
                         compare_root=str(out_dir.relative_to(phase_root)),
                     )
@@ -755,6 +801,12 @@ def main() -> None:
             depwalk_enable=False,
             depwalk_hops=int(args.goc_depwalk_hops),
             depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+            smart_enable=False,
+            smart_cap_option=int(args.goc_smart_cap_option),
+            smart_cap_assumption=int(args.goc_smart_cap_assumption),
+            smart_cap_update=int(args.goc_smart_cap_update),
+            smart_cap_exception=int(args.goc_smart_cap_exception),
+            smart_cap_evidence=int(args.goc_smart_cap_evidence),
         )
         _run_goc_variant(
             "goc_phase18_depwalk",
@@ -770,6 +822,12 @@ def main() -> None:
             depwalk_enable=True,
             depwalk_hops=int(args.goc_depwalk_hops),
             depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+            smart_enable=True,
+            smart_cap_option=int(args.goc_smart_cap_option),
+            smart_cap_assumption=int(args.goc_smart_cap_assumption),
+            smart_cap_update=int(args.goc_smart_cap_update),
+            smart_cap_exception=int(args.goc_smart_cap_exception),
+            smart_cap_evidence=int(args.goc_smart_cap_evidence),
         )
         if args.include_ablations:
             _run_goc_variant(
@@ -786,6 +844,12 @@ def main() -> None:
                 depwalk_enable=True,
                 depwalk_hops=int(args.goc_depwalk_hops),
                 depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                smart_enable=True,
+                smart_cap_option=int(args.goc_smart_cap_option),
+                smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                smart_cap_update=int(args.goc_smart_cap_update),
+                smart_cap_exception=int(args.goc_smart_cap_exception),
+                smart_cap_evidence=int(args.goc_smart_cap_evidence),
             )
         if args.include_oracle:
             _run_goc_variant(
@@ -802,6 +866,12 @@ def main() -> None:
                 depwalk_enable=True,
                 depwalk_hops=int(args.goc_depwalk_hops),
                 depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                smart_enable=True,
+                smart_cap_option=int(args.goc_smart_cap_option),
+                smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                smart_cap_update=int(args.goc_smart_cap_update),
+                smart_cap_exception=int(args.goc_smart_cap_exception),
+                smart_cap_evidence=int(args.goc_smart_cap_evidence),
             )
 
     (phase_root / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -845,7 +915,10 @@ def main() -> None:
         ),
         (
             f"- goc_depwalk_hops={int(args.goc_depwalk_hops)} "
-            f"goc_depwalk_topk_per_hop={int(args.goc_depwalk_topk_per_hop)}"
+            f"goc_depwalk_topk_per_hop={int(args.goc_depwalk_topk_per_hop)} "
+            f"goc_smart_caps=(option={int(args.goc_smart_cap_option)},assumption={int(args.goc_smart_cap_assumption)},"
+            f"update={int(args.goc_smart_cap_update)},exception={int(args.goc_smart_cap_exception)},"
+            f"evidence={int(args.goc_smart_cap_evidence)})"
         ),
         (
             "- traceops_v0 deterministic mode (no LLM calls); token fields are estimates."

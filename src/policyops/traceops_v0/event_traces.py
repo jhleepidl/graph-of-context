@@ -200,6 +200,21 @@ def build_event_trace_line(
             rec.get("goc_update_history_rescue_ids"),
         )
         goc["goc_update_history_rescue_count"] = rec.get("goc_update_history_rescue_count")
+        goc["goc_smart_enable"] = rec.get("goc_smart_enable")
+        goc["goc_smart_dropped_ids"] = _cap(
+            "goc_smart_dropped_ids",
+            rec.get("goc_smart_dropped_ids"),
+        )
+        goc["goc_smart_dropped_reasons"] = _cap(
+            "goc_smart_dropped_reasons",
+            rec.get("goc_smart_dropped_reasons"),
+        )
+        goc["goc_smart_injected_ids"] = _cap(
+            "goc_smart_injected_ids",
+            rec.get("goc_smart_injected_ids"),
+        )
+        goc["goc_smart_type_counts_before"] = rec.get("goc_smart_type_counts_before")
+        goc["goc_smart_type_counts_after"] = rec.get("goc_smart_type_counts_after")
 
         goc["goc_exception_injected_ids"] = _cap(
             "goc_exception_injected_ids",

@@ -8020,6 +8020,32 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
             "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
             "goc_depwalk_topk_per_hop": int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
+            "goc_smart_context_enable": bool(getattr(args, "goc_smart_context_enable", False)),
+            "goc_smart_cap_option": int(
+                getattr(args, "goc_smart_cap_option", 0)
+                if getattr(args, "goc_smart_cap_option", None) is not None
+                else 0
+            ),
+            "goc_smart_cap_assumption": int(
+                getattr(args, "goc_smart_cap_assumption", 2)
+                if getattr(args, "goc_smart_cap_assumption", None) is not None
+                else 2
+            ),
+            "goc_smart_cap_update": int(
+                getattr(args, "goc_smart_cap_update", 4)
+                if getattr(args, "goc_smart_cap_update", None) is not None
+                else 4
+            ),
+            "goc_smart_cap_exception": int(
+                getattr(args, "goc_smart_cap_exception", 2)
+                if getattr(args, "goc_smart_cap_exception", None) is not None
+                else 2
+            ),
+            "goc_smart_cap_evidence": int(
+                getattr(args, "goc_smart_cap_evidence", 2)
+                if getattr(args, "goc_smart_cap_evidence", None) is not None
+                else 2
+            ),
         },
         "metrics": dict(report.get("metrics") or {}),
         "records": list(report.get("records") or []),
@@ -8203,6 +8229,32 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
             "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
             "goc_depwalk_topk_per_hop": int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
+            "goc_smart_context_enable": bool(getattr(args, "goc_smart_context_enable", False)),
+            "goc_smart_cap_option": int(
+                getattr(args, "goc_smart_cap_option", 0)
+                if getattr(args, "goc_smart_cap_option", None) is not None
+                else 0
+            ),
+            "goc_smart_cap_assumption": int(
+                getattr(args, "goc_smart_cap_assumption", 2)
+                if getattr(args, "goc_smart_cap_assumption", None) is not None
+                else 2
+            ),
+            "goc_smart_cap_update": int(
+                getattr(args, "goc_smart_cap_update", 4)
+                if getattr(args, "goc_smart_cap_update", None) is not None
+                else 4
+            ),
+            "goc_smart_cap_exception": int(
+                getattr(args, "goc_smart_cap_exception", 2)
+                if getattr(args, "goc_smart_cap_exception", None) is not None
+                else 2
+            ),
+            "goc_smart_cap_evidence": int(
+                getattr(args, "goc_smart_cap_evidence", 2)
+                if getattr(args, "goc_smart_cap_evidence", None) is not None
+                else 2
+            ),
         },
         "summary": summary,
         "method_reports": method_reports,
@@ -8868,6 +8920,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--goc_depwalk_hops", type=int, default=2)
     ev.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    ev.add_argument("--goc_smart_context_enable", action="store_true", default=False)
+    ev.add_argument("--goc_smart_cap_option", type=int, default=0)
+    ev.add_argument("--goc_smart_cap_assumption", type=int, default=2)
+    ev.add_argument("--goc_smart_cap_update", type=int, default=4)
+    ev.add_argument("--goc_smart_cap_exception", type=int, default=2)
+    ev.add_argument("--goc_smart_cap_evidence", type=int, default=2)
     ev.add_argument("--traceops_indirection_rate", type=float, default=0.4)
     ev.add_argument("--traceops_trap_distractor_count", type=int, default=4)
     ev.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)
@@ -9278,6 +9336,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cmp.add_argument("--goc_depwalk_hops", type=int, default=2)
     cmp.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    cmp.add_argument("--goc_smart_context_enable", action="store_true", default=False)
+    cmp.add_argument("--goc_smart_cap_option", type=int, default=0)
+    cmp.add_argument("--goc_smart_cap_assumption", type=int, default=2)
+    cmp.add_argument("--goc_smart_cap_update", type=int, default=4)
+    cmp.add_argument("--goc_smart_cap_exception", type=int, default=2)
+    cmp.add_argument("--goc_smart_cap_evidence", type=int, default=2)
     cmp.add_argument("--traceops_indirection_rate", type=float, default=0.4)
     cmp.add_argument("--traceops_trap_distractor_count", type=int, default=4)
     cmp.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)

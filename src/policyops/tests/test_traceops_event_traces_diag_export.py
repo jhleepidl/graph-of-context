@@ -43,6 +43,12 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
         "goc_exception_injected_ids": ["C0002", "C0004"],
         "goc_exception_injected_count": 2,
         "goc_exception_applicable_count": 1,
+        "goc_smart_enable": True,
+        "goc_smart_dropped_ids": [f"X{i:04d}" for i in range(230)],
+        "goc_smart_dropped_reasons": ["drop_option_unreferenced"] * 230,
+        "goc_smart_injected_ids": [f"Y{i:04d}" for i in range(225)],
+        "goc_smart_type_counts_before": {"OPTION": 10, "UPDATE": 8},
+        "goc_smart_type_counts_after": {"OPTION": 1, "UPDATE": 3},
         "core_necessity_flip_count": 3,
         "core_necessity_all_required": True,
         "core_necessity_failed": False,
@@ -68,6 +74,12 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
     assert len(goc_diag["goc_depwalk_added_ids"]) == 200
     assert line["diag"]["truncation"]["goc_depwalk_added_ids_full_count"] == 255
     assert line["diag"]["truncation"]["goc_depwalk_added_ids_truncated"] is True
+    assert goc_diag["goc_smart_enable"] is True
+    assert len(goc_diag["goc_smart_dropped_ids"]) == 200
+    assert len(goc_diag["goc_smart_dropped_reasons"]) == 200
+    assert len(goc_diag["goc_smart_injected_ids"]) == 200
+    assert goc_diag["goc_smart_type_counts_before"]["OPTION"] == 10
+    assert goc_diag["goc_smart_type_counts_after"]["OPTION"] == 1
 
     avoid_diag = line["diag"]["avoid"]
     assert avoid_diag["avoid_target_count"] == 20
