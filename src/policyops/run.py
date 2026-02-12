@@ -7902,6 +7902,13 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
             )
             or "stale,inapplicable,avoided,decision_checkpoint"
         ),
+        trap_graph_force_topk=int(getattr(args, "traceops_trap_graph_force_topk", 1) or 1),
+        trap_graph_force_include_flip_target=bool(
+            getattr(args, "traceops_trap_graph_force_include_flip_target", True)
+        ),
+        trap_graph_force_include_decision_checkpoint=bool(
+            getattr(args, "traceops_trap_graph_force_include_decision_checkpoint", True)
+        ),
         trap_invalidation_text_strength=float(
             getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
         ),
@@ -7987,6 +7994,15 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
                     "stale,inapplicable,avoided,decision_checkpoint",
                 )
                 or "stale,inapplicable,avoided,decision_checkpoint"
+            ),
+            "traceops_trap_graph_force_topk": int(
+                getattr(args, "traceops_trap_graph_force_topk", 1) or 1
+            ),
+            "traceops_trap_graph_force_include_flip_target": bool(
+                getattr(args, "traceops_trap_graph_force_include_flip_target", True)
+            ),
+            "traceops_trap_graph_force_include_decision_checkpoint": bool(
+                getattr(args, "traceops_trap_graph_force_include_decision_checkpoint", True)
             ),
             "traceops_trap_invalidation_text_strength": float(
                 getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
@@ -8088,6 +8104,15 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "mean_decision_checkpoint_trap_injected_count": metrics.get(
                 "mean_decision_checkpoint_trap_injected_count"
             ),
+            "mean_forced_trap_injected_count": metrics.get(
+                "mean_forced_trap_injected_count"
+            ),
+            "mean_forced_trap_injected_rate": metrics.get(
+                "mean_forced_trap_injected_rate"
+            ),
+            "forced_trap_injected_any_rate": metrics.get(
+                "forced_trap_injected_any_rate"
+            ),
             "mean_core_size": metrics.get("mean_core_size"),
             "decision_accuracy": metrics.get("decision_accuracy"),
             "judge_accuracy": metrics.get("judge_accuracy"),
@@ -8142,6 +8167,15 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
                     "stale,inapplicable,avoided,decision_checkpoint",
                 )
                 or "stale,inapplicable,avoided,decision_checkpoint"
+            ),
+            "traceops_trap_graph_force_topk": int(
+                getattr(args, "traceops_trap_graph_force_topk", 1) or 1
+            ),
+            "traceops_trap_graph_force_include_flip_target": bool(
+                getattr(args, "traceops_trap_graph_force_include_flip_target", True)
+            ),
+            "traceops_trap_graph_force_include_decision_checkpoint": bool(
+                getattr(args, "traceops_trap_graph_force_include_decision_checkpoint", True)
             ),
             "traceops_trap_invalidation_text_strength": float(
                 getattr(args, "traceops_trap_invalidation_text_strength", 0.6) or 0.6
@@ -8622,6 +8656,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="stale,inapplicable,avoided,decision_checkpoint",
     )
+    gen.add_argument("--traceops_trap_graph_force_topk", type=int, default=1)
+    gen.add_argument(
+        "--traceops_trap_graph_force_include_flip_target",
+        action="store_true",
+        default=True,
+    )
+    gen.add_argument(
+        "--no_traceops_trap_graph_force_include_flip_target",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_flip_target",
+    )
+    gen.add_argument(
+        "--traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_true",
+        default=True,
+    )
+    gen.add_argument(
+        "--no_traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_decision_checkpoint",
+    )
     gen.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     gen.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
     gen.add_argument("--traceops_hidden_core_enable", action="store_true", default=False)
@@ -8829,6 +8884,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--traceops_trap_graph_excludable_kinds",
         type=str,
         default="stale,inapplicable,avoided,decision_checkpoint",
+    )
+    ev.add_argument("--traceops_trap_graph_force_topk", type=int, default=1)
+    ev.add_argument(
+        "--traceops_trap_graph_force_include_flip_target",
+        action="store_true",
+        default=True,
+    )
+    ev.add_argument(
+        "--no_traceops_trap_graph_force_include_flip_target",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_flip_target",
+    )
+    ev.add_argument(
+        "--traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_true",
+        default=True,
+    )
+    ev.add_argument(
+        "--no_traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_decision_checkpoint",
     )
     ev.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     ev.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
@@ -9218,6 +9294,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--traceops_trap_graph_excludable_kinds",
         type=str,
         default="stale,inapplicable,avoided,decision_checkpoint",
+    )
+    cmp.add_argument("--traceops_trap_graph_force_topk", type=int, default=1)
+    cmp.add_argument(
+        "--traceops_trap_graph_force_include_flip_target",
+        action="store_true",
+        default=True,
+    )
+    cmp.add_argument(
+        "--no_traceops_trap_graph_force_include_flip_target",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_flip_target",
+    )
+    cmp.add_argument(
+        "--traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_true",
+        default=True,
+    )
+    cmp.add_argument(
+        "--no_traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_decision_checkpoint",
     )
     cmp.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     cmp.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)

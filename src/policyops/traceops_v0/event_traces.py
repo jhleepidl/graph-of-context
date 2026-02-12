@@ -82,7 +82,11 @@ def build_event_trace_line(
         "trap_flip_target_id",
         "trap_flip_target_kind",
         "trap_graph_excludable_count",
+        "trap_graph_excludable_forced_count",
         "trap_invalidation_attached_to_update",
+        "forced_trap_injected_count",
+        "forced_trap_injected_rate",
+        "forced_trap_injected_any",
     ]:
         line[key] = rec.get(key)
     line["hidden_core_ids"] = _cap("hidden_core_ids", rec.get("hidden_core_ids"))
@@ -101,6 +105,18 @@ def build_event_trace_line(
     )
     line["trap_graph_excludable_ids"] = _cap(
         "trap_graph_excludable_ids", rec.get("trap_graph_excludable_ids")
+    )
+    line["trap_graph_excludable_forced_ids"] = _cap(
+        "trap_graph_excludable_forced_ids",
+        rec.get("trap_graph_excludable_forced_ids"),
+    )
+    line["trap_graph_excludable_forced_reasons"] = _cap(
+        "trap_graph_excludable_forced_reasons",
+        rec.get("trap_graph_excludable_forced_reasons"),
+    )
+    line["forced_trap_injected_ids"] = _cap(
+        "forced_trap_injected_ids",
+        rec.get("forced_trap_injected_ids"),
     )
 
     raw_context_ids = line.get("context_clause_ids")
@@ -234,7 +250,23 @@ def build_event_trace_line(
         "trap_graph_excludable_ids": _cap(
             "scenario_trap_graph_excludable_ids", rec.get("trap_graph_excludable_ids")
         ),
+        "trap_graph_excludable_forced_count": rec.get("trap_graph_excludable_forced_count"),
+        "trap_graph_excludable_forced_ids": _cap(
+            "scenario_trap_graph_excludable_forced_ids",
+            rec.get("trap_graph_excludable_forced_ids"),
+        ),
+        "trap_graph_excludable_forced_reasons": _cap(
+            "scenario_trap_graph_excludable_forced_reasons",
+            rec.get("trap_graph_excludable_forced_reasons"),
+        ),
         "trap_invalidation_attached_to_update": rec.get("trap_invalidation_attached_to_update"),
+        "forced_trap_injected_count": rec.get("forced_trap_injected_count"),
+        "forced_trap_injected_rate": rec.get("forced_trap_injected_rate"),
+        "forced_trap_injected_any": rec.get("forced_trap_injected_any"),
+        "forced_trap_injected_ids": _cap(
+            "scenario_forced_trap_injected_ids",
+            rec.get("forced_trap_injected_ids"),
+        ),
         "trap_flip_salience": rec.get("trap_flip_salience"),
         "trap_flip_attach_kind": rec.get("trap_flip_attach_kind"),
         "trap_graph_excludable_rate": rec.get("trap_graph_excludable_rate"),

@@ -245,6 +245,9 @@ def generate_traceops_threads(
     trap_flip_attach_kind: str = "avoided",
     trap_graph_excludable_rate: float = 0.7,
     trap_graph_excludable_kinds: str = "stale,inapplicable,avoided,decision_checkpoint",
+    trap_graph_force_topk: int = 1,
+    trap_graph_force_include_flip_target: bool = True,
+    trap_graph_force_include_decision_checkpoint: bool = True,
     trap_invalidation_text_strength: float = 0.6,
     defer_budget_rate: float = 0.15,
     hidden_core_enable: bool = False,
@@ -289,8 +292,13 @@ def generate_traceops_threads(
         }
     )
     if not trap_graph_excludable_kind_set:
-        trap_graph_excludable_kind_set = {"stale", "inapplicable", "avoided"}
+        trap_graph_excludable_kind_set = {"stale", "inapplicable", "avoided", "decision_checkpoint"}
     trap_graph_excludable_kinds = ",".join(sorted(trap_graph_excludable_kind_set))
+    trap_graph_force_topk = max(0, int(trap_graph_force_topk))
+    trap_graph_force_include_flip_target = bool(trap_graph_force_include_flip_target)
+    trap_graph_force_include_decision_checkpoint = bool(
+        trap_graph_force_include_decision_checkpoint
+    )
     trap_invalidation_text_strength = max(0.0, min(1.0, float(trap_invalidation_text_strength)))
     defer_budget_rate = max(0.0, min(1.0, float(defer_budget_rate)))
     hidden_core_enable = bool(hidden_core_enable)
@@ -607,6 +615,8 @@ def generate_traceops_threads(
                 "trap_flip_target_kind": "",
                 "trap_graph_excludable_count": 0,
                 "trap_graph_excludable_ids": [],
+                "trap_graph_excludable_forced_ids": [],
+                "trap_graph_excludable_forced_reasons": [],
                 "decision_checkpoint_trap_count": 0,
                 "decision_checkpoint_trap_ids": [],
                 "decision_checkpoint_trap_excludable_ids": [],
@@ -1091,6 +1101,17 @@ def generate_traceops_threads(
                             best = max(best, _jaccard_text(message, str(dclause.text or "")))
                         return float(best)
 
+                    def _rank_distractor_similarity(ids: Sequence[str]) -> List[Tuple[float, str]]:
+                        ranked: List[Tuple[float, str]] = []
+                        for dcid in ids:
+                            dclause = clauses.get(str(dcid))
+                            if dclause is None:
+                                continue
+                            sim = float(_jaccard_text(message, str(dclause.text or "")))
+                            ranked.append((sim, str(dcid)))
+                        ranked.sort(key=lambda item: (-item[0], item[1]))
+                        return ranked
+
                     def _trap_kind(cid: str) -> str:
                         clause = clauses.get(str(cid))
                         if clause is None:
@@ -1213,19 +1234,65 @@ def generate_traceops_threads(
                         trap_gap_failed = bool(trap_gap <= 0.0)
 
                     trap_graph_excludable_ids: List[str] = []
+                    trap_graph_excludable_forced_ids: List[str] = []
+                    trap_graph_excludable_forced_reasons: List[Dict[str, str]] = []
                     trap_invalidation_attached_to_update = False
-                    if trap_clause_ids and trap_graph_excludable_rate > 0.0:
+                    if trap_clause_ids:
                         eligible = [
                             str(cid)
                             for cid in trap_clause_ids
                             if _trap_kind(str(cid)) in trap_graph_excludable_kind_set
                         ]
+                        eligible_set = set(eligible)
+                        forced_reason_map: Dict[str, List[str]] = {}
+
+                        def _force_add(cid: str, reason: str) -> None:
+                            sid = str(cid or "").strip()
+                            if not sid or sid not in eligible_set:
+                                return
+                            reasons = forced_reason_map.setdefault(sid, [])
+                            if reason not in reasons:
+                                reasons.append(reason)
+
+                        if trap_graph_force_include_flip_target and trap_flip_target_id:
+                            _force_add(str(trap_flip_target_id), "flip_target")
+
+                        if trap_graph_force_topk > 0 and eligible:
+                            ranked_all = _rank_distractor_similarity(eligible)
+                            for _, rcid in ranked_all[: int(trap_graph_force_topk)]:
+                                _force_add(str(rcid), "topk_sim")
+
+                        if trap_graph_force_include_decision_checkpoint and eligible:
+                            checkpoint_eligible = [
+                                str(cid)
+                                for cid in eligible
+                                if _trap_kind(str(cid)) == "decision_checkpoint"
+                            ]
+                            if checkpoint_eligible:
+                                ranked_checkpoint = _rank_distractor_similarity(checkpoint_eligible)
+                                if ranked_checkpoint:
+                                    _force_add(str(ranked_checkpoint[0][1]), "decision_checkpoint")
+
+                        sampled_ids: List[str] = []
                         for cid in eligible:
                             if trng.random() <= float(trap_graph_excludable_rate):
-                                trap_graph_excludable_ids.append(str(cid))
+                                sampled_ids.append(str(cid))
+
+                        trap_graph_excludable_ids = _unique_strs(
+                            list(sampled_ids) + list(forced_reason_map.keys())
+                        )
                         if eligible and not trap_graph_excludable_ids:
-                            trap_graph_excludable_ids.append(str(eligible[0]))
-                        trap_graph_excludable_ids = _unique_strs(trap_graph_excludable_ids)
+                            fallback_id = str(eligible[0])
+                            trap_graph_excludable_ids = [fallback_id]
+                            _force_add(fallback_id, "fallback_first")
+
+                        trap_graph_excludable_forced_ids = [
+                            cid for cid in trap_graph_excludable_ids if cid in forced_reason_map
+                        ]
+                        trap_graph_excludable_forced_reasons = [
+                            {"id": cid, "reason": "+".join(forced_reason_map.get(cid, []))}
+                            for cid in trap_graph_excludable_forced_ids
+                        ]
                     decision_checkpoint_trap_excludable_ids = [
                         cid
                         for cid in trap_graph_excludable_ids
@@ -1312,6 +1379,12 @@ def generate_traceops_threads(
                         "trap_flip_target_kind": str(trap_flip_target_kind or ""),
                         "trap_graph_excludable_count": int(len(trap_graph_excludable_ids)),
                         "trap_graph_excludable_ids": list(trap_graph_excludable_ids),
+                        "trap_graph_excludable_forced_ids": list(
+                            trap_graph_excludable_forced_ids
+                        ),
+                        "trap_graph_excludable_forced_reasons": list(
+                            trap_graph_excludable_forced_reasons
+                        ),
                         "decision_checkpoint_trap_count": int(len(decision_checkpoint_trap_ids)),
                         "decision_checkpoint_trap_ids": list(decision_checkpoint_trap_ids),
                         "decision_checkpoint_trap_excludable_ids": list(
@@ -1322,6 +1395,13 @@ def generate_traceops_threads(
                         "trap_flip_attach_kind": str(trap_flip_attach_kind),
                         "trap_graph_excludable_rate": float(trap_graph_excludable_rate),
                         "trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
+                        "trap_graph_force_topk": int(trap_graph_force_topk),
+                        "trap_graph_force_include_flip_target": bool(
+                            trap_graph_force_include_flip_target
+                        ),
+                        "trap_graph_force_include_decision_checkpoint": bool(
+                            trap_graph_force_include_decision_checkpoint
+                        ),
                         "trap_invalidation_text_strength": float(trap_invalidation_text_strength),
                         "defer_budget_rate": float(defer_budget_rate),
                         "core_necessity_enable": bool(core_necessity_enable),
@@ -1448,6 +1528,13 @@ def generate_traceops_threads(
                 "traceops_trap_graph_excludable_unknown_tokens": list(
                     trap_graph_excludable_unknown_tokens
                 ),
+                "traceops_trap_graph_force_topk": int(trap_graph_force_topk),
+                "traceops_trap_graph_force_include_flip_target": bool(
+                    trap_graph_force_include_flip_target
+                ),
+                "traceops_trap_graph_force_include_decision_checkpoint": bool(
+                    trap_graph_force_include_decision_checkpoint
+                ),
                 "traceops_trap_invalidation_text_strength": float(trap_invalidation_text_strength),
                 "traceops_defer_budget_rate": float(defer_budget_rate),
                 "traceops_hidden_core_enable": bool(hidden_core_enable),
@@ -1486,6 +1573,13 @@ def generate_traceops_threads(
         "traceops_trap_graph_excludable_kinds": str(trap_graph_excludable_kinds),
         "traceops_trap_graph_excludable_unknown_tokens": list(
             trap_graph_excludable_unknown_tokens
+        ),
+        "traceops_trap_graph_force_topk": int(trap_graph_force_topk),
+        "traceops_trap_graph_force_include_flip_target": bool(
+            trap_graph_force_include_flip_target
+        ),
+        "traceops_trap_graph_force_include_decision_checkpoint": bool(
+            trap_graph_force_include_decision_checkpoint
         ),
         "traceops_trap_invalidation_text_strength": float(trap_invalidation_text_strength),
         "traceops_defer_budget_rate": float(defer_budget_rate),

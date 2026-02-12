@@ -110,6 +110,9 @@ class RunEntry:
     traceops_trap_flip_attach_kind: str
     traceops_trap_graph_excludable_rate: float
     traceops_trap_graph_excludable_kinds: str
+    traceops_trap_graph_force_topk: int
+    traceops_trap_graph_force_include_flip_target: bool
+    traceops_trap_graph_force_include_decision_checkpoint: bool
     traceops_trap_invalidation_text_strength: float
     traceops_defer_budget_rate: float
     traceops_hidden_core_enable: bool
@@ -180,6 +183,27 @@ def main() -> None:
         "--traceops_trap_graph_excludable_kinds",
         type=str,
         default="stale,inapplicable,avoided,decision_checkpoint",
+    )
+    ap.add_argument("--traceops_trap_graph_force_topk", type=int, default=1)
+    ap.add_argument(
+        "--traceops_trap_graph_force_include_flip_target",
+        action="store_true",
+        default=True,
+    )
+    ap.add_argument(
+        "--no_traceops_trap_graph_force_include_flip_target",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_flip_target",
+    )
+    ap.add_argument(
+        "--traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_true",
+        default=True,
+    )
+    ap.add_argument(
+        "--no_traceops_trap_graph_force_include_decision_checkpoint",
+        action="store_false",
+        dest="traceops_trap_graph_force_include_decision_checkpoint",
     )
     ap.add_argument("--traceops_trap_invalidation_text_strength", type=float, default=0.6)
     ap.add_argument("--traceops_defer_budget_rate", type=float, default=0.15)
@@ -267,6 +291,13 @@ def main() -> None:
         "traceops_trap_flip_attach_kind": str(args.traceops_trap_flip_attach_kind),
         "traceops_trap_graph_excludable_rate": float(args.traceops_trap_graph_excludable_rate),
         "traceops_trap_graph_excludable_kinds": str(args.traceops_trap_graph_excludable_kinds),
+        "traceops_trap_graph_force_topk": int(args.traceops_trap_graph_force_topk),
+        "traceops_trap_graph_force_include_flip_target": bool(
+            args.traceops_trap_graph_force_include_flip_target
+        ),
+        "traceops_trap_graph_force_include_decision_checkpoint": bool(
+            args.traceops_trap_graph_force_include_decision_checkpoint
+        ),
         "traceops_trap_invalidation_text_strength": float(args.traceops_trap_invalidation_text_strength),
         "traceops_defer_budget_rate": float(args.traceops_defer_budget_rate),
         "traceops_hidden_core_enable": bool(args.traceops_hidden_core_enable),
@@ -334,6 +365,8 @@ def main() -> None:
             str(args.traceops_trap_graph_excludable_rate),
             "--traceops_trap_graph_excludable_kinds",
             str(args.traceops_trap_graph_excludable_kinds),
+            "--traceops_trap_graph_force_topk",
+            str(args.traceops_trap_graph_force_topk),
             "--traceops_trap_invalidation_text_strength",
             str(args.traceops_trap_invalidation_text_strength),
             "--traceops_defer_budget_rate",
@@ -353,6 +386,14 @@ def main() -> None:
             gen_cmd += ["--no_traceops_core_necessity_require_all"]
         if bool(args.traceops_trap_decision_flip_enable):
             gen_cmd += ["--traceops_trap_decision_flip_enable"]
+        if bool(args.traceops_trap_graph_force_include_flip_target):
+            gen_cmd += ["--traceops_trap_graph_force_include_flip_target"]
+        else:
+            gen_cmd += ["--no_traceops_trap_graph_force_include_flip_target"]
+        if bool(args.traceops_trap_graph_force_include_decision_checkpoint):
+            gen_cmd += ["--traceops_trap_graph_force_include_decision_checkpoint"]
+        else:
+            gen_cmd += ["--no_traceops_trap_graph_force_include_decision_checkpoint"]
         if bool(args.traceops_hidden_core_enable):
             gen_cmd += ["--traceops_hidden_core_enable"]
         if int(args.traceops_trace_len) > 0:
@@ -390,6 +431,9 @@ def main() -> None:
                     "traceops_trap_flip_attach_kind",
                     "traceops_trap_graph_excludable_rate",
                     "traceops_trap_graph_excludable_kinds",
+                    "traceops_trap_graph_force_topk",
+                    "traceops_trap_graph_force_include_flip_target",
+                    "traceops_trap_graph_force_include_decision_checkpoint",
                     "traceops_trap_invalidation_text_strength",
                     "traceops_defer_budget_rate",
                     "traceops_hidden_core_enable",
@@ -436,6 +480,8 @@ def main() -> None:
             str(float(args.traceops_trap_graph_excludable_rate)),
             "--traceops_trap_graph_excludable_kinds",
             str(args.traceops_trap_graph_excludable_kinds),
+            "--traceops_trap_graph_force_topk",
+            str(int(args.traceops_trap_graph_force_topk)),
             "--traceops_trap_invalidation_text_strength",
             str(float(args.traceops_trap_invalidation_text_strength)),
             "--traceops_defer_budget_rate",
@@ -455,6 +501,14 @@ def main() -> None:
             base_compare_flags += ["--no_traceops_core_necessity_require_all"]
         if bool(args.traceops_trap_decision_flip_enable):
             base_compare_flags += ["--traceops_trap_decision_flip_enable"]
+        if bool(args.traceops_trap_graph_force_include_flip_target):
+            base_compare_flags += ["--traceops_trap_graph_force_include_flip_target"]
+        else:
+            base_compare_flags += ["--no_traceops_trap_graph_force_include_flip_target"]
+        if bool(args.traceops_trap_graph_force_include_decision_checkpoint):
+            base_compare_flags += ["--traceops_trap_graph_force_include_decision_checkpoint"]
+        else:
+            base_compare_flags += ["--no_traceops_trap_graph_force_include_decision_checkpoint"]
         if bool(args.traceops_hidden_core_enable):
             base_compare_flags += ["--traceops_hidden_core_enable"]
         if str(args.traceops_eval_mode) == "llm":
@@ -532,6 +586,13 @@ def main() -> None:
                     traceops_trap_flip_attach_kind=str(args.traceops_trap_flip_attach_kind),
                     traceops_trap_graph_excludable_rate=float(args.traceops_trap_graph_excludable_rate),
                     traceops_trap_graph_excludable_kinds=str(args.traceops_trap_graph_excludable_kinds),
+                    traceops_trap_graph_force_topk=int(args.traceops_trap_graph_force_topk),
+                    traceops_trap_graph_force_include_flip_target=bool(
+                        args.traceops_trap_graph_force_include_flip_target
+                    ),
+                    traceops_trap_graph_force_include_decision_checkpoint=bool(
+                        args.traceops_trap_graph_force_include_decision_checkpoint
+                    ),
                     traceops_trap_invalidation_text_strength=float(args.traceops_trap_invalidation_text_strength),
                     traceops_defer_budget_rate=float(args.traceops_defer_budget_rate),
                     traceops_hidden_core_enable=bool(args.traceops_hidden_core_enable),
@@ -646,6 +707,13 @@ def main() -> None:
                         traceops_trap_flip_attach_kind=str(args.traceops_trap_flip_attach_kind),
                         traceops_trap_graph_excludable_rate=float(args.traceops_trap_graph_excludable_rate),
                         traceops_trap_graph_excludable_kinds=str(args.traceops_trap_graph_excludable_kinds),
+                        traceops_trap_graph_force_topk=int(args.traceops_trap_graph_force_topk),
+                        traceops_trap_graph_force_include_flip_target=bool(
+                            args.traceops_trap_graph_force_include_flip_target
+                        ),
+                        traceops_trap_graph_force_include_decision_checkpoint=bool(
+                            args.traceops_trap_graph_force_include_decision_checkpoint
+                        ),
                         traceops_trap_invalidation_text_strength=float(args.traceops_trap_invalidation_text_strength),
                         traceops_defer_budget_rate=float(args.traceops_defer_budget_rate),
                         traceops_hidden_core_enable=bool(args.traceops_hidden_core_enable),
@@ -763,6 +831,9 @@ def main() -> None:
         ),
         (
             f"- trap_graph_excludable_kinds={str(args.traceops_trap_graph_excludable_kinds)} "
+            f"trap_graph_force_topk={int(args.traceops_trap_graph_force_topk)} "
+            f"trap_graph_force_include_flip_target={bool(args.traceops_trap_graph_force_include_flip_target)} "
+            f"trap_graph_force_include_decision_checkpoint={bool(args.traceops_trap_graph_force_include_decision_checkpoint)} "
             f"trap_invalidation_text_strength={float(args.traceops_trap_invalidation_text_strength)} "
             f"defer_budget_rate={float(args.traceops_defer_budget_rate)}"
         ),

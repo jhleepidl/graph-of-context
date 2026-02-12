@@ -1307,6 +1307,29 @@ def evaluate_traceops_method(
                 if decision_checkpoint_trap_set
                 else float("nan")
             )
+            trap_graph_excludable_forced_ids = _unique_strs(
+                step_meta.get("trap_graph_excludable_forced_ids") or []
+            )
+            trap_graph_excludable_forced_set = {
+                str(cid) for cid in trap_graph_excludable_forced_ids if str(cid).strip()
+            }
+            trap_graph_excludable_forced_reasons_raw = step_meta.get(
+                "trap_graph_excludable_forced_reasons"
+            )
+            trap_graph_excludable_forced_reasons = (
+                list(trap_graph_excludable_forced_reasons_raw)
+                if isinstance(trap_graph_excludable_forced_reasons_raw, list)
+                else []
+            )
+            forced_trap_injected_ids = [
+                str(cid) for cid in list(context_ids) if str(cid) in trap_graph_excludable_forced_set
+            ]
+            forced_trap_injected_count = int(len(forced_trap_injected_ids))
+            forced_trap_injected_rate = (
+                float(forced_trap_injected_count) / float(len(trap_graph_excludable_forced_set))
+                if trap_graph_excludable_forced_set
+                else float("nan")
+            )
             raw_flip_count = step_meta.get("core_necessity_flip_count")
             core_necessity_flip_count = (
                 int(raw_flip_count)
@@ -1465,6 +1488,19 @@ def evaluate_traceops_method(
                 "trap_flip_target_kind": str(step_meta.get("trap_flip_target_kind", "") or ""),
                 "trap_graph_excludable_count": int(step_meta.get("trap_graph_excludable_count", 0) or 0),
                 "trap_graph_excludable_ids": list(_unique_strs(step_meta.get("trap_graph_excludable_ids") or [])),
+                "trap_graph_excludable_forced_ids": list(
+                    trap_graph_excludable_forced_ids
+                ),
+                "trap_graph_excludable_forced_count": int(
+                    len(trap_graph_excludable_forced_set)
+                ),
+                "trap_graph_excludable_forced_reasons": list(
+                    trap_graph_excludable_forced_reasons
+                ),
+                "forced_trap_injected_ids": list(forced_trap_injected_ids),
+                "forced_trap_injected_count": int(forced_trap_injected_count),
+                "forced_trap_injected_rate": forced_trap_injected_rate,
+                "forced_trap_injected_any": bool(forced_trap_injected_count > 0),
                 "decision_checkpoint_trap_count": int(
                     step_meta.get("decision_checkpoint_trap_count", len(decision_checkpoint_trap_ids))
                     or 0
@@ -1604,6 +1640,18 @@ def evaluate_traceops_method(
         if isinstance(r.get("decision_checkpoint_trap_injected_rate"), (int, float))
         and math.isfinite(float(r.get("decision_checkpoint_trap_injected_rate")))
     ]
+    forced_trap_injected_count_vals = [
+        float(int(r.get("forced_trap_injected_count", 0) or 0)) for r in pivot_records
+    ]
+    forced_trap_injected_rate_vals = [
+        float(r.get("forced_trap_injected_rate"))
+        for r in pivot_records
+        if isinstance(r.get("forced_trap_injected_rate"), (int, float))
+        and math.isfinite(float(r.get("forced_trap_injected_rate")))
+    ]
+    forced_trap_injected_any_vals = [
+        1.0 if bool(r.get("forced_trap_injected_any", False)) else 0.0 for r in pivot_records
+    ]
     core_size_vals = [float(int(r.get("core_size", 0) or 0)) for r in pivot_records]
     trap_present_vals = [1.0 if bool(r.get("trap_present", False)) else 0.0 for r in pivot_records]
     core_need_all_required_vals = [
@@ -1681,6 +1729,9 @@ def evaluate_traceops_method(
         "decision_checkpoint_trap_injected_rate": _mean(
             decision_checkpoint_trap_injected_rate_vals
         ),
+        "mean_forced_trap_injected_count": _mean(forced_trap_injected_count_vals),
+        "mean_forced_trap_injected_rate": _mean(forced_trap_injected_rate_vals),
+        "forced_trap_injected_any_rate": _mean(forced_trap_injected_any_vals),
         "mean_core_size": _mean(core_size_vals),
         "core_necessity_all_required_rate": _mean(core_need_all_required_vals),
         "mean_core_necessity_flip_count": _mean(core_need_flip_vals),
