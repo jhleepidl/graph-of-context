@@ -305,3 +305,63 @@ def test_phase18_late_decision_checkpoints_not_in_gold_core() -> None:
             )
             assert int(md.get("decision_checkpoint_in_gold_core_count", 0) or 0) == 0
     assert saw_checkpoint_pivot
+
+
+def test_phase18_policy_anchor_and_codebook_generated_linked_and_in_gold_core() -> None:
+    threads, _ = generate_traceops_threads(
+        level=2,
+        scenarios=["indirect"],
+        seed=71,
+        threads=4,
+        indirection_rate=1.0,
+        core_necessity_enable=True,
+        core_necessity_require_all=True,
+        hidden_core_enable=True,
+    )
+    saw_pivot = False
+    for thread in threads:
+        for step in thread.steps:
+            if str(step.kind) != "pivot_check":
+                continue
+            saw_pivot = True
+            md = dict(step.metadata or {})
+            policy_anchor_id = str(md.get("policy_anchor_id", "") or "").strip()
+            policy_codebook_id = str(md.get("policy_codebook_id", "") or "").strip()
+            assert policy_anchor_id
+            assert policy_codebook_id
+            assert bool(md.get("policy_anchor_in_gold_core", False))
+            assert bool(md.get("policy_codebook_in_gold_core", False))
+            assert policy_anchor_id in set(str(cid) for cid in (step.pivot_required_ids or []))
+            assert policy_codebook_id in set(str(cid) for cid in (step.pivot_required_ids or []))
+
+            anchor_clause = thread.clauses.get(policy_anchor_id)
+            assert anchor_clause is not None
+            assert str(anchor_clause.node_type or "") in {"EVIDENCE", "ASSUMPTION"}
+            anchor_meta = dict(anchor_clause.metadata or {})
+            assert bool(anchor_meta.get("policy_anchor", False))
+            assert not bool(anchor_meta.get("trap", False))
+
+            codebook_clause = thread.clauses.get(policy_codebook_id)
+            assert codebook_clause is not None
+            assert str(codebook_clause.node_type or "") in {"EVIDENCE", "ASSUMPTION"}
+            codebook_meta = dict(codebook_clause.metadata or {})
+            assert bool(codebook_meta.get("policy_codebook", False))
+            assert not bool(codebook_meta.get("trap", False))
+            codebook_text = str(codebook_clause.text or "")
+            assert "lane-alpha => ALLOW" in codebook_text
+            assert "lane-beta => DENY" in codebook_text
+
+            prior_decisions = [
+                clause
+                for clause in thread.clauses.values()
+                if int(clause.step_idx) < int(step.step_idx)
+                and str(clause.node_type or "") == "DECISION"
+            ]
+            assert any(
+                {
+                    policy_anchor_id,
+                    policy_codebook_id,
+                }.issubset(set(str(dep) for dep in (clause.depends_on or [])))
+                for clause in prior_decisions
+            )
+    assert saw_pivot

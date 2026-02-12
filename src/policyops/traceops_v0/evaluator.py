@@ -25,6 +25,12 @@ def _unique_strs(values: Sequence[Any]) -> List[str]:
     return out
 
 
+def _arg_get(args: Any, name: str, default: Any = None) -> Any:
+    if isinstance(args, dict):
+        return args.get(name, default)
+    return getattr(args, name, default)
+
+
 def _tokenize(text: str) -> Set[str]:
     toks = []
     token = []
@@ -346,6 +352,22 @@ def _is_update_invalidation_clause(clause: TraceWorldClause | None) -> bool:
     return False
 
 
+def _traceops_clause_state_key(clause: TraceWorldClause | None) -> str:
+    if clause is None:
+        return ""
+    return str(getattr(clause, "state_key", "") or "").strip().lower()
+
+
+def _is_trap_update_clause(clause: TraceWorldClause | None) -> bool:
+    if clause is None or _goc_clause_type(clause) != "UPDATE":
+        return False
+    meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+    if bool(meta.get("trap", False)):
+        return True
+    trap_kind = str(meta.get("trap_kind", "") or "").strip().lower()
+    return bool(trap_kind)
+
+
 def _goc_overlap_count(message_tokens: Set[str], clause: TraceWorldClause | None) -> int:
     if clause is None:
         return 0
@@ -365,6 +387,26 @@ def _goc_smart_pack_context_ids(
     ordered_history_ids = _unique_strs(ordered_history)
     ordered_history_rank = {cid: idx for idx, cid in enumerate(ordered_history_ids)}
     message_tokens = _tokenize(step.message)
+    cur_step = int(getattr(step, "step_idx", 0) or 0)
+    smart_warning = ""
+    delay_source = "default"
+    raw_delay = _arg_get(args, "traceops_delay_to_relevance", None)
+    if raw_delay not in (None, ""):
+        delay_source = "args"
+    if raw_delay is None:
+        raw_delay = 0
+    delay = max(0, int(raw_delay or 0))
+    if delay <= 0:
+        step_meta = step.metadata if isinstance(step.metadata, dict) else {}
+        fallback_delay = step_meta.get("traceops_delay_to_relevance", None)
+        if fallback_delay in (None, ""):
+            fallback_delay = step_meta.get("delay_to_relevance", 0)
+        fallback_delay_int = max(0, int(fallback_delay or 0))
+        if fallback_delay_int > 0:
+            delay = fallback_delay_int
+            delay_source = "metadata"
+    if delay <= 0 and delay_source == "default":
+        smart_warning = "delay_default_zero"
 
     initial_ids = [
         cid
@@ -374,6 +416,22 @@ def _goc_smart_pack_context_ids(
     keep_set: Set[str] = set(initial_ids)
     dropped_reason_by_id: Dict[str, str] = {}
     injected_ids: List[str] = []
+    update_keys_required: Set[str] = set()
+    update_keys_injected: Set[str] = set()
+    protected_update_ids: Set[str] = set()
+
+    def _is_policy_core_clause(clause: TraceWorldClause | None) -> bool:
+        if clause is None:
+            return False
+        meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+        return bool(meta.get("policy_anchor", False) or meta.get("policy_codebook", False))
+
+    def _current_policy_protected_ids() -> Set[str]:
+        return {
+            cid
+            for cid in keep_set
+            if _is_policy_core_clause(clauses.get(cid))
+        }
 
     def _drop(cid: str, reason: str) -> None:
         if cid not in keep_set:
@@ -405,9 +463,35 @@ def _goc_smart_pack_context_ids(
         ranked.sort(reverse=True)
         return [cid for _, _, _, _, cid in ranked]
 
+    def _clause_age(cid: str) -> int:
+        clause = clauses.get(cid)
+        if clause is None:
+            return 0
+        return int(cur_step - int(clause.step_idx))
+
+    def _update_is_stable(cid: str) -> bool:
+        return bool(_clause_age(cid) >= delay)
+
+    def _update_sort_key(cid: str) -> Tuple[int, int, int, str]:
+        clause = clauses.get(cid)
+        if clause is None:
+            return (-1, -10**9, -10**9, str(cid))
+        return (
+            int(clause.step_idx),
+            int(ordered_history_rank.get(cid, -10**9)),
+            _goc_overlap_count(message_tokens, clause),
+            str(cid),
+        )
+
+    def _latest_id(ids: Sequence[str]) -> str | None:
+        ranked = sorted(_unique_strs(ids), key=_update_sort_key)
+        if not ranked:
+            return None
+        return str(ranked[-1])
+
     def _apply_type_quotas(*, protect_ids: Set[str]) -> None:
         def _cap_value(name: str, default: int) -> int:
-            raw = getattr(args, name, default)
+            raw = _arg_get(args, name, default)
             if raw is None:
                 return int(default)
             return int(raw)
@@ -428,7 +512,31 @@ def _goc_smart_pack_context_ids(
             if not type_ids:
                 continue
             protected = {cid for cid in type_ids if cid in protect_ids}
-            ranked = _rank_ids(type_ids)
+            if ctype == "UPDATE":
+                ranked_update: List[Tuple[int, int, int, int, int, str]] = []
+                for cid in _unique_strs(type_ids):
+                    clause = clauses.get(cid)
+                    if clause is None:
+                        continue
+                    stable = 1 if _update_is_stable(cid) else 0
+                    invalidation = 1 if _is_update_invalidation_clause(clause) else 0
+                    trap = 1 if _is_trap_update_clause(clause) else 0
+                    if stable:
+                        pri = 3
+                    elif invalidation:
+                        pri = 2
+                    elif not trap:
+                        pri = 1
+                    else:
+                        pri = 0
+                    overlap = _goc_overlap_count(message_tokens, clause)
+                    recency = int(clause.step_idx)
+                    history_idx = int(ordered_history_rank.get(cid, -1))
+                    ranked_update.append((pri, stable, invalidation, overlap, recency, str(cid)))
+                ranked_update.sort(reverse=True)
+                ranked = [cid for _, _, _, _, _, cid in ranked_update]
+            else:
+                ranked = _rank_ids(type_ids)
             keep_type: Set[str] = set(protected)
             remaining = max(0, int(cap) - len(keep_type))
             for cid in ranked:
@@ -464,7 +572,7 @@ def _goc_smart_pack_context_ids(
         if cid not in referenced_options:
             _drop(cid, "drop_option_unreferenced")
 
-    # Rule 2) UPDATE dedup by state_key: latest + invalidation updates.
+    # Rule 2) UPDATE dedup by state_key (delay-aware + trap-aware).
     updates_by_key: Dict[str, List[str]] = {}
     for cid in ordered_history_ids:
         if cid not in keep_set:
@@ -472,7 +580,7 @@ def _goc_smart_pack_context_ids(
         clause = clauses.get(cid)
         if _goc_clause_type(clause) != "UPDATE":
             continue
-        key = str(getattr(clause, "state_key", "") or "").strip().lower()
+        key = _traceops_clause_state_key(clause)
         if not key:
             continue
         updates_by_key.setdefault(key, []).append(cid)
@@ -480,15 +588,39 @@ def _goc_smart_pack_context_ids(
         ranked_group = _ordered(group_ids)
         if not ranked_group:
             continue
-        latest_id = ranked_group[-1]
-        keep_updates = {latest_id}
-        for cid in ranked_group:
-            if _is_update_invalidation_clause(clauses.get(cid)):
+        invalidation_updates = [
+            cid for cid in ranked_group if _is_update_invalidation_clause(clauses.get(cid))
+        ]
+        trap_updates = [
+            cid
+            for cid in ranked_group
+            if _is_trap_update_clause(clauses.get(cid))
+            and cid not in set(invalidation_updates)
+        ]
+        normal_updates = [
+            cid
+            for cid in ranked_group
+            if cid not in set(invalidation_updates) and cid not in set(trap_updates)
+        ]
+        stable_updates = [cid for cid in normal_updates if _update_is_stable(cid)]
+        recent_updates = [cid for cid in normal_updates if not _update_is_stable(cid)]
+
+        keep_updates: Set[str] = set(invalidation_updates)
+        stable_latest = _latest_id(stable_updates)
+        recent_latest = _latest_id(recent_updates)
+        if stable_latest:
+            keep_updates.add(stable_latest)
+        if recent_latest:
+            keep_updates.add(recent_latest)
+        if not stable_latest and normal_updates:
+            for cid in sorted(normal_updates, key=_update_sort_key)[-2:]:
                 keep_updates.add(cid)
+
+        protected_update_ids.update(keep_updates)
         for cid in ranked_group:
             if cid in keep_updates:
                 continue
-            _drop(cid, "dedup_update_keep_latest")
+            _drop(cid, "dedup_update_drop_non_selected")
 
     # Rule 3) ASSUMPTION dedup.
     assumptions_by_group: Dict[str, List[str]] = {}
@@ -534,10 +666,6 @@ def _goc_smart_pack_context_ids(
         if cid not in referenced_options:
             _drop(cid, "drop_option_unreferenced")
 
-    # Rule 4) Type quotas.
-    _apply_type_quotas(protect_ids=set(referenced_options))
-
-    # Rule 5 + SmartUnfold: fill missing critical types.
     candidate_pool = [
         cid
         for cid in _unique_strs(candidates)
@@ -545,6 +673,83 @@ def _goc_smart_pack_context_ids(
         and cid not in avoid_set
         and int(clauses[cid].step_idx) < int(step.step_idx)
     ]
+    candidates_by_key: Dict[str, List[str]] = {}
+    for cid in candidate_pool:
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) != "UPDATE":
+            continue
+        key = _traceops_clause_state_key(clause)
+        if not key:
+            continue
+        candidates_by_key.setdefault(key, []).append(cid)
+
+    # SmartUnfold v2) key-coverage injection for UPDATE history.
+    for cid in list(keep_set):
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) == "UPDATE":
+            key = _traceops_clause_state_key(clause)
+            if key:
+                update_keys_required.add(key)
+        if _goc_clause_type(clause) == "DECISION":
+            meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+            for meta_key in ["binding_key", "ordinal_key"]:
+                raw_key = str(meta.get(meta_key, "") or "").strip().lower()
+                if raw_key:
+                    update_keys_required.add(raw_key)
+
+    for key in sorted(update_keys_required):
+        kept_for_key = [
+            cid
+            for cid in keep_set
+            if _goc_clause_type(clauses.get(cid)) == "UPDATE"
+            and _traceops_clause_state_key(clauses.get(cid)) == key
+        ]
+        nontrap_kept = [cid for cid in kept_for_key if not _is_trap_update_clause(clauses.get(cid))]
+        has_stable_nontrap = any(_update_is_stable(cid) for cid in nontrap_kept)
+        if has_stable_nontrap:
+            continue
+
+        key_candidates = [
+            cid
+            for cid in candidates_by_key.get(key, [])
+            if not _is_trap_update_clause(clauses.get(cid))
+        ]
+        if not key_candidates:
+            continue
+
+        stable_candidates = [cid for cid in key_candidates if _update_is_stable(cid)]
+        chosen: str | None = _latest_id(stable_candidates)
+        if chosen is None:
+            newest_kept_idx = max(
+                [int(clauses[cid].step_idx) for cid in kept_for_key if cid in clauses] or [-10**9]
+            )
+            older_candidates = [
+                cid
+                for cid in key_candidates
+                if cid in clauses and int(clauses[cid].step_idx) < int(newest_kept_idx)
+            ]
+            chosen = _latest_id(older_candidates) or _latest_id(key_candidates)
+
+        if not chosen:
+            continue
+        if chosen not in keep_set:
+            keep_set.add(chosen)
+            injected_ids.append(chosen)
+            dropped_reason_by_id.setdefault(
+                str(chosen),
+                "unfold_inject_update_history_missing_stable",
+            )
+        protected_update_ids.add(chosen)
+        update_keys_injected.add(key)
+
+    # Rule 4) Type quotas.
+    _apply_type_quotas(
+        protect_ids=set(referenced_options)
+        | set(protected_update_ids)
+        | _current_policy_protected_ids()
+    )
+
+    # Rule 5 + SmartUnfold: fill missing critical types.
     def _pick_missing(
         *,
         pred,
@@ -577,8 +782,12 @@ def _goc_smart_pack_context_ids(
         reason="unfold_inject_decision_missing",
     )
     _pick_missing(
-        pred=lambda c: _goc_clause_type(c) == "UPDATE",
+        pred=lambda c: _goc_clause_type(c) == "UPDATE" and not _is_trap_update_clause(c),
         reason="unfold_inject_update_missing",
+    )
+    _pick_missing(
+        pred=lambda c: _goc_clause_type(c) == "UPDATE",
+        reason="unfold_inject_update_missing_fallback",
     )
     if applicable_exception_exists:
         _pick_missing(
@@ -592,7 +801,9 @@ def _goc_smart_pack_context_ids(
         )
 
     protected_unfold_ids = set(referenced_options)
+    protected_unfold_ids.update(protected_update_ids)
     protected_unfold_ids.update(injected_ids)
+    protected_unfold_ids.update(_current_policy_protected_ids())
     _apply_type_quotas(protect_ids=protected_unfold_ids)
 
     final_ids = [cid for cid in ordered_history_ids if cid in keep_set]
@@ -610,6 +821,11 @@ def _goc_smart_pack_context_ids(
         if cid in dropped_reason_by_id and cid not in set(final_ids)
     ]
     dropped_reasons_ordered = [str(dropped_reason_by_id[cid]) for cid in dropped_ids_ordered]
+    final_update_ids = [
+        cid for cid in final_ids if _goc_clause_type(clauses.get(cid)) == "UPDATE"
+    ]
+    stable_update_count = int(sum(1 for cid in final_update_ids if _update_is_stable(cid)))
+    recent_update_count = int(max(0, len(final_update_ids) - stable_update_count))
 
     debug = {
         "goc_smart_enable": True,
@@ -618,7 +834,26 @@ def _goc_smart_pack_context_ids(
         "goc_smart_injected_ids": list(_unique_strs(injected_ids)),
         "goc_smart_type_counts_before": _goc_type_counts(initial_ids, clauses),
         "goc_smart_type_counts_after": _goc_type_counts(final_ids, clauses),
+        "goc_update_delay": int(delay),
+        "goc_update_counts_by_age": {
+            "stable_update_count": int(stable_update_count),
+            "recent_update_count": int(recent_update_count),
+        },
+        "goc_smart_protected_ids": list(
+            _unique_strs(
+                [
+                    cid
+                    for cid in ordered_history_ids
+                    if cid in keep_set and _is_policy_core_clause(clauses.get(cid))
+                ]
+            )
+        ),
+        "goc_update_keys_required": list(sorted(update_keys_required)),
+        "goc_update_keys_injected": list(sorted(update_keys_injected)),
+        "goc_update_delay_source": str(delay_source),
     }
+    if smart_warning:
+        debug["goc_smart_warning"] = str(smart_warning)
     return final_ids, debug
 
 
@@ -650,7 +885,7 @@ def _choose_traceops_context(
             score = len(q_tokens & _tokenize(clause.text))
             scored.append((score, -idx, cid))
         scored.sort(reverse=True)
-        k = max(4, int(getattr(args, "traceops_similarity_topk", 8) or 8))
+        k = max(4, int(_arg_get(args, "traceops_similarity_topk", 8) or 8))
         context_ids = [cid for _, _, cid in scored[:k]]
     elif method in {"agent_fold", "lossy_summary"}:
         # Intentionally lossy: keep only recent decision/update style notes.
@@ -666,17 +901,17 @@ def _choose_traceops_context(
                 break
         context_ids = list(reversed(keep))
     elif method in {"goc", "goc_oracle", "goc_force_required"}:
-        use_avoids = bool(getattr(args, "goc_enable_avoids", True))
+        use_avoids = bool(_arg_get(args, "goc_enable_avoids", True))
         candidates = [cid for cid in ordered_history if (cid not in avoid_set or not use_avoids)]
         if not candidates:
             candidates = list(ordered_history)
         context_ordered_history = list(ordered_history)
         should_force_include_required = bool(
             method in {"goc_oracle", "goc_force_required"}
-            or bool(getattr(args, "traceops_force_include_required", False))
+            or bool(_arg_get(args, "traceops_force_include_required", False))
         )
         universe_ids: List[str] = []
-        universe_cap = max(1, int(getattr(args, "traceops_universe_debug_cap", 200) or 200))
+        universe_cap = max(1, int(_arg_get(args, "traceops_universe_debug_cap", 200) or 200))
 
         def _applicable_rate(ids: Sequence[str]) -> float:
             id_list = list(_unique_strs(ids))
@@ -741,8 +976,8 @@ def _choose_traceops_context(
         anchor_ids = _unique_strs(anchor_ids)
 
         seed_ids: List[str] = []
-        seed_topk = max(1, int(getattr(args, "goc_applicability_seed_topk", 8) or 8))
-        if bool(getattr(args, "goc_applicability_seed_enable", False)):
+        seed_topk = max(1, int(_arg_get(args, "goc_applicability_seed_topk", 8) or 8))
+        if bool(_arg_get(args, "goc_applicability_seed_enable", False)):
             scored: List[tuple[float, int, str]] = []
             for idx, cid in enumerate(candidates):
                 clause = clauses.get(cid)
@@ -767,10 +1002,10 @@ def _choose_traceops_context(
 
         closure_added: List[str] = []
         selected_before_closure = _unique_strs(anchor_ids + seed_ids)
-        if bool(getattr(args, "goc_dependency_closure_enable", False)):
-            hops = max(0, int(getattr(args, "goc_dependency_closure_hops", 1) or 1))
-            topk = max(0, int(getattr(args, "goc_dependency_closure_topk", 12) or 12))
-            universe_mode = str(getattr(args, "goc_dependency_closure_universe", "candidates") or "candidates")
+        if bool(_arg_get(args, "goc_dependency_closure_enable", False)):
+            hops = max(0, int(_arg_get(args, "goc_dependency_closure_hops", 1) or 1))
+            topk = max(0, int(_arg_get(args, "goc_dependency_closure_topk", 12) or 12))
+            universe_mode = str(_arg_get(args, "goc_dependency_closure_universe", "candidates") or "candidates")
             if universe_mode == "world":
                 raw_universe_ids = list(thread.clauses.keys())
             elif universe_mode == "memory_opened":
@@ -800,11 +1035,11 @@ def _choose_traceops_context(
         context_ids = _unique_strs(anchor_ids + seed_ids + closure_added)
 
         depwalk_added: List[str] = []
-        depwalk_enable = bool(getattr(args, "goc_depwalk_enable", False))
-        depwalk_hops = max(0, int(getattr(args, "goc_depwalk_hops", 2) or 2))
+        depwalk_enable = bool(_arg_get(args, "goc_depwalk_enable", False))
+        depwalk_hops = max(0, int(_arg_get(args, "goc_depwalk_hops", 2) or 2))
         depwalk_topk_per_hop = max(
             0,
-            int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
+            int(_arg_get(args, "goc_depwalk_topk_per_hop", 6) or 6),
         )
         if depwalk_enable and depwalk_hops > 0 and depwalk_topk_per_hop > 0:
             depwalk_history = [
@@ -953,7 +1188,7 @@ def _choose_traceops_context(
 
         update_key_cap = max(
             1,
-            int(getattr(args, "goc_exception_rescue_recent_update_keys", 4) or 4),
+            int(_arg_get(args, "goc_exception_rescue_recent_update_keys", 4) or 4),
         )
         update_key_trace: List[str] = []
         for cid in context_ordered_history:
@@ -990,7 +1225,7 @@ def _choose_traceops_context(
             rescue_ran = True
             rescue_reason_short = "weak_depwalk"
 
-        raw_exception_rescue_topk = getattr(args, "goc_exception_rescue_topk", None)
+        raw_exception_rescue_topk = _arg_get(args, "goc_exception_rescue_topk", None)
         exception_rescue_topk = (
             2 if raw_exception_rescue_topk is None else max(0, int(raw_exception_rescue_topk))
         )
@@ -1117,7 +1352,7 @@ def _choose_traceops_context(
             exception_rescue_reasons = list(selected_exception_reasons)
             context_ids = _unique_strs(context_ids + exception_rescue_ids)
 
-        raw_update_history_rescue_topk = getattr(args, "goc_update_history_rescue_topk", None)
+        raw_update_history_rescue_topk = _arg_get(args, "goc_update_history_rescue_topk", None)
         update_history_rescue_topk = (
             4 if raw_update_history_rescue_topk is None else max(0, int(raw_update_history_rescue_topk))
         )
@@ -1152,7 +1387,7 @@ def _choose_traceops_context(
                     break
             context_ids = _unique_strs(context_ids + update_history_rescue_ids)
 
-        base_max = int(getattr(args, "goc_unfold_max_nodes", 0) or 0)
+        base_max = int(_arg_get(args, "goc_unfold_max_nodes", 0) or 0)
         if base_max <= 0:
             base_max = 999
 
@@ -1173,14 +1408,21 @@ def _choose_traceops_context(
                     force_but_inapplicable.append(cid)
             context_ids = _unique_strs(context_ids + force_ids)
 
-        smart_enable = bool(getattr(args, "goc_smart_context_enable", False))
+        smart_enable = bool(_arg_get(args, "goc_smart_context_enable", False))
         smart_debug: Dict[str, Any] = {
             "goc_smart_enable": bool(smart_enable),
             "goc_smart_dropped_ids": [],
             "goc_smart_dropped_reasons": [],
             "goc_smart_injected_ids": [],
+            "goc_smart_protected_ids": [],
             "goc_smart_type_counts_before": {},
             "goc_smart_type_counts_after": {},
+            "goc_smart_warning": "",
+            "goc_update_delay": 0,
+            "goc_update_delay_source": "",
+            "goc_update_counts_by_age": {},
+            "goc_update_keys_required": [],
+            "goc_update_keys_injected": [],
         }
         if smart_enable:
             context_ids, smart_debug = _goc_smart_pack_context_ids(
@@ -1219,10 +1461,10 @@ def _choose_traceops_context(
             "goc_dependency_closure_added_applicable_rate": _applicable_rate(closure_added),
             "goc_dependency_closure_universe_effective": (
                 list(universe_ids[:universe_cap])
-                if bool(getattr(args, "goc_dependency_closure_enable", False))
+                if bool(_arg_get(args, "goc_dependency_closure_enable", False))
                 else []
             ),
-            "goc_dependency_closure_universe_effective_size": int(len(universe_ids)) if bool(getattr(args, "goc_dependency_closure_enable", False)) else 0,
+            "goc_dependency_closure_universe_effective_size": int(len(universe_ids)) if bool(_arg_get(args, "goc_dependency_closure_enable", False)) else 0,
             "goc_avoid_target_clause_ids": list(_unique_strs(invalidated_ids)),
             "goc_required_force_included_ids": list(force_ids),
             "goc_required_force_included_but_avoided_ids": list(force_but_avoided),
@@ -1236,12 +1478,23 @@ def _choose_traceops_context(
             "goc_smart_dropped_ids": list(smart_debug.get("goc_smart_dropped_ids") or []),
             "goc_smart_dropped_reasons": list(smart_debug.get("goc_smart_dropped_reasons") or []),
             "goc_smart_injected_ids": list(smart_debug.get("goc_smart_injected_ids") or []),
+            "goc_smart_protected_ids": list(
+                smart_debug.get("goc_smart_protected_ids") or []
+            ),
             "goc_smart_type_counts_before": dict(
                 smart_debug.get("goc_smart_type_counts_before") or {}
             ),
             "goc_smart_type_counts_after": dict(
                 smart_debug.get("goc_smart_type_counts_after") or {}
             ),
+            "goc_smart_warning": str(smart_debug.get("goc_smart_warning", "") or ""),
+            "goc_update_delay": int(smart_debug.get("goc_update_delay", 0) or 0),
+            "goc_update_delay_source": str(
+                smart_debug.get("goc_update_delay_source", "") or ""
+            ),
+            "goc_update_counts_by_age": dict(smart_debug.get("goc_update_counts_by_age") or {}),
+            "goc_update_keys_required": list(smart_debug.get("goc_update_keys_required") or []),
+            "goc_update_keys_injected": list(smart_debug.get("goc_update_keys_injected") or []),
         }
     else:
         context_ids = list(ordered_history)
@@ -1635,6 +1888,20 @@ def evaluate_traceops_method(
             step_meta = dict(step.metadata or {})
             hidden_core_ids = _unique_strs(step_meta.get("hidden_core_ids") or [])
             hidden_core_parent_ids = _unique_strs(step_meta.get("hidden_core_parent_ids") or [])
+            policy_anchor_id = str(step_meta.get("policy_anchor_id", "") or "").strip()
+            policy_anchor_in_gold_core = bool(
+                step_meta.get("policy_anchor_in_gold_core", False)
+            )
+            policy_anchor_in_context = bool(
+                policy_anchor_id and str(policy_anchor_id) in {str(cid) for cid in list(context_ids)}
+            )
+            policy_codebook_id = str(step_meta.get("policy_codebook_id", "") or "").strip()
+            policy_codebook_in_gold_core = bool(
+                step_meta.get("policy_codebook_in_gold_core", False)
+            )
+            policy_codebook_in_context = bool(
+                policy_codebook_id and str(policy_codebook_id) in {str(cid) for cid in list(context_ids)}
+            )
             trap_distractor_ids = _unique_strs(step_meta.get("trap_distractor_ids") or [])
             trap_distractor_set = {str(cid) for cid in trap_distractor_ids if str(cid).strip()}
             trap_injected_ids = [
@@ -1811,11 +2078,28 @@ def evaluate_traceops_method(
                     debug.get("goc_smart_dropped_reasons") or []
                 ),
                 "goc_smart_injected_ids": list(debug.get("goc_smart_injected_ids") or []),
+                "goc_smart_protected_ids": list(
+                    debug.get("goc_smart_protected_ids") or []
+                ),
                 "goc_smart_type_counts_before": dict(
                     debug.get("goc_smart_type_counts_before") or {}
                 ),
                 "goc_smart_type_counts_after": dict(
                     debug.get("goc_smart_type_counts_after") or {}
+                ),
+                "goc_smart_warning": str(debug.get("goc_smart_warning", "") or ""),
+                "goc_update_delay": int(debug.get("goc_update_delay", 0) or 0),
+                "goc_update_delay_source": str(
+                    debug.get("goc_update_delay_source", "") or ""
+                ),
+                "goc_update_counts_by_age": dict(
+                    debug.get("goc_update_counts_by_age") or {}
+                ),
+                "goc_update_keys_required": list(
+                    debug.get("goc_update_keys_required") or []
+                ),
+                "goc_update_keys_injected": list(
+                    debug.get("goc_update_keys_injected") or []
                 ),
                 "e3_context_clause_ids": list(context_ids),
                 "goc_exception_injected_ids": list(exception_injected_ids),
@@ -1925,6 +2209,12 @@ def evaluate_traceops_method(
                 ),
                 "hidden_core_ids": list(hidden_core_ids),
                 "hidden_core_parent_ids": list(hidden_core_parent_ids),
+                "policy_anchor_id": str(policy_anchor_id),
+                "policy_anchor_in_gold_core": bool(policy_anchor_in_gold_core),
+                "policy_anchor_in_context": bool(policy_anchor_in_context),
+                "policy_codebook_id": str(policy_codebook_id),
+                "policy_codebook_in_gold_core": bool(policy_codebook_in_gold_core),
+                "policy_codebook_in_context": bool(policy_codebook_in_context),
                 "decision_checkpoint_in_gold_core_count": int(
                     step_meta.get("decision_checkpoint_in_gold_core_count", 0) or 0
                 ),
@@ -2001,6 +2291,21 @@ def evaluate_traceops_method(
         int(r.get("goc_exception_injected_count", 0) or 0) for r in pivot_records
     ]
     exception_injected_vals = [1.0 if cnt > 0 else 0.0 for cnt in exception_injected_counts]
+    stable_update_count_vals: List[float] = []
+    recent_update_count_vals: List[float] = []
+    stable_update_present_vals: List[float] = []
+    for rec in pivot_records:
+        counts_obj = rec.get("goc_update_counts_by_age")
+        if not isinstance(counts_obj, dict):
+            continue
+        stable_val = counts_obj.get("stable_update_count")
+        recent_val = counts_obj.get("recent_update_count")
+        if isinstance(stable_val, (int, float)) and math.isfinite(float(stable_val)):
+            stable_f = float(stable_val)
+            stable_update_count_vals.append(stable_f)
+            stable_update_present_vals.append(1.0 if stable_f > 0.0 else 0.0)
+        if isinstance(recent_val, (int, float)) and math.isfinite(float(recent_val)):
+            recent_update_count_vals.append(float(recent_val))
     indirection_vals = [
         float(r.get("indirection_overlap_gold"))
         for r in pivot_records
@@ -2065,6 +2370,20 @@ def evaluate_traceops_method(
     hidden_core_present_vals = [
         1.0 if len(list(r.get("hidden_core_ids") or [])) > 0 else 0.0 for r in pivot_records
     ]
+    policy_anchor_present_vals = [
+        1.0 if bool(r.get("policy_anchor_in_gold_core", False)) else 0.0 for r in pivot_records
+    ]
+    policy_anchor_in_context_vals = [
+        1.0 if bool(r.get("policy_anchor_in_context", False)) else 0.0 for r in pivot_records
+    ]
+    policy_codebook_present_vals = [
+        1.0 if bool(r.get("policy_codebook_in_gold_core", False)) else 0.0
+        for r in pivot_records
+    ]
+    policy_codebook_in_context_vals = [
+        1.0 if bool(r.get("policy_codebook_in_context", False)) else 0.0
+        for r in pivot_records
+    ]
     gold_core_has_checkpoint_vals = [
         1.0 if bool(r.get("gold_core_has_decision_checkpoint", False)) else 0.0
         for r in pivot_records
@@ -2077,6 +2396,8 @@ def evaluate_traceops_method(
     ]
     hidden_core_rescued_by_depwalk_rate = float("nan")
     hidden_core_missing_without_depwalk_rate = float("nan")
+    policy_anchor_retrieved_by_goc_rate = float("nan")
+    policy_codebook_retrieved_by_goc_rate = float("nan")
     if method_name == "goc" and depwalk_enabled:
         rescued_vals = []
         for rec in hidden_pivot_records:
@@ -2091,6 +2412,9 @@ def evaluate_traceops_method(
             context_set = {str(cid) for cid in (rec.get("e3_context_clause_ids") or []) if str(cid).strip()}
             missing_vals.append(1.0 if bool(hidden_set - context_set) else 0.0)
         hidden_core_missing_without_depwalk_rate = _mean(missing_vals)
+    if method_name == "goc":
+        policy_anchor_retrieved_by_goc_rate = _mean(policy_anchor_in_context_vals)
+        policy_codebook_retrieved_by_goc_rate = _mean(policy_codebook_in_context_vals)
 
     tokens_pivot_mean_est = _mean(pivot_tokens_est)
     tokens_total_mean_est = _mean(total_tokens_by_thread_est)
@@ -2117,6 +2441,9 @@ def evaluate_traceops_method(
         "avoided_injected_rate": _mean(avoided_injected_vals),
         "exception_injected_rate": _mean(exception_injected_vals),
         "mean_exception_injected_count": _mean([float(v) for v in exception_injected_counts]),
+        "mean_goc_stable_update_count": _mean(stable_update_count_vals),
+        "mean_goc_recent_update_count": _mean(recent_update_count_vals),
+        "stable_update_present_rate": _mean(stable_update_present_vals),
         "revive_success_rate": _mean(revive_vals),
         "mean_indirection_overlap_gold": _mean(indirection_vals),
         "mean_trap_gap": _mean(trap_gap_vals),
@@ -2145,6 +2472,12 @@ def evaluate_traceops_method(
         "core_necessity_failed_rate": _mean(core_need_failed_vals),
         "trap_decision_flip_rate": _mean(trap_decision_flip_vals),
         "hidden_core_present_rate": _mean(hidden_core_present_vals),
+        "policy_anchor_present_rate": _mean(policy_anchor_present_vals),
+        "policy_anchor_in_context_rate": _mean(policy_anchor_in_context_vals),
+        "policy_anchor_retrieved_by_goc_rate": policy_anchor_retrieved_by_goc_rate,
+        "policy_codebook_present_rate": _mean(policy_codebook_present_vals),
+        "policy_codebook_in_context_rate": _mean(policy_codebook_in_context_vals),
+        "policy_codebook_retrieved_by_goc_rate": policy_codebook_retrieved_by_goc_rate,
         "gold_core_has_decision_checkpoint_rate": _mean(gold_core_has_checkpoint_vals),
         "hidden_core_rescued_by_depwalk_rate": hidden_core_rescued_by_depwalk_rate,
         "hidden_core_missing_without_depwalk_rate": hidden_core_missing_without_depwalk_rate,

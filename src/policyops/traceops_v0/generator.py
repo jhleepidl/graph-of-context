@@ -360,6 +360,63 @@ def generate_traceops_threads(
         handle_token = _rand_handle(trng)
         ordinal_key = trng.choice(["region", "deadline", "budget", "residency", "retention_tier"])
         handle_binding_ids: List[str] = []
+        policy_anchor_id: str | None = None
+        policy_codebook_ids: Dict[str, str] = {}
+
+        def _lane_map_for_key(key: str) -> Tuple[List[str], List[str]]:
+            k = str(key or "").strip().lower()
+            predefined: Dict[str, Tuple[List[str], List[str]]] = {
+                "region": (["eu", "apac"], ["us"]),
+                "deadline": (["normal", "flex"], ["tight"]),
+                "budget": (["medium", "high"], ["low"]),
+                "residency": (["eu", "global"], ["us"]),
+                "retention_tier": (["short", "long"], ["standard"]),
+            }
+            if k in predefined:
+                alpha_vals, beta_vals = predefined[k]
+                return list(alpha_vals), list(beta_vals)
+            cur = str(state.get(k, "")).strip()
+            if cur:
+                return [cur], []
+            return [f"{k}_alpha"], [f"{k}_beta"]
+
+        def _ensure_policy_codebook(
+            *,
+            step_idx: int,
+            add_to_step: TraceStep | None = None,
+        ) -> str:
+            key = str(ordinal_key)
+            existing = policy_codebook_ids.get(key)
+            if existing and existing in clauses:
+                return str(existing)
+            lane_alpha_vals, lane_beta_vals = _lane_map_for_key(key)
+            alpha_txt = ", ".join(lane_alpha_vals) if lane_alpha_vals else "alpha-default"
+            beta_txt = ", ".join(lane_beta_vals) if lane_beta_vals else "beta-default"
+            cid = _new_clause(
+                step_idx=int(step_idx),
+                node_type="EVIDENCE",
+                text=(
+                    f"Codebook {handle_token} for key {key}: lane-alpha => ALLOW; lane-beta => DENY. "
+                    f"For {key}: {{{alpha_txt}}} -> lane-alpha; {{{beta_txt}}} -> lane-beta."
+                ),
+                tags=["indirect", "policy_codebook", "hidden_core"],
+                metadata={
+                    "policy_codebook": True,
+                    "hidden_core": True,
+                    "hidden_core_kind": "policy_codebook_low_overlap",
+                    "binding_key": str(key),
+                    "lane_map": {
+                        "lane-alpha": list(lane_alpha_vals),
+                        "lane-beta": list(lane_beta_vals),
+                    },
+                },
+            )
+            policy_codebook_ids[key] = str(cid)
+            if add_to_step is not None:
+                add_to_step.introduced_clause_ids = _unique_strs(
+                    list(add_to_step.introduced_clause_ids) + [cid]
+                )
+            return str(cid)
 
         def _new_clause(
             *,
@@ -431,6 +488,30 @@ def generate_traceops_threads(
                     scenario == "indirect"
                     or (scenario == "mixed" and trng.random() < float(indirection_rate))
                 )
+                if indirect_active_step and policy_anchor_id is None and int(step_idx) <= 1:
+                    policy_anchor_id = _new_clause(
+                        step_idx=step_idx,
+                        node_type="EVIDENCE",
+                        text=(
+                            f"Anchor ledger {handle_token}: lane-alpha qualifies, lane-beta is blocked; "
+                            "resolve outcome through linked chain nodes, not recent wording."
+                        ),
+                        tags=["indirect", "policy_anchor", "hidden_core"],
+                        metadata={
+                            "policy_anchor": True,
+                            "hidden_core": True,
+                            "hidden_core_kind": "policy_anchor_low_overlap",
+                        },
+                    )
+                    introduced.append(policy_anchor_id)
+                if indirect_active_step and int(step_idx) <= 1:
+                    codebook_id = _ensure_policy_codebook(step_idx=step_idx)
+                    codebook_clause = clauses.get(str(codebook_id))
+                    if (
+                        codebook_clause is not None
+                        and int(codebook_clause.step_idx) == int(step_idx)
+                    ):
+                        introduced.append(str(codebook_id))
                 if indirect_active_step and len(handle_binding_ids) < alias_chain_len:
                     bind_id = _new_clause(
                         step_idx=step_idx,
@@ -480,7 +561,24 @@ def generate_traceops_threads(
                 introduced.append(asm_id)
                 assumption_ids.append(asm_id)
                 decision_label = _decision_from_state(state)
-                dep = [cid for cid in [chosen_option, asm_id] if cid]
+                indirect_active_step = (
+                    scenario == "indirect"
+                    or (scenario == "mixed" and trng.random() < float(indirection_rate))
+                )
+                codebook_for_decision = str(policy_codebook_ids.get(str(ordinal_key), "") or "")
+                if indirect_active_step and not codebook_for_decision:
+                    codebook_for_decision = _ensure_policy_codebook(step_idx=step_idx)
+                    codebook_clause = clauses.get(str(codebook_for_decision))
+                    if (
+                        codebook_clause is not None
+                        and int(codebook_clause.step_idx) == int(step_idx)
+                    ):
+                        introduced.append(str(codebook_for_decision))
+                dep = [
+                    cid
+                    for cid in [chosen_option, asm_id, policy_anchor_id, codebook_for_decision]
+                    if cid
+                ]
                 dec_id = _new_clause(
                     step_idx=step_idx,
                     node_type="DECISION",
@@ -492,11 +590,12 @@ def generate_traceops_threads(
                 introduced.append(dec_id)
                 decision_ids.append(dec_id)
 
-                indirect_active_step = (
-                    scenario == "indirect"
-                    or (scenario == "mixed" and trng.random() < float(indirection_rate))
-                )
                 if indirect_active_step and len(handle_binding_ids) < alias_chain_len:
+                    bind_dep = [
+                        cid
+                        for cid in [dec_id, policy_anchor_id, codebook_for_decision]
+                        if cid
+                    ]
                     bind_decision_id = _new_clause(
                         step_idx=step_idx,
                         node_type="DECISION",
@@ -504,7 +603,7 @@ def generate_traceops_threads(
                             f"Handle {handle_token} binding revision {len(handle_binding_ids)+1}: "
                             f"use latest {ordinal_key} update for final decision."
                         ),
-                        depends_on=[dec_id] if dec_id else [],
+                        depends_on=bind_dep,
                         tags=["indirect", "handle_binding", "alias", "revision"],
                         metadata={
                             "decision_label": "handle_binding",
@@ -656,6 +755,10 @@ def generate_traceops_threads(
                 "core_filled_by_fallback": False,
                 "hidden_core_ids": [],
                 "hidden_core_parent_ids": [],
+                "policy_anchor_id": "",
+                "policy_anchor_in_gold_core": False,
+                "policy_codebook_id": "",
+                "policy_codebook_in_gold_core": False,
             }
             if kind == "pivot_check":
                 all_prior_ids = [
@@ -793,6 +896,32 @@ def generate_traceops_threads(
                     style_choice = trng.choice(["ordinal_ref", "alias_handle", "blended"])
 
                 if indirect_pivot_active:
+                    if policy_anchor_id is None and steps:
+                        prev_step = steps[-1]
+                        policy_anchor_id = _new_clause(
+                            step_idx=int(prev_step.step_idx),
+                            node_type="EVIDENCE",
+                            text=(
+                                f"Anchor ledger {handle_token}: lane-alpha qualifies, lane-beta is blocked; "
+                                "resolve outcome through linked chain nodes, not recent wording."
+                            ),
+                            tags=["indirect", "policy_anchor", "hidden_core"],
+                            metadata={
+                                "policy_anchor": True,
+                                "hidden_core": True,
+                                "hidden_core_kind": "policy_anchor_low_overlap",
+                            },
+                        )
+                        prev_step.introduced_clause_ids = _unique_strs(
+                            list(prev_step.introduced_clause_ids) + [policy_anchor_id]
+                        )
+                    codebook_for_ordinal = str(policy_codebook_ids.get(str(ordinal_key), "") or "")
+                    if not codebook_for_ordinal and steps:
+                        prev_step = steps[-1]
+                        codebook_for_ordinal = _ensure_policy_codebook(
+                            step_idx=int(prev_step.step_idx),
+                            add_to_step=prev_step,
+                        )
                     # Ensure a handle binding exists before pivot for alias-style references.
                     if (style_choice in {"alias_handle", "blended"}) and not handle_binding_ids and steps:
                         prev_step = steps[-1]
@@ -966,6 +1095,8 @@ def generate_traceops_threads(
                         + list(assumption_ids[-max(1, alias_chain_len):])
                         + list(handle_binding_ids[-max(1, alias_chain_len):])
                         + ([latest_decision_id] if latest_decision_id else [])
+                        + ([policy_anchor_id] if policy_anchor_id else [])
+                        + ([codebook_for_ordinal] if codebook_for_ordinal else [])
                         + list(hidden_core_ids)
                     )
                     base_candidate_core = _filter_non_checkpoint_ids(base_candidate_core)
@@ -1058,6 +1189,10 @@ def generate_traceops_threads(
                             if not preferred_assumption and assumptions_recent:
                                 preferred_assumption = assumptions_recent[0]
                             mandatory = []
+                            if policy_anchor_id and policy_anchor_id in candidate_core:
+                                mandatory.append(policy_anchor_id)
+                            if codebook_for_ordinal and codebook_for_ordinal in candidate_core:
+                                mandatory.append(codebook_for_ordinal)
                             if updates_recent:
                                 mandatory.append(updates_recent[0])
                             if decisions_recent:
@@ -1180,7 +1315,18 @@ def generate_traceops_threads(
                             base_decision = _oracle_decision_from_evidence(clauses, core_required_ids, state)
                             for removed_id in core_required_ids:
                                 reduced = [cid for cid in core_required_ids if cid != removed_id]
-                                reduced_decision = _oracle_decision_from_evidence(clauses, reduced, state)
+                                removed_clause = clauses.get(str(removed_id))
+                                removed_meta = (
+                                    dict(removed_clause.metadata or {})
+                                    if removed_clause is not None
+                                    else {}
+                                )
+                                if bool(removed_meta.get("policy_anchor", False)):
+                                    reduced_decision = "unknown"
+                                else:
+                                    reduced_decision = _oracle_decision_from_evidence(
+                                        clauses, reduced, state
+                                    )
                                 if reduced_decision == "unknown" or reduced_decision != base_decision:
                                     flip_count += 1
                             all_required = bool(flip_count == len(core_required_ids))
@@ -1215,6 +1361,31 @@ def generate_traceops_threads(
                         )
                     if len(pivot_required_ids) > int(core_size_max):
                         pivot_required_ids = pivot_required_ids[: int(core_size_max)]
+                    if policy_anchor_id and policy_anchor_id in clauses:
+                        if policy_anchor_id not in pivot_required_ids:
+                            if len(pivot_required_ids) >= int(core_size_max):
+                                for idx in range(len(pivot_required_ids) - 1, -1, -1):
+                                    if pivot_required_ids[idx] != policy_anchor_id:
+                                        pivot_required_ids.pop(idx)
+                                        break
+                            pivot_required_ids = _unique_strs(
+                                [policy_anchor_id] + list(pivot_required_ids)
+                            )
+                            if len(pivot_required_ids) > int(core_size_max):
+                                pivot_required_ids = pivot_required_ids[: int(core_size_max)]
+                    if codebook_for_ordinal and codebook_for_ordinal in clauses:
+                        if codebook_for_ordinal not in pivot_required_ids:
+                            if len(pivot_required_ids) >= int(core_size_max):
+                                for idx in range(len(pivot_required_ids) - 1, -1, -1):
+                                    cid = str(pivot_required_ids[idx])
+                                    if cid not in {str(policy_anchor_id or ""), str(codebook_for_ordinal)}:
+                                        pivot_required_ids.pop(idx)
+                                        break
+                            pivot_required_ids = _unique_strs(
+                                [codebook_for_ordinal] + list(pivot_required_ids)
+                            )
+                            if len(pivot_required_ids) > int(core_size_max):
+                                pivot_required_ids = pivot_required_ids[: int(core_size_max)]
                     decision = accepted_decision
                     conditions = list(accepted_conditions)
                     chosen_exception = accepted_exception
@@ -1587,6 +1758,14 @@ def generate_traceops_threads(
                         "hidden_core_parent_ids": list(hidden_core_parent_ids),
                         "hidden_core_kind": str(hidden_core_kind),
                         "hidden_core_link_mode": str(hidden_core_link_mode),
+                        "policy_anchor_id": str(policy_anchor_id or ""),
+                        "policy_anchor_in_gold_core": bool(
+                            policy_anchor_id and str(policy_anchor_id) in set(pivot_required_ids)
+                        ),
+                        "policy_codebook_id": str(codebook_for_ordinal or ""),
+                        "policy_codebook_in_gold_core": bool(
+                            codebook_for_ordinal and str(codebook_for_ordinal) in set(pivot_required_ids)
+                        ),
                         "ordinal_key": str(ordinal_key),
                         "handle_token": str(handle_token),
                     }
@@ -1641,6 +1820,15 @@ def generate_traceops_threads(
                 pivot_meta["decision_checkpoint_in_gold_core_count"] = int(
                     len(checkpoint_in_gold_ids)
                 )
+                current_codebook_id = str(policy_codebook_ids.get(str(ordinal_key), "") or "")
+                pivot_meta["policy_anchor_id"] = str(policy_anchor_id or "")
+                pivot_meta["policy_anchor_in_gold_core"] = bool(
+                    policy_anchor_id and str(policy_anchor_id) in set(pivot_required_ids)
+                )
+                pivot_meta["policy_codebook_id"] = str(current_codebook_id or "")
+                pivot_meta["policy_codebook_in_gold_core"] = bool(
+                    current_codebook_id and str(current_codebook_id) in set(pivot_required_ids)
+                )
                 step_gold = TraceGold(
                     decision=decision,
                     conditions=conditions,
@@ -1678,6 +1866,16 @@ def generate_traceops_threads(
             1
             for s in pivot_steps
             if isinstance(s.metadata, dict) and bool(s.metadata.get("indirect_active", False))
+        )
+        policy_anchor_count = sum(
+            1
+            for clause in clauses.values()
+            if bool((clause.metadata or {}).get("policy_anchor", False))
+        )
+        policy_codebook_count = sum(
+            1
+            for clause in clauses.values()
+            if bool((clause.metadata or {}).get("policy_codebook", False))
         )
         thread = TraceThread(
             thread_id=thread_id,
@@ -1726,6 +1924,10 @@ def generate_traceops_threads(
                 "traceops_hidden_core_kind": str(hidden_core_kind),
                 "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
                 "traceops_trap_require_avoided": bool(trap_require_avoided),
+                "traceops_policy_anchor_enable": True,
+                "policy_anchor_count": int(policy_anchor_count),
+                "traceops_policy_codebook_enable": True,
+                "policy_codebook_count": int(policy_codebook_count),
                 "decision_checkpoint_core_exclusion_enable": True,
                 "decision_checkpoint_core_exclusion_version": "phase18.3_patchL",
             },
@@ -1774,6 +1976,8 @@ def generate_traceops_threads(
         "traceops_hidden_core_kind": str(hidden_core_kind),
         "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
         "traceops_trap_require_avoided": bool(trap_require_avoided),
+        "traceops_policy_anchor_enable": True,
+        "traceops_policy_codebook_enable": True,
         "decision_checkpoint_core_exclusion_enable": True,
         "decision_checkpoint_core_exclusion_version": "phase18.3_patchL",
         "pivots_available_total": int(

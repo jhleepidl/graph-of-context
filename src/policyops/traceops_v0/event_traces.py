@@ -76,6 +76,10 @@ def build_event_trace_line(
         "decision_checkpoint_trap_injected_any",
         "decision_checkpoint_in_gold_core_count",
         "gold_core_has_decision_checkpoint",
+        "policy_anchor_in_gold_core",
+        "policy_anchor_in_context",
+        "policy_codebook_in_gold_core",
+        "policy_codebook_in_context",
         "core_size",
         "core_necessity_flip_count",
         "core_necessity_all_required",
@@ -96,6 +100,8 @@ def build_event_trace_line(
         line[key] = rec.get(key)
     line["hidden_core_ids"] = _cap("hidden_core_ids", rec.get("hidden_core_ids"))
     line["hidden_core_parent_ids"] = _cap("hidden_core_parent_ids", rec.get("hidden_core_parent_ids"))
+    line["policy_anchor_id"] = str(rec.get("policy_anchor_id", "") or "")
+    line["policy_codebook_id"] = str(rec.get("policy_codebook_id", "") or "")
     line["trap_distractor_ids"] = _cap("trap_distractor_ids", rec.get("trap_distractor_ids"))
     line["decision_checkpoint_trap_ids"] = _cap(
         "decision_checkpoint_trap_ids", rec.get("decision_checkpoint_trap_ids")
@@ -213,8 +219,24 @@ def build_event_trace_line(
             "goc_smart_injected_ids",
             rec.get("goc_smart_injected_ids"),
         )
+        goc["goc_smart_protected_ids"] = _cap(
+            "goc_smart_protected_ids",
+            rec.get("goc_smart_protected_ids"),
+        )
         goc["goc_smart_type_counts_before"] = rec.get("goc_smart_type_counts_before")
         goc["goc_smart_type_counts_after"] = rec.get("goc_smart_type_counts_after")
+        goc["goc_smart_warning"] = rec.get("goc_smart_warning")
+        goc["goc_update_delay"] = rec.get("goc_update_delay")
+        goc["goc_update_delay_source"] = rec.get("goc_update_delay_source")
+        goc["goc_update_counts_by_age"] = rec.get("goc_update_counts_by_age")
+        goc["goc_update_keys_required"] = _cap(
+            "goc_update_keys_required",
+            rec.get("goc_update_keys_required"),
+        )
+        goc["goc_update_keys_injected"] = _cap(
+            "goc_update_keys_injected",
+            rec.get("goc_update_keys_injected"),
+        )
 
         goc["goc_exception_injected_ids"] = _cap(
             "goc_exception_injected_ids",
@@ -318,6 +340,12 @@ def build_event_trace_line(
         "trap_decision_label": rec.get("trap_decision_label"),
         "trap_decision_flip": rec.get("trap_decision_flip"),
         "hidden_core_ids": _cap("scenario_hidden_core_ids", rec.get("hidden_core_ids")),
+        "policy_anchor_id": str(rec.get("policy_anchor_id", "") or ""),
+        "policy_anchor_in_gold_core": rec.get("policy_anchor_in_gold_core"),
+        "policy_anchor_in_context": rec.get("policy_anchor_in_context"),
+        "policy_codebook_id": str(rec.get("policy_codebook_id", "") or ""),
+        "policy_codebook_in_gold_core": rec.get("policy_codebook_in_gold_core"),
+        "policy_codebook_in_context": rec.get("policy_codebook_in_context"),
         "trap_distractor_ids": _cap("scenario_trap_distractor_ids", rec.get("trap_distractor_ids")),
     }
     if any(v is not None for k, v in scenario_metrics.items() if k != "trap_distractor_ids"):

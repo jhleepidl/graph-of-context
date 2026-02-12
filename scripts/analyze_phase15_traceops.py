@@ -533,6 +533,15 @@ def main() -> None:
                     "mean_exception_injected_count": _as_float(
                         metrics.get("mean_exception_injected_count")
                     ),
+                    "mean_goc_stable_update_count": _as_float(
+                        metrics.get("mean_goc_stable_update_count")
+                    ),
+                    "mean_goc_recent_update_count": _as_float(
+                        metrics.get("mean_goc_recent_update_count")
+                    ),
+                    "stable_update_present_rate": _as_float(
+                        metrics.get("stable_update_present_rate")
+                    ),
                     "mean_depwalk_added_count": _mean_or_zero(depwalk_added_vals),
                     "mean_exception_rescue_count": _mean_or_zero(exception_rescue_vals),
                     "mean_update_history_rescue_count": _mean_or_zero(update_history_rescue_vals),
@@ -590,6 +599,24 @@ def main() -> None:
                     ),
                     "hidden_core_present_rate": _as_float(
                         metrics.get("hidden_core_present_rate")
+                    ),
+                    "policy_anchor_present_rate": _as_float(
+                        metrics.get("policy_anchor_present_rate")
+                    ),
+                    "policy_anchor_in_context_rate": _as_float(
+                        metrics.get("policy_anchor_in_context_rate")
+                    ),
+                    "policy_anchor_retrieved_by_goc_rate": _as_float(
+                        metrics.get("policy_anchor_retrieved_by_goc_rate")
+                    ),
+                    "policy_codebook_present_rate": _as_float(
+                        metrics.get("policy_codebook_present_rate")
+                    ),
+                    "policy_codebook_in_context_rate": _as_float(
+                        metrics.get("policy_codebook_in_context_rate")
+                    ),
+                    "policy_codebook_retrieved_by_goc_rate": _as_float(
+                        metrics.get("policy_codebook_retrieved_by_goc_rate")
                     ),
                     "hidden_core_rescued_by_depwalk_rate": _as_float(
                         metrics.get("hidden_core_rescued_by_depwalk_rate")
@@ -780,6 +807,9 @@ def main() -> None:
             "avoided_injected_rate",
             "exception_injected_rate",
             "mean_exception_injected_count",
+            "mean_goc_stable_update_count",
+            "mean_goc_recent_update_count",
+            "stable_update_present_rate",
             "mean_depwalk_added_count",
             "mean_exception_rescue_count",
             "mean_update_history_rescue_count",
@@ -803,6 +833,12 @@ def main() -> None:
             "core_necessity_failed_rate",
             "trap_decision_flip_rate",
             "hidden_core_present_rate",
+            "policy_anchor_present_rate",
+            "policy_anchor_in_context_rate",
+            "policy_anchor_retrieved_by_goc_rate",
+            "policy_codebook_present_rate",
+            "policy_codebook_in_context_rate",
+            "policy_codebook_retrieved_by_goc_rate",
             "hidden_core_rescued_by_depwalk_rate",
             "hidden_core_missing_without_depwalk_rate",
             "tokens_savings_vs_full",
@@ -834,6 +870,9 @@ def main() -> None:
             "avoided_injected_rate",
             "exception_injected_rate",
             "mean_exception_injected_count",
+            "mean_goc_stable_update_count",
+            "mean_goc_recent_update_count",
+            "stable_update_present_rate",
             "mean_depwalk_added_count",
             "mean_exception_rescue_count",
             "mean_update_history_rescue_count",
@@ -857,6 +896,12 @@ def main() -> None:
             "core_necessity_failed_rate",
             "trap_decision_flip_rate",
             "hidden_core_present_rate",
+            "policy_anchor_present_rate",
+            "policy_anchor_in_context_rate",
+            "policy_anchor_retrieved_by_goc_rate",
+            "policy_codebook_present_rate",
+            "policy_codebook_in_context_rate",
+            "policy_codebook_retrieved_by_goc_rate",
             "hidden_core_rescued_by_depwalk_rate",
             "hidden_core_missing_without_depwalk_rate",
         ]

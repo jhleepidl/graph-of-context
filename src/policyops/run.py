@@ -7963,6 +7963,11 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             "traceops_indirection_rate": float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
             "traceops_trap_distractor_count": int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
             "traceops_trap_similarity_boost": float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
+            "traceops_delay_to_relevance": int(
+                getattr(args, "traceops_delay_to_relevance", 0)
+                if getattr(args, "traceops_delay_to_relevance", None) is not None
+                else 0
+            ),
             "traceops_core_size_min": int(getattr(args, "traceops_core_size_min", 2) or 2),
             "traceops_core_size_max": int(getattr(args, "traceops_core_size_max", 4) or 4),
             "traceops_alias_chain_len": int(getattr(args, "traceops_alias_chain_len", 2) or 2),
@@ -8172,6 +8177,11 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "traceops_indirection_rate": float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
             "traceops_trap_distractor_count": int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
             "traceops_trap_similarity_boost": float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
+            "traceops_delay_to_relevance": int(
+                getattr(args, "traceops_delay_to_relevance", 0)
+                if getattr(args, "traceops_delay_to_relevance", None) is not None
+                else 0
+            ),
             "traceops_core_size_min": int(getattr(args, "traceops_core_size_min", 2) or 2),
             "traceops_core_size_max": int(getattr(args, "traceops_core_size_max", 4) or 4),
             "traceops_alias_chain_len": int(getattr(args, "traceops_alias_chain_len", 2) or 2),
@@ -8927,6 +8937,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--goc_smart_cap_exception", type=int, default=2)
     ev.add_argument("--goc_smart_cap_evidence", type=int, default=2)
     ev.add_argument("--traceops_indirection_rate", type=float, default=0.4)
+    ev.add_argument("--traceops_delay_to_relevance", type=int, default=0)
     ev.add_argument("--traceops_trap_distractor_count", type=int, default=4)
     ev.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)
     ev.add_argument("--traceops_core_size_min", type=int, default=2)
@@ -9343,6 +9354,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--goc_smart_cap_exception", type=int, default=2)
     cmp.add_argument("--goc_smart_cap_evidence", type=int, default=2)
     cmp.add_argument("--traceops_indirection_rate", type=float, default=0.4)
+    cmp.add_argument("--traceops_delay_to_relevance", type=int, default=0)
     cmp.add_argument("--traceops_trap_distractor_count", type=int, default=4)
     cmp.add_argument("--traceops_trap_similarity_boost", type=float, default=0.7)
     cmp.add_argument("--traceops_core_size_min", type=int, default=2)
