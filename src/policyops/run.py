@@ -8121,6 +8121,9 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
                 "forced_trap_injected_any_rate"
             ),
             "mean_core_size": metrics.get("mean_core_size"),
+            "gold_core_has_decision_checkpoint_rate": metrics.get(
+                "gold_core_has_decision_checkpoint_rate"
+            ),
             "decision_accuracy": metrics.get("decision_accuracy"),
             "judge_accuracy": metrics.get("judge_accuracy"),
         }

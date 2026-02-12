@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from policyops.traceops_v0.generator import _jaccard_text, generate_traceops_threads
+from policyops.traceops_v0.generator import (
+    _jaccard_text,
+    generate_traceops_threads,
+    is_decision_checkpoint_clause,
+)
 
 
 def test_phase18_graph_excludable_traps_are_attached_to_update_avoid_targets() -> None:
@@ -242,3 +246,62 @@ def test_phase18_decision_checkpoint_prefix_is_always_trap_marked() -> None:
             assert str(meta.get("trap_kind", "")) == "decision_checkpoint"
             assert bool(meta.get("trap_decision_checkpoint", False))
     assert saw_checkpoint
+
+
+def test_phase18_gold_core_excludes_decision_checkpoints() -> None:
+    threads, meta = generate_traceops_threads(
+        level=3,
+        scenarios=["indirect"],
+        seed=41,
+        threads=6,
+        indirection_rate=1.0,
+        trap_distractor_count=5,
+        trap_similarity_boost=0.9,
+        trap_decision_flip_enable=True,
+        trap_graph_excludable_kinds="stale,inapplicable,avoided,decision_checkpoint",
+        hidden_core_enable=True,
+    )
+    assert bool(meta.get("decision_checkpoint_core_exclusion_enable", False))
+    assert str(meta.get("decision_checkpoint_core_exclusion_version", "")) == "phase18.3_patchL"
+    saw_pivot = False
+    for thread in threads:
+        for step in thread.steps:
+            if str(step.kind) != "pivot_check":
+                continue
+            saw_pivot = True
+            for cid in list(step.pivot_required_ids or []):
+                clause = thread.clauses.get(str(cid))
+                assert clause is not None
+                assert not is_decision_checkpoint_clause(clause)
+            md = dict(step.metadata or {})
+            assert int(md.get("decision_checkpoint_in_gold_core_count", 0) or 0) == 0
+            assert list(md.get("decision_checkpoint_in_gold_core_ids") or []) == []
+    assert saw_pivot
+
+
+def test_phase18_late_decision_checkpoints_not_in_gold_core() -> None:
+    threads, _ = generate_traceops_threads(
+        level=1,
+        scenarios=["indirect"],
+        seed=53,
+        threads=4,
+        indirection_rate=1.0,
+        trap_decision_flip_enable=True,
+        trap_graph_excludable_kinds="stale,inapplicable,avoided,decision_checkpoint",
+    )
+    saw_checkpoint_pivot = False
+    for thread in threads:
+        for step in thread.steps:
+            if str(step.kind) != "pivot_check":
+                continue
+            md = dict(step.metadata or {})
+            checkpoint_ids = [str(cid) for cid in (md.get("decision_checkpoint_trap_ids") or []) if str(cid)]
+            if not checkpoint_ids:
+                continue
+            saw_checkpoint_pivot = True
+            assert all(
+                str(cid) not in set(str(x) for x in (step.pivot_required_ids or []))
+                for cid in checkpoint_ids
+            )
+            assert int(md.get("decision_checkpoint_in_gold_core_count", 0) or 0) == 0
+    assert saw_checkpoint_pivot

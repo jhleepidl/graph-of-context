@@ -573,6 +573,9 @@ def main() -> None:
                         metrics.get("forced_trap_injected_any_rate")
                     ),
                     "mean_core_size": _as_float(metrics.get("mean_core_size")),
+                    "gold_core_has_decision_checkpoint_rate": _as_float(
+                        metrics.get("gold_core_has_decision_checkpoint_rate")
+                    ),
                     "core_necessity_all_required_rate": _as_float(
                         metrics.get("core_necessity_all_required_rate")
                     ),
@@ -794,6 +797,7 @@ def main() -> None:
             "mean_forced_trap_injected_rate",
             "forced_trap_injected_any_rate",
             "mean_core_size",
+            "gold_core_has_decision_checkpoint_rate",
             "core_necessity_all_required_rate",
             "mean_core_necessity_flip_count",
             "core_necessity_failed_rate",
@@ -847,6 +851,7 @@ def main() -> None:
             "mean_forced_trap_injected_rate",
             "forced_trap_injected_any_rate",
             "mean_core_size",
+            "gold_core_has_decision_checkpoint_rate",
             "core_necessity_all_required_rate",
             "mean_core_necessity_flip_count",
             "core_necessity_failed_rate",

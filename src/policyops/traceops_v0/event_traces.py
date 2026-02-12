@@ -74,6 +74,8 @@ def build_event_trace_line(
         "decision_checkpoint_trap_injected_count",
         "decision_checkpoint_trap_injected_rate",
         "decision_checkpoint_trap_injected_any",
+        "decision_checkpoint_in_gold_core_count",
+        "gold_core_has_decision_checkpoint",
         "core_size",
         "core_necessity_flip_count",
         "core_necessity_all_required",
@@ -105,6 +107,10 @@ def build_event_trace_line(
     line["decision_checkpoint_trap_injected_ids"] = _cap(
         "decision_checkpoint_trap_injected_ids",
         rec.get("decision_checkpoint_trap_injected_ids"),
+    )
+    line["decision_checkpoint_in_gold_core_ids"] = _cap(
+        "decision_checkpoint_in_gold_core_ids",
+        rec.get("decision_checkpoint_in_gold_core_ids"),
     )
     line["trap_graph_excludable_ids"] = _cap(
         "trap_graph_excludable_ids", rec.get("trap_graph_excludable_ids")
@@ -249,6 +255,16 @@ def build_event_trace_line(
         ),
         "decision_checkpoint_trap_injected_any": rec.get(
             "decision_checkpoint_trap_injected_any"
+        ),
+        "decision_checkpoint_in_gold_core_count": rec.get(
+            "decision_checkpoint_in_gold_core_count"
+        ),
+        "decision_checkpoint_in_gold_core_ids": _cap(
+            "scenario_decision_checkpoint_in_gold_core_ids",
+            rec.get("decision_checkpoint_in_gold_core_ids"),
+        ),
+        "gold_core_has_decision_checkpoint": rec.get(
+            "gold_core_has_decision_checkpoint"
         ),
         "trap_flip_target_id": rec.get("trap_flip_target_id"),
         "trap_flip_target_kind": rec.get("trap_flip_target_kind"),

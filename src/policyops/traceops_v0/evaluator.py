@@ -1548,6 +1548,15 @@ def evaluate_traceops_method(
                 ),
                 "hidden_core_ids": list(hidden_core_ids),
                 "hidden_core_parent_ids": list(hidden_core_parent_ids),
+                "decision_checkpoint_in_gold_core_count": int(
+                    step_meta.get("decision_checkpoint_in_gold_core_count", 0) or 0
+                ),
+                "decision_checkpoint_in_gold_core_ids": list(
+                    _unique_strs(step_meta.get("decision_checkpoint_in_gold_core_ids") or [])
+                ),
+                "gold_core_has_decision_checkpoint": bool(
+                    int(step_meta.get("decision_checkpoint_in_gold_core_count", 0) or 0) > 0
+                ),
             }
             records.append(rec)
             pivot_step_records.append(rec)
@@ -1679,6 +1688,10 @@ def evaluate_traceops_method(
     hidden_core_present_vals = [
         1.0 if len(list(r.get("hidden_core_ids") or [])) > 0 else 0.0 for r in pivot_records
     ]
+    gold_core_has_checkpoint_vals = [
+        1.0 if bool(r.get("gold_core_has_decision_checkpoint", False)) else 0.0
+        for r in pivot_records
+    ]
 
     method_name = str(method or "")
     depwalk_enabled = bool(getattr(args, "goc_depwalk_enable", False))
@@ -1755,6 +1768,7 @@ def evaluate_traceops_method(
         "core_necessity_failed_rate": _mean(core_need_failed_vals),
         "trap_decision_flip_rate": _mean(trap_decision_flip_vals),
         "hidden_core_present_rate": _mean(hidden_core_present_vals),
+        "gold_core_has_decision_checkpoint_rate": _mean(gold_core_has_checkpoint_vals),
         "hidden_core_rescued_by_depwalk_rate": hidden_core_rescued_by_depwalk_rate,
         "hidden_core_missing_without_depwalk_rate": hidden_core_missing_without_depwalk_rate,
         "pivot_records": int(len(pivot_records)),

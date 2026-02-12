@@ -89,6 +89,20 @@ def _clause_applicable_like_eval(clause: TraceWorldClause, state: Dict[str, Any]
     return str(state.get(key, "")) == str(val)
 
 
+def is_decision_checkpoint_clause(clause: TraceWorldClause | None) -> bool:
+    if clause is None:
+        return False
+    meta = dict(clause.metadata or {})
+    if (
+        str(clause.node_type or "") == "DECISION"
+        and str(clause.text or "").startswith("Decision checkpoint:")
+    ):
+        return True
+    if str(meta.get("trap_kind", "") or "") == "decision_checkpoint":
+        return True
+    return bool(meta.get("trap_decision_checkpoint", False))
+
+
 def _decision_from_state(state: Dict[str, Any], *, force_exception: bool = False) -> str:
     if force_exception:
         return "require_exception"
@@ -119,7 +133,11 @@ def _oracle_decision_from_evidence(
     evidence_ids: Sequence[str],
     state: Dict[str, Any],
 ) -> str:
-    selected = [clauses[cid] for cid in evidence_ids if cid in clauses]
+    selected = [
+        clauses[cid]
+        for cid in evidence_ids
+        if cid in clauses and not is_decision_checkpoint_clause(clauses[cid])
+    ]
     if not selected:
         return "unknown"
 
@@ -372,10 +390,7 @@ def generate_traceops_threads(
                 metadata=dict(metadata or {}),
             )
             # Single source of truth for decision-checkpoint trap semantics.
-            if (
-                str(clause_obj.node_type or "") == "DECISION"
-                and str(clause_obj.text or "").startswith("Decision checkpoint:")
-            ):
+            if is_decision_checkpoint_clause(clause_obj):
                 clause_obj.metadata["trap"] = True
                 clause_obj.metadata["trap_kind"] = "decision_checkpoint"
                 clause_obj.metadata["trap_decision_checkpoint"] = True
@@ -631,11 +646,14 @@ def generate_traceops_threads(
                 "decision_checkpoint_trap_count": 0,
                 "decision_checkpoint_trap_ids": [],
                 "decision_checkpoint_trap_excludable_ids": [],
+                "decision_checkpoint_in_gold_core_count": 0,
+                "decision_checkpoint_in_gold_core_ids": [],
                 "trap_invalidation_attached_to_update": False,
                 "invalidation_update_injected": False,
                 "invalidation_update_step_idx": None,
                 "defer_budget_rate": float(defer_budget_rate),
                 "trap_gap_failed": False,
+                "core_filled_by_fallback": False,
                 "hidden_core_ids": [],
                 "hidden_core_parent_ids": [],
             }
@@ -674,6 +692,97 @@ def generate_traceops_threads(
                     if str(state.get("deadline", "")).strip().lower() == "tight":
                         return "deny", []
                     return "allow", []
+
+                def _filter_non_checkpoint_ids(ids: Sequence[str]) -> List[str]:
+                    return [
+                        str(cid)
+                        for cid in _unique_strs(ids)
+                        if str(cid) in clauses
+                        and not is_decision_checkpoint_clause(clauses[str(cid)])
+                    ]
+
+                def _fill_core_ids_minimum(
+                    current_ids: Sequence[str],
+                    *,
+                    min_size: int,
+                ) -> tuple[List[str], bool]:
+                    target = max(0, int(min_size))
+                    out = _filter_non_checkpoint_ids(current_ids)
+                    if len(out) >= target:
+                        return out, False
+
+                    # Priority 1) controlling update chain signals.
+                    for cid in list(reversed(update_ids_by_key.get(str(ordinal_key), []))) + list(reversed(update_ids)):
+                        sid = str(cid)
+                        if sid in out or sid not in clauses:
+                            continue
+                        clause = clauses[sid]
+                        if str(clause.node_type or "") != "UPDATE":
+                            continue
+                        if is_decision_checkpoint_clause(clause):
+                            continue
+                        out.append(sid)
+                        if len(out) >= target:
+                            return out, False
+
+                    # Priority 2) active/applicable exceptions.
+                    for cid in reversed(all_prior_ids):
+                        sid = str(cid)
+                        if sid in out or sid not in clauses:
+                            continue
+                        clause = clauses[sid]
+                        if str(clause.node_type or "") != "EXCEPTION":
+                            continue
+                        if is_decision_checkpoint_clause(clause):
+                            continue
+                        if not _clause_applicable_like_eval(clause, state):
+                            continue
+                        out.append(sid)
+                        if len(out) >= target:
+                            return out, False
+
+                    # Priority 3) assumption/evidence with low lexical trap affinity.
+                    for cid in reversed(all_prior_ids):
+                        sid = str(cid)
+                        if sid in out or sid not in clauses:
+                            continue
+                        clause = clauses[sid]
+                        ntype = str(clause.node_type or "")
+                        if ntype not in {"ASSUMPTION", "EVIDENCE"}:
+                            continue
+                        if is_decision_checkpoint_clause(clause):
+                            continue
+                        if bool((clause.metadata or {}).get("trap", False)):
+                            continue
+                        overlap = _jaccard_text(str(message or ""), str(clause.text or ""))
+                        if overlap > 0.5:
+                            continue
+                        out.append(sid)
+                        if len(out) >= target:
+                            return out, False
+
+                    # Fallback fill (recorded): any non-checkpoint prior evidence.
+                    fallback_used = False
+                    for cid in reversed(all_prior_ids):
+                        sid = str(cid)
+                        if sid in out or sid not in clauses:
+                            continue
+                        clause = clauses[sid]
+                        if is_decision_checkpoint_clause(clause):
+                            continue
+                        if str(clause.node_type or "") not in {
+                            "UPDATE",
+                            "EXCEPTION",
+                            "ASSUMPTION",
+                            "EVIDENCE",
+                            "DECISION",
+                        }:
+                            continue
+                        out.append(sid)
+                        fallback_used = True
+                        if len(out) >= target:
+                            break
+                    return out, fallback_used
 
                 indirect_pivot_active = (
                     scenario == "indirect"
@@ -859,6 +968,7 @@ def generate_traceops_threads(
                         + ([latest_decision_id] if latest_decision_id else [])
                         + list(hidden_core_ids)
                     )
+                    base_candidate_core = _filter_non_checkpoint_ids(base_candidate_core)
                     if core_necessity_enable and core_necessity_require_all:
                         has_update = any(
                             clauses.get(cid) is not None and str(clauses[cid].node_type or "") == "UPDATE"
@@ -880,6 +990,8 @@ def generate_traceops_threads(
                                 clause = clauses.get(cid)
                                 if clause is None or str(clause.node_type or "") != "ASSUMPTION":
                                     continue
+                                if is_decision_checkpoint_clause(clause):
+                                    continue
                                 base_candidate_core.append(cid)
                                 break
                     # Add one applicable exception when available.
@@ -890,9 +1002,9 @@ def generate_traceops_threads(
                         if _clause_applicable_like_eval(clause, state):
                             base_candidate_core.append(cid)
                             break
-                    base_candidate_core = [cid for cid in _unique_strs(base_candidate_core) if cid in clauses]
-                    if not base_candidate_core and latest_decision_id:
-                        base_candidate_core = [latest_decision_id]
+                    base_candidate_core = _filter_non_checkpoint_ids(base_candidate_core)
+                    if not base_candidate_core:
+                        base_candidate_core, _ = _fill_core_ids_minimum([], min_size=1)
 
                     max_attempts = core_necessity_max_tries if core_necessity_enable else 1
                     accepted_core_required_ids: List[str] = []
@@ -902,9 +1014,10 @@ def generate_traceops_threads(
                     accepted_all_required = False
                     accepted_exception = ""
                     accepted_tries_used = 0
+                    accepted_core_fallback_used = False
 
                     for attempt_idx in range(1, max_attempts + 1):
-                        candidate_core = list(base_candidate_core)
+                        candidate_core = _filter_non_checkpoint_ids(base_candidate_core)
                         trng.shuffle(candidate_core)
                         desired_core = min(
                             len(candidate_core),
@@ -914,9 +1027,6 @@ def generate_traceops_threads(
                             desired_core = min(core_size_min, len(candidate_core))
                         if core_necessity_enable and core_necessity_require_all:
                             desired_core = max(desired_core, min(3, len(candidate_core)))
-                        if desired_core <= 0 and latest_decision_id:
-                            candidate_core = [latest_decision_id]
-                            desired_core = 1
 
                         core_required_ids: List[str] = []
                         if core_necessity_enable and core_necessity_require_all:
@@ -1021,6 +1131,16 @@ def generate_traceops_threads(
                                 cid for cid in _unique_strs(core_required_ids) if cid in clauses
                             ][:desired_core]
 
+                        core_required_ids = _filter_non_checkpoint_ids(core_required_ids)
+                        min_needed = max(1, min(int(core_size_min), int(core_size_max)))
+                        filled_core_ids, fallback_fill_used = _fill_core_ids_minimum(
+                            core_required_ids,
+                            min_size=min_needed,
+                        )
+                        if len(filled_core_ids) > int(core_size_max):
+                            filled_core_ids = filled_core_ids[: int(core_size_max)]
+                        core_required_ids = list(filled_core_ids)
+
                         chosen_exception = ""
                         chosen_updates = []
                         for cid in core_required_ids:
@@ -1072,6 +1192,7 @@ def generate_traceops_threads(
                         accepted_all_required = bool(all_required)
                         accepted_exception = str(chosen_exception or "")
                         accepted_tries_used = int(attempt_idx)
+                        accepted_core_fallback_used = bool(fallback_fill_used)
                         if not core_necessity_enable:
                             break
                         if core_necessity_require_all:
@@ -1083,6 +1204,17 @@ def generate_traceops_threads(
                     pivot_required_ids = [
                         cid for cid in _unique_strs(accepted_core_required_ids) if cid in clauses
                     ]
+                    pivot_required_ids = _filter_non_checkpoint_ids(pivot_required_ids)
+                    if len(pivot_required_ids) < max(1, min(int(core_size_min), int(core_size_max))):
+                        pivot_required_ids, late_fallback_used = _fill_core_ids_minimum(
+                            pivot_required_ids,
+                            min_size=max(1, min(int(core_size_min), int(core_size_max))),
+                        )
+                        accepted_core_fallback_used = bool(
+                            accepted_core_fallback_used or late_fallback_used
+                        )
+                    if len(pivot_required_ids) > int(core_size_max):
+                        pivot_required_ids = pivot_required_ids[: int(core_size_max)]
                     decision = accepted_decision
                     conditions = list(accepted_conditions)
                     chosen_exception = accepted_exception
@@ -1448,6 +1580,7 @@ def generate_traceops_threads(
                             core_necessity_enable and core_necessity_require_all and not accepted_all_required
                         ),
                         "core_necessity_tries_used": int(accepted_tries_used if core_necessity_enable else 0),
+                        "core_filled_by_fallback": bool(accepted_core_fallback_used),
                         "trap_decision_label": str(trap_decision_label or ""),
                         "trap_decision_flip": bool(trap_decision_flip),
                         "hidden_core_ids": list(hidden_core_ids),
@@ -1491,6 +1624,23 @@ def generate_traceops_threads(
                     decision, conditions = _maybe_calibrate_needs_more_info(decision, conditions)
 
                 pivot_required_ids = [cid for cid in _unique_strs(pivot_required_ids) if cid in clauses]
+                pivot_required_ids = _filter_non_checkpoint_ids(pivot_required_ids)
+                if not pivot_required_ids:
+                    pivot_required_ids, non_indirect_fallback_used = _fill_core_ids_minimum(
+                        pivot_required_ids,
+                        min_size=1,
+                    )
+                    if non_indirect_fallback_used:
+                        pivot_meta["core_filled_by_fallback"] = True
+                checkpoint_in_gold_ids = [
+                    cid
+                    for cid in pivot_required_ids
+                    if cid in clauses and is_decision_checkpoint_clause(clauses[cid])
+                ]
+                pivot_meta["decision_checkpoint_in_gold_core_ids"] = list(checkpoint_in_gold_ids)
+                pivot_meta["decision_checkpoint_in_gold_core_count"] = int(
+                    len(checkpoint_in_gold_ids)
+                )
                 step_gold = TraceGold(
                     decision=decision,
                     conditions=conditions,
@@ -1576,6 +1726,8 @@ def generate_traceops_threads(
                 "traceops_hidden_core_kind": str(hidden_core_kind),
                 "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
                 "traceops_trap_require_avoided": bool(trap_require_avoided),
+                "decision_checkpoint_core_exclusion_enable": True,
+                "decision_checkpoint_core_exclusion_version": "phase18.3_patchL",
             },
         )
         result.append(thread)
@@ -1622,6 +1774,8 @@ def generate_traceops_threads(
         "traceops_hidden_core_kind": str(hidden_core_kind),
         "traceops_hidden_core_link_mode": str(hidden_core_link_mode),
         "traceops_trap_require_avoided": bool(trap_require_avoided),
+        "decision_checkpoint_core_exclusion_enable": True,
+        "decision_checkpoint_core_exclusion_version": "phase18.3_patchL",
         "pivots_available_total": int(
             sum(1 for thread in result for step in thread.steps if str(step.kind) == "pivot_check")
         ),
