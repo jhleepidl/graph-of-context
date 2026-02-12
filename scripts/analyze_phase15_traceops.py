@@ -533,6 +533,21 @@ def main() -> None:
                     "mean_exception_injected_count": _as_float(
                         metrics.get("mean_exception_injected_count")
                     ),
+                    "gold_needs_more_info_rate": _as_float(
+                        metrics.get("gold_needs_more_info_rate")
+                    ),
+                    "pred_needs_more_info_rate": _as_float(
+                        metrics.get("pred_needs_more_info_rate")
+                    ),
+                    "commit_when_gold_unknown_rate": _as_float(
+                        metrics.get("commit_when_gold_unknown_rate")
+                    ),
+                    "noop_update_in_context_rate": _as_float(
+                        metrics.get("noop_update_in_context_rate")
+                    ),
+                    "noop_update_dropped_rate": _as_float(
+                        metrics.get("noop_update_dropped_rate")
+                    ),
                     "mean_goc_stable_update_count": _as_float(
                         metrics.get("mean_goc_stable_update_count")
                     ),
@@ -807,6 +822,11 @@ def main() -> None:
             "avoided_injected_rate",
             "exception_injected_rate",
             "mean_exception_injected_count",
+            "gold_needs_more_info_rate",
+            "pred_needs_more_info_rate",
+            "commit_when_gold_unknown_rate",
+            "noop_update_in_context_rate",
+            "noop_update_dropped_rate",
             "mean_goc_stable_update_count",
             "mean_goc_recent_update_count",
             "stable_update_present_rate",
@@ -870,6 +890,11 @@ def main() -> None:
             "avoided_injected_rate",
             "exception_injected_rate",
             "mean_exception_injected_count",
+            "gold_needs_more_info_rate",
+            "pred_needs_more_info_rate",
+            "commit_when_gold_unknown_rate",
+            "noop_update_in_context_rate",
+            "noop_update_dropped_rate",
             "mean_goc_stable_update_count",
             "mean_goc_recent_update_count",
             "stable_update_present_rate",

@@ -35,6 +35,11 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
         "traceops_eval_mode": "llm",
         "traceops_llm_eval_scope": "pivots",
         "sampled_step": False,
+        "gold_needs_more_info": True,
+        "pred_needs_more_info": True,
+        "commit_when_gold_unknown": False,
+        "noop_update_in_context": True,
+        "noop_update_in_context_count": 3,
         "evidence_core_missing_ids_strict": missing_ids,
         "evidence_core_missing_equiv_keys": missing_keys,
         "goc_avoid_target_clause_ids": avoid_ids,
@@ -51,8 +56,12 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
         "goc_smart_type_counts_after": {"OPTION": 1, "UPDATE": 3},
         "goc_update_delay": 6,
         "goc_update_counts_by_age": {"stable_update_count": 2, "recent_update_count": 1},
+        "goc_noop_update_dropped_count": 2,
+        "goc_recent_update_dropped_count": 4,
+        "goc_stable_update_kept_count": 2,
         "goc_update_keys_required": ["region", "budget", "retention_tier"],
         "goc_update_keys_injected": ["retention_tier"],
+        "goc_update_keys_missing_after_smart": ["budget"],
         "core_necessity_flip_count": 3,
         "core_necessity_all_required": True,
         "core_necessity_failed": False,
@@ -89,12 +98,21 @@ def test_event_trace_line_includes_diag_and_truncation() -> None:
     assert goc_diag["goc_smart_type_counts_after"]["OPTION"] == 1
     assert goc_diag["goc_update_delay"] == 6
     assert goc_diag["goc_update_counts_by_age"]["stable_update_count"] == 2
+    assert goc_diag["goc_noop_update_dropped_count"] == 2
+    assert goc_diag["goc_recent_update_dropped_count"] == 4
+    assert goc_diag["goc_stable_update_kept_count"] == 2
     assert "retention_tier" in goc_diag["goc_update_keys_required"]
     assert goc_diag["goc_update_keys_injected"] == ["retention_tier"]
+    assert goc_diag["goc_update_keys_missing_after_smart"] == ["budget"]
 
     avoid_diag = line["diag"]["avoid"]
     assert avoid_diag["avoid_target_count"] == 20
     assert avoid_diag["avoid_injected"] is True
+    assert line["gold_needs_more_info"] is True
+    assert line["pred_needs_more_info"] is True
+    assert line["commit_when_gold_unknown"] is False
+    assert line["noop_update_in_context"] is True
+    assert line["noop_update_in_context_count"] == 3
 
     assert line["core_necessity_all_required"] is True
     assert line["core_necessity_flip_count"] == 3

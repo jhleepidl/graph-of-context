@@ -124,6 +124,9 @@ def _build_traceops_llm_prompt(
         "Every evidence id MUST be selected from Allowed evidence clause IDs."
     )
     lines.append(
+        "For decision=allow|deny|require_condition: `evidence` MUST include at least 1 UPDATE clause id."
+    )
+    lines.append(
         "If the above evidence requirement is not satisfied, decision MUST be `needs_more_info`, "
         "conditions MUST be [], and evidence should contain at most one most relevant allowed clause id (or [])."
     )
@@ -368,6 +371,47 @@ def _is_trap_update_clause(clause: TraceWorldClause | None) -> bool:
     return bool(trap_kind)
 
 
+def _is_noop_update_clause(clause: TraceWorldClause | None) -> bool:
+    if clause is None or _goc_clause_type(clause) != "UPDATE":
+        return False
+    meta = clause.metadata if isinstance(clause.metadata, dict) else {}
+    return bool(meta.get("noop_update", False))
+
+
+def _apply_llm_update_evidence_gate(
+    *,
+    prediction: Dict[str, Any],
+    context_ids: Sequence[str],
+    clauses: Dict[str, TraceWorldClause],
+) -> Dict[str, Any]:
+    pred = dict(prediction or {})
+    decision = str(pred.get("decision", "needs_more_info") or "needs_more_info")
+    if decision not in {"allow", "deny", "require_condition", "needs_more_info"}:
+        decision = "needs_more_info"
+    evidence_ids = _unique_strs(pred.get("evidence") or [])
+    if decision == "needs_more_info":
+        pred["decision"] = decision
+        pred["evidence"] = list(evidence_ids[:1])
+        return pred
+
+    allowed_ids = set(_unique_strs(context_ids))
+    evidence_allowed = [cid for cid in evidence_ids if cid in allowed_ids]
+    has_min_two = len(set(evidence_allowed)) >= 2
+    has_update = any(
+        str((clauses.get(cid).node_type if clauses.get(cid) is not None else "") or "") == "UPDATE"
+        for cid in evidence_allowed
+    )
+    if has_min_two and has_update:
+        pred["decision"] = decision
+        pred["evidence"] = list(evidence_allowed)
+        return pred
+
+    pred["decision"] = "needs_more_info"
+    pred["conditions"] = []
+    pred["evidence"] = list(evidence_allowed[:1])
+    return pred
+
+
 def _goc_overlap_count(message_tokens: Set[str], clause: TraceWorldClause | None) -> int:
     if clause is None:
         return 0
@@ -418,7 +462,10 @@ def _goc_smart_pack_context_ids(
     injected_ids: List[str] = []
     update_keys_required: Set[str] = set()
     update_keys_injected: Set[str] = set()
+    update_keys_missing_after_smart: Set[str] = set()
     protected_update_ids: Set[str] = set()
+    noop_update_dropped_count = 0
+    recent_update_dropped_count = 0
 
     def _is_policy_core_clause(clause: TraceWorldClause | None) -> bool:
         if clause is None:
@@ -572,6 +619,19 @@ def _goc_smart_pack_context_ids(
         if cid not in referenced_options:
             _drop(cid, "drop_option_unreferenced")
 
+    # Rule 1.5) Drop noop updates used only for invalidation plumbing.
+    required_keep_ids = {str(cid) for cid in _unique_strs(step.pivot_required_ids or [])}
+    for cid in list(keep_set):
+        clause = clauses.get(cid)
+        if _goc_clause_type(clause) != "UPDATE":
+            continue
+        if not _is_noop_update_clause(clause):
+            continue
+        if cid in required_keep_ids:
+            continue
+        _drop(cid, "drop_noop_update_invalidation_only")
+        noop_update_dropped_count += 1
+
     # Rule 2) UPDATE dedup by state_key (delay-aware + trap-aware).
     updates_by_key: Dict[str, List[str]] = {}
     for cid in ordered_history_ids:
@@ -591,30 +651,40 @@ def _goc_smart_pack_context_ids(
         invalidation_updates = [
             cid for cid in ranked_group if _is_update_invalidation_clause(clauses.get(cid))
         ]
+        noop_updates = [
+            cid
+            for cid in ranked_group
+            if _is_noop_update_clause(clauses.get(cid))
+        ]
         trap_updates = [
             cid
             for cid in ranked_group
             if _is_trap_update_clause(clauses.get(cid))
             and cid not in set(invalidation_updates)
+            and cid not in set(noop_updates)
         ]
         normal_updates = [
             cid
             for cid in ranked_group
-            if cid not in set(invalidation_updates) and cid not in set(trap_updates)
+            if cid not in set(invalidation_updates)
+            and cid not in set(trap_updates)
+            and cid not in set(noop_updates)
         ]
-        stable_updates = [cid for cid in normal_updates if _update_is_stable(cid)]
-        recent_updates = [cid for cid in normal_updates if not _update_is_stable(cid)]
+        stable_nontrap_nonnoop = [cid for cid in normal_updates if _update_is_stable(cid)]
+        recent_nontrap_nonnoop = [cid for cid in normal_updates if not _update_is_stable(cid)]
 
-        keep_updates: Set[str] = set(invalidation_updates)
-        stable_latest = _latest_id(stable_updates)
-        recent_latest = _latest_id(recent_updates)
+        keep_updates: Set[str] = {
+            cid
+            for cid in invalidation_updates
+            if (_update_is_stable(cid) or cid in required_keep_ids)
+        }
+        stable_latest = _latest_id(stable_nontrap_nonnoop)
         if stable_latest:
             keep_updates.add(stable_latest)
-        if recent_latest:
-            keep_updates.add(recent_latest)
-        if not stable_latest and normal_updates:
-            for cid in sorted(normal_updates, key=_update_sort_key)[-2:]:
-                keep_updates.add(cid)
+            recent_update_dropped_count += int(len(recent_nontrap_nonnoop))
+        else:
+            recent_update_dropped_count += int(len(recent_nontrap_nonnoop))
+            update_keys_missing_after_smart.add(str(key))
 
         protected_update_ids.update(keep_updates)
         for cid in ranked_group:
@@ -713,24 +783,16 @@ def _goc_smart_pack_context_ids(
             cid
             for cid in candidates_by_key.get(key, [])
             if not _is_trap_update_clause(clauses.get(cid))
+            and not _is_noop_update_clause(clauses.get(cid))
         ]
         if not key_candidates:
+            update_keys_missing_after_smart.add(str(key))
             continue
 
         stable_candidates = [cid for cid in key_candidates if _update_is_stable(cid)]
         chosen: str | None = _latest_id(stable_candidates)
-        if chosen is None:
-            newest_kept_idx = max(
-                [int(clauses[cid].step_idx) for cid in kept_for_key if cid in clauses] or [-10**9]
-            )
-            older_candidates = [
-                cid
-                for cid in key_candidates
-                if cid in clauses and int(clauses[cid].step_idx) < int(newest_kept_idx)
-            ]
-            chosen = _latest_id(older_candidates) or _latest_id(key_candidates)
-
         if not chosen:
+            update_keys_missing_after_smart.add(str(key))
             continue
         if chosen not in keep_set:
             keep_set.add(chosen)
@@ -782,12 +844,13 @@ def _goc_smart_pack_context_ids(
         reason="unfold_inject_decision_missing",
     )
     _pick_missing(
-        pred=lambda c: _goc_clause_type(c) == "UPDATE" and not _is_trap_update_clause(c),
-        reason="unfold_inject_update_missing",
-    )
-    _pick_missing(
-        pred=lambda c: _goc_clause_type(c) == "UPDATE",
-        reason="unfold_inject_update_missing_fallback",
+        pred=lambda c: (
+            _goc_clause_type(c) == "UPDATE"
+            and not _is_trap_update_clause(c)
+            and not _is_noop_update_clause(c)
+            and _update_is_stable(str(c.clause_id))
+        ),
+        reason="unfold_inject_update_missing_stable_only",
     )
     if applicable_exception_exists:
         _pick_missing(
@@ -824,8 +887,20 @@ def _goc_smart_pack_context_ids(
     final_update_ids = [
         cid for cid in final_ids if _goc_clause_type(clauses.get(cid)) == "UPDATE"
     ]
-    stable_update_count = int(sum(1 for cid in final_update_ids if _update_is_stable(cid)))
-    recent_update_count = int(max(0, len(final_update_ids) - stable_update_count))
+    stable_update_count = int(
+        sum(
+            1
+            for cid in final_update_ids
+            if _update_is_stable(cid) and not _is_noop_update_clause(clauses.get(cid))
+        )
+    )
+    recent_update_count = int(
+        sum(
+            1
+            for cid in final_update_ids
+            if (not _update_is_stable(cid)) and not _is_noop_update_clause(clauses.get(cid))
+        )
+    )
 
     debug = {
         "goc_smart_enable": True,
@@ -839,6 +914,9 @@ def _goc_smart_pack_context_ids(
             "stable_update_count": int(stable_update_count),
             "recent_update_count": int(recent_update_count),
         },
+        "goc_noop_update_dropped_count": int(noop_update_dropped_count),
+        "goc_recent_update_dropped_count": int(recent_update_dropped_count),
+        "goc_stable_update_kept_count": int(stable_update_count),
         "goc_smart_protected_ids": list(
             _unique_strs(
                 [
@@ -850,6 +928,9 @@ def _goc_smart_pack_context_ids(
         ),
         "goc_update_keys_required": list(sorted(update_keys_required)),
         "goc_update_keys_injected": list(sorted(update_keys_injected)),
+        "goc_update_keys_missing_after_smart": list(
+            sorted(update_keys_missing_after_smart)
+        ),
         "goc_update_delay_source": str(delay_source),
     }
     if smart_warning:
@@ -1421,8 +1502,12 @@ def _choose_traceops_context(
             "goc_update_delay": 0,
             "goc_update_delay_source": "",
             "goc_update_counts_by_age": {},
+            "goc_noop_update_dropped_count": 0,
+            "goc_recent_update_dropped_count": 0,
+            "goc_stable_update_kept_count": 0,
             "goc_update_keys_required": [],
             "goc_update_keys_injected": [],
+            "goc_update_keys_missing_after_smart": [],
         }
         if smart_enable:
             context_ids, smart_debug = _goc_smart_pack_context_ids(
@@ -1493,8 +1578,20 @@ def _choose_traceops_context(
                 smart_debug.get("goc_update_delay_source", "") or ""
             ),
             "goc_update_counts_by_age": dict(smart_debug.get("goc_update_counts_by_age") or {}),
+            "goc_noop_update_dropped_count": int(
+                smart_debug.get("goc_noop_update_dropped_count", 0) or 0
+            ),
+            "goc_recent_update_dropped_count": int(
+                smart_debug.get("goc_recent_update_dropped_count", 0) or 0
+            ),
+            "goc_stable_update_kept_count": int(
+                smart_debug.get("goc_stable_update_kept_count", 0) or 0
+            ),
             "goc_update_keys_required": list(smart_debug.get("goc_update_keys_required") or []),
             "goc_update_keys_injected": list(smart_debug.get("goc_update_keys_injected") or []),
+            "goc_update_keys_missing_after_smart": list(
+                smart_debug.get("goc_update_keys_missing_after_smart") or []
+            ),
         }
     else:
         context_ids = list(ordered_history)
@@ -1839,6 +1936,11 @@ def evaluate_traceops_method(
                         encoding="utf-8",
                     )
                 pred = _parse_llm_json(llm_output_text)
+                pred = _apply_llm_update_evidence_gate(
+                    prediction=pred,
+                    context_ids=context_ids,
+                    clauses=thread.clauses,
+                )
                 llm_parse_error = bool(pred.get("parse_error"))
                 llm_steps_seen += 1
                 if is_scored_pivot:
@@ -1876,10 +1978,13 @@ def evaluate_traceops_method(
 
             exception_injected_ids: List[str] = []
             exception_applicable_count = 0
+            noop_update_in_context_count = 0
             for cid in list(context_ids):
                 clause = thread.clauses.get(cid)
                 if clause is None:
                     continue
+                if str(clause.node_type or "") == "UPDATE" and _is_noop_update_clause(clause):
+                    noop_update_in_context_count += 1
                 if str(clause.node_type or "") != "EXCEPTION":
                     continue
                 exception_injected_ids.append(str(cid))
@@ -2005,6 +2110,17 @@ def evaluate_traceops_method(
                     score.get("conditions_correct_subset_equiv", False)
                 ),
                 "e3_answer_correct": bool(score.get("answer_correct", False)),
+                "gold_needs_more_info": bool(
+                    str(score.get("gold_decision", "") or "") == "needs_more_info"
+                ),
+                "pred_needs_more_info": bool(
+                    str(score.get("pred_decision", "") or "") == "needs_more_info"
+                ),
+                "commit_when_gold_unknown": bool(
+                    str(score.get("gold_decision", "") or "") == "needs_more_info"
+                    and str(score.get("pred_decision", "") or "")
+                    in {"allow", "deny", "require_condition"}
+                ),
                 "e3_evidence_valid_in_context": bool(score.get("evidence_valid_in_context", False)),
                 "critical_coverage_e3": score.get("critical_coverage"),
                 "critical_coverage_strict_e3": score.get("critical_coverage_strict"),
@@ -2095,13 +2211,27 @@ def evaluate_traceops_method(
                 "goc_update_counts_by_age": dict(
                     debug.get("goc_update_counts_by_age") or {}
                 ),
+                "goc_noop_update_dropped_count": int(
+                    debug.get("goc_noop_update_dropped_count", 0) or 0
+                ),
+                "goc_recent_update_dropped_count": int(
+                    debug.get("goc_recent_update_dropped_count", 0) or 0
+                ),
+                "goc_stable_update_kept_count": int(
+                    debug.get("goc_stable_update_kept_count", 0) or 0
+                ),
                 "goc_update_keys_required": list(
                     debug.get("goc_update_keys_required") or []
                 ),
                 "goc_update_keys_injected": list(
                     debug.get("goc_update_keys_injected") or []
                 ),
+                "goc_update_keys_missing_after_smart": list(
+                    debug.get("goc_update_keys_missing_after_smart") or []
+                ),
                 "e3_context_clause_ids": list(context_ids),
+                "noop_update_in_context_count": int(noop_update_in_context_count),
+                "noop_update_in_context": bool(noop_update_in_context_count > 0),
                 "goc_exception_injected_ids": list(exception_injected_ids),
                 "goc_exception_injected_count": int(len(exception_injected_ids)),
                 "goc_exception_applicable_count": int(exception_applicable_count),
@@ -2294,7 +2424,28 @@ def evaluate_traceops_method(
     stable_update_count_vals: List[float] = []
     recent_update_count_vals: List[float] = []
     stable_update_present_vals: List[float] = []
+    noop_update_in_context_vals: List[float] = []
+    noop_update_dropped_vals: List[float] = []
+    gold_needs_more_info_vals: List[float] = []
+    pred_needs_more_info_vals: List[float] = []
+    commit_when_gold_unknown_vals: List[float] = []
     for rec in pivot_records:
+        noop_update_in_context_vals.append(
+            1.0 if bool(rec.get("noop_update_in_context", False)) else 0.0
+        )
+        gold_needs_more_info_vals.append(
+            1.0 if bool(rec.get("gold_needs_more_info", False)) else 0.0
+        )
+        pred_needs_more_info_vals.append(
+            1.0 if bool(rec.get("pred_needs_more_info", False)) else 0.0
+        )
+        commit_when_gold_unknown_vals.append(
+            1.0 if bool(rec.get("commit_when_gold_unknown", False)) else 0.0
+        )
+        if bool(rec.get("goc_smart_enable", False)):
+            noop_update_dropped_vals.append(
+                1.0 if int(rec.get("goc_noop_update_dropped_count", 0) or 0) > 0 else 0.0
+            )
         counts_obj = rec.get("goc_update_counts_by_age")
         if not isinstance(counts_obj, dict):
             continue
@@ -2441,6 +2592,13 @@ def evaluate_traceops_method(
         "avoided_injected_rate": _mean(avoided_injected_vals),
         "exception_injected_rate": _mean(exception_injected_vals),
         "mean_exception_injected_count": _mean([float(v) for v in exception_injected_counts]),
+        "gold_needs_more_info_rate": _mean(gold_needs_more_info_vals),
+        "pred_needs_more_info_rate": _mean(pred_needs_more_info_vals),
+        "commit_when_gold_unknown_rate": _mean(commit_when_gold_unknown_vals),
+        "noop_update_in_context_rate": _mean(noop_update_in_context_vals),
+        "noop_update_dropped_rate": (
+            _mean(noop_update_dropped_vals) if noop_update_dropped_vals else float("nan")
+        ),
         "mean_goc_stable_update_count": _mean(stable_update_count_vals),
         "mean_goc_recent_update_count": _mean(recent_update_count_vals),
         "stable_update_present_rate": _mean(stable_update_present_vals),

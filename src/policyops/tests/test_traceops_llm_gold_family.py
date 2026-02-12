@@ -9,7 +9,7 @@ from policyops.traceops_v0.schema import TraceGold, TraceStep, TraceThread, Trac
 class _FakeLLMClient:
     def generate_with_usage(self, prompt: str, *, temperature: float = 0.0, max_output_tokens: int = 256):
         return (
-            '{"decision":"require_condition","conditions":[],"evidence":["C0001"]}',
+            '{"decision":"require_condition","conditions":[],"evidence":["C0001","C0002"]}',
             {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
         )
 
@@ -47,7 +47,7 @@ def test_llm_mode_uses_family_correctness_for_primary_metric(tmp_path) -> None:
                 kind="explore",
                 message="explore",
                 state={"region": "eu"},
-                introduced_clause_ids=["C0001"],
+                introduced_clause_ids=["C0001", "C0002"],
             ),
             TraceStep(
                 step_id="TR0001-S002",
@@ -73,7 +73,16 @@ def test_llm_mode_uses_family_correctness_for_primary_metric(tmp_path) -> None:
                 step_idx=0,
                 node_type="EXCEPTION",
                 text="Exception clause.",
-            )
+            ),
+            "C0002": TraceWorldClause(
+                clause_id="C0002",
+                thread_id="TR0001",
+                step_idx=0,
+                node_type="UPDATE",
+                text="Update: region changed to eu.",
+                state_key="region",
+                state_value="eu",
+            ),
         },
         meta={},
     )

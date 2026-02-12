@@ -408,7 +408,7 @@ def test_goc_smart_update_delay_backfill_and_key_coverage() -> None:
     assert "USTABLE" in context_ids
     assert rec.get("goc_update_delay") == 6
     assert "retention_tier" in list(rec.get("goc_update_keys_required") or [])
-    assert "retention_tier" in list(rec.get("goc_update_keys_injected") or [])
+    assert "retention_tier" in list(rec.get("goc_update_keys_missing_after_smart") or [])
     assert float(age_diag.get("stable_update_count", 0)) >= 1.0
 
 
@@ -467,8 +467,10 @@ def test_goc_smart_pack_reads_delay_from_dict_args() -> None:
         },
     )
     assert "U_STABLE" in set(packed_ids)
-    assert "U_RECENT" in set(packed_ids)
+    assert "U_RECENT" not in set(packed_ids)
     assert int(debug.get("goc_update_delay", 0)) == 6
+    assert int(debug.get("goc_recent_update_dropped_count", 0)) >= 1
+    assert int(debug.get("goc_stable_update_kept_count", 0)) >= 1
 
 
 def test_goc_smart_pack_uses_step_delay_metadata_when_arg_missing() -> None:
@@ -519,7 +521,124 @@ def test_goc_smart_pack_uses_step_delay_metadata_when_arg_missing() -> None:
     counts = debug.get("goc_update_counts_by_age") or {}
     assert int(debug.get("goc_update_delay", 0)) == 6
     assert int(counts.get("stable_update_count", 0)) >= 1
-    assert int(counts.get("recent_update_count", 0)) >= 1
+    assert int(counts.get("recent_update_count", 0)) == 0
+
+
+def test_goc_smart_pack_drops_noop_update_when_not_core() -> None:
+    step = TraceStep(
+        step_id="TR-NOOP-S010",
+        thread_id="TR-NOOP",
+        step_idx=10,
+        kind="pivot_check",
+        message="final decision",
+        state={"region": "us"},
+        pivot_required_ids=["D1"],
+        metadata={"delay_to_relevance": 6},
+    )
+    clauses = {
+        "UN": TraceWorldClause(
+            clause_id="UN",
+            thread_id="TR-NOOP",
+            step_idx=9,
+            node_type="UPDATE",
+            text="No-op update: invalidation wiring only.",
+            state_key="region",
+            state_value="us",
+            metadata={"noop_update": True},
+        ),
+        "US": TraceWorldClause(
+            clause_id="US",
+            thread_id="TR-NOOP",
+            step_idx=2,
+            node_type="UPDATE",
+            text="Update: region changed to us.",
+            state_key="region",
+            state_value="us",
+        ),
+        "D1": TraceWorldClause(
+            clause_id="D1",
+            thread_id="TR-NOOP",
+            step_idx=8,
+            node_type="DECISION",
+            text="Decision depends on region timeline.",
+            metadata={"binding_key": "region"},
+        ),
+    }
+
+    packed_ids, debug = _goc_smart_pack_context_ids(
+        context_ids=["UN", "US", "D1"],
+        ordered_history=["UN", "US", "D1"],
+        candidates=["UN", "US", "D1"],
+        step=step,
+        clauses=clauses,
+        avoid_set=set(),
+        args={
+            "traceops_delay_to_relevance": 6,
+            "goc_smart_cap_option": 0,
+            "goc_smart_cap_assumption": 2,
+            "goc_smart_cap_update": 4,
+            "goc_smart_cap_exception": 2,
+            "goc_smart_cap_evidence": 2,
+        },
+    )
+    packed = set(packed_ids)
+    assert "UN" not in packed
+    assert "US" in packed
+    assert int(debug.get("goc_noop_update_dropped_count", 0)) >= 1
+    assert "drop_noop_update_invalidation_only" in list(
+        debug.get("goc_smart_dropped_reasons") or []
+    )
+
+
+def test_goc_smart_pack_drops_recent_when_no_stable_for_key() -> None:
+    step = TraceStep(
+        step_id="TR-MISS-S010",
+        thread_id="TR-MISS",
+        step_idx=10,
+        kind="pivot_check",
+        message="final decision",
+        state={"budget": "low"},
+        metadata={"delay_to_relevance": 6},
+    )
+    clauses = {
+        "UR": TraceWorldClause(
+            clause_id="UR",
+            thread_id="TR-MISS",
+            step_idx=9,
+            node_type="UPDATE",
+            text="Update: budget changed to low.",
+            state_key="budget",
+            state_value="low",
+        ),
+        "D1": TraceWorldClause(
+            clause_id="D1",
+            thread_id="TR-MISS",
+            step_idx=9,
+            node_type="DECISION",
+            text="Decision depends on budget timeline.",
+            metadata={"binding_key": "budget"},
+        ),
+    }
+    packed_ids, debug = _goc_smart_pack_context_ids(
+        context_ids=["UR", "D1"],
+        ordered_history=["UR", "D1"],
+        candidates=["UR", "D1"],
+        step=step,
+        clauses=clauses,
+        avoid_set=set(),
+        args={
+            "traceops_delay_to_relevance": 6,
+            "goc_smart_cap_option": 0,
+            "goc_smart_cap_assumption": 2,
+            "goc_smart_cap_update": 4,
+            "goc_smart_cap_exception": 2,
+            "goc_smart_cap_evidence": 2,
+        },
+    )
+    packed = set(packed_ids)
+    assert "UR" not in packed
+    assert "budget" in set(debug.get("goc_update_keys_missing_after_smart") or [])
+    assert int(debug.get("goc_recent_update_dropped_count", 0)) >= 1
 
 
 def test_goc_smart_pack_protects_policy_anchor_and_codebook_from_quota_drop() -> None:

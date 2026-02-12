@@ -44,6 +44,11 @@ def build_event_trace_line(
         "decision_correct_strict_raw",
         "decision_correct_exact",
         "decision_correct_family",
+        "gold_needs_more_info",
+        "pred_needs_more_info",
+        "commit_when_gold_unknown",
+        "noop_update_in_context",
+        "noop_update_in_context_count",
         "conditions_correct_exact",
         "conditions_correct_subset",
         "conditions_correct_exact_equiv",
@@ -229,6 +234,9 @@ def build_event_trace_line(
         goc["goc_update_delay"] = rec.get("goc_update_delay")
         goc["goc_update_delay_source"] = rec.get("goc_update_delay_source")
         goc["goc_update_counts_by_age"] = rec.get("goc_update_counts_by_age")
+        goc["goc_noop_update_dropped_count"] = rec.get("goc_noop_update_dropped_count")
+        goc["goc_recent_update_dropped_count"] = rec.get("goc_recent_update_dropped_count")
+        goc["goc_stable_update_kept_count"] = rec.get("goc_stable_update_kept_count")
         goc["goc_update_keys_required"] = _cap(
             "goc_update_keys_required",
             rec.get("goc_update_keys_required"),
@@ -236,6 +244,10 @@ def build_event_trace_line(
         goc["goc_update_keys_injected"] = _cap(
             "goc_update_keys_injected",
             rec.get("goc_update_keys_injected"),
+        )
+        goc["goc_update_keys_missing_after_smart"] = _cap(
+            "goc_update_keys_missing_after_smart",
+            rec.get("goc_update_keys_missing_after_smart"),
         )
 
         goc["goc_exception_injected_ids"] = _cap(
