@@ -73,6 +73,7 @@ def build_event_trace_line(
         "decision_checkpoint_trap_excludable_count",
         "decision_checkpoint_trap_injected_count",
         "decision_checkpoint_trap_injected_rate",
+        "decision_checkpoint_trap_injected_any",
         "core_size",
         "core_necessity_flip_count",
         "core_necessity_all_required",
@@ -84,6 +85,8 @@ def build_event_trace_line(
         "trap_graph_excludable_count",
         "trap_graph_excludable_forced_count",
         "trap_invalidation_attached_to_update",
+        "invalidation_update_injected",
+        "invalidation_update_step_idx",
         "forced_trap_injected_count",
         "forced_trap_injected_rate",
         "forced_trap_injected_any",
@@ -244,6 +247,9 @@ def build_event_trace_line(
         "decision_checkpoint_trap_injected_rate": rec.get(
             "decision_checkpoint_trap_injected_rate"
         ),
+        "decision_checkpoint_trap_injected_any": rec.get(
+            "decision_checkpoint_trap_injected_any"
+        ),
         "trap_flip_target_id": rec.get("trap_flip_target_id"),
         "trap_flip_target_kind": rec.get("trap_flip_target_kind"),
         "trap_graph_excludable_count": rec.get("trap_graph_excludable_count"),
@@ -260,6 +266,8 @@ def build_event_trace_line(
             rec.get("trap_graph_excludable_forced_reasons"),
         ),
         "trap_invalidation_attached_to_update": rec.get("trap_invalidation_attached_to_update"),
+        "invalidation_update_injected": rec.get("invalidation_update_injected"),
+        "invalidation_update_step_idx": rec.get("invalidation_update_step_idx"),
         "forced_trap_injected_count": rec.get("forced_trap_injected_count"),
         "forced_trap_injected_rate": rec.get("forced_trap_injected_rate"),
         "forced_trap_injected_any": rec.get("forced_trap_injected_any"),

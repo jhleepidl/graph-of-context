@@ -1519,9 +1519,16 @@ def evaluate_traceops_method(
                     decision_checkpoint_trap_injected_count
                 ),
                 "decision_checkpoint_trap_injected_rate": decision_checkpoint_trap_injected_rate,
+                "decision_checkpoint_trap_injected_any": bool(
+                    decision_checkpoint_trap_injected_count > 0
+                ),
                 "trap_invalidation_attached_to_update": bool(
                     step_meta.get("trap_invalidation_attached_to_update", False)
                 ),
+                "invalidation_update_injected": bool(
+                    step_meta.get("invalidation_update_injected", False)
+                ),
+                "invalidation_update_step_idx": step_meta.get("invalidation_update_step_idx"),
                 "trap_flip_salience": (
                     float(step_meta.get("trap_flip_salience"))
                     if isinstance(step_meta.get("trap_flip_salience"), (int, float))
@@ -1640,6 +1647,10 @@ def evaluate_traceops_method(
         if isinstance(r.get("decision_checkpoint_trap_injected_rate"), (int, float))
         and math.isfinite(float(r.get("decision_checkpoint_trap_injected_rate")))
     ]
+    decision_checkpoint_trap_injected_any_vals = [
+        1.0 if bool(r.get("decision_checkpoint_trap_injected_any", False)) else 0.0
+        for r in pivot_records
+    ]
     forced_trap_injected_count_vals = [
         float(int(r.get("forced_trap_injected_count", 0) or 0)) for r in pivot_records
     ]
@@ -1728,6 +1739,12 @@ def evaluate_traceops_method(
         ),
         "decision_checkpoint_trap_injected_rate": _mean(
             decision_checkpoint_trap_injected_rate_vals
+        ),
+        "mean_decision_checkpoint_trap_injected_rate": _mean(
+            decision_checkpoint_trap_injected_rate_vals
+        ),
+        "decision_checkpoint_trap_injected_any_rate": _mean(
+            decision_checkpoint_trap_injected_any_vals
         ),
         "mean_forced_trap_injected_count": _mean(forced_trap_injected_count_vals),
         "mean_forced_trap_injected_rate": _mean(forced_trap_injected_rate_vals),

@@ -8101,6 +8101,13 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "decision_checkpoint_trap_injected_rate": metrics.get(
                 "decision_checkpoint_trap_injected_rate"
             ),
+            "mean_decision_checkpoint_trap_injected_rate": metrics.get(
+                "mean_decision_checkpoint_trap_injected_rate",
+                metrics.get("decision_checkpoint_trap_injected_rate"),
+            ),
+            "decision_checkpoint_trap_injected_any_rate": metrics.get(
+                "decision_checkpoint_trap_injected_any_rate"
+            ),
             "mean_decision_checkpoint_trap_injected_count": metrics.get(
                 "mean_decision_checkpoint_trap_injected_count"
             ),

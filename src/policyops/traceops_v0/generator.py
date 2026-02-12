@@ -358,7 +358,7 @@ def generate_traceops_threads(
             nonlocal clause_counter
             clause_counter += 1
             cid = f"{thread_id}-C{clause_counter:04d}"
-            clauses[cid] = TraceWorldClause(
+            clause_obj = TraceWorldClause(
                 clause_id=cid,
                 thread_id=thread_id,
                 step_idx=int(step_idx),
@@ -371,6 +371,17 @@ def generate_traceops_threads(
                 branch_id=branch_id,
                 metadata=dict(metadata or {}),
             )
+            # Single source of truth for decision-checkpoint trap semantics.
+            if (
+                str(clause_obj.node_type or "") == "DECISION"
+                and str(clause_obj.text or "").startswith("Decision checkpoint:")
+            ):
+                clause_obj.metadata["trap"] = True
+                clause_obj.metadata["trap_kind"] = "decision_checkpoint"
+                clause_obj.metadata["trap_decision_checkpoint"] = True
+                clause_obj.metadata.setdefault("decision_checkpoint_controlling", False)
+                clause_obj.tags = _unique_strs(list(clause_obj.tags) + ["decision_checkpoint"])
+            clauses[cid] = clause_obj
             return cid
 
         for step_idx, kind in enumerate(kinds):
@@ -621,6 +632,8 @@ def generate_traceops_threads(
                 "decision_checkpoint_trap_ids": [],
                 "decision_checkpoint_trap_excludable_ids": [],
                 "trap_invalidation_attached_to_update": False,
+                "invalidation_update_injected": False,
+                "invalidation_update_step_idx": None,
                 "defer_budget_rate": float(defer_budget_rate),
                 "trap_gap_failed": False,
                 "hidden_core_ids": [],
@@ -1189,43 +1202,37 @@ def generate_traceops_threads(
                             trap_gap_failed = True
 
                     decision_checkpoint_trap_ids: List[str] = []
-                    if trap_decision_flip_enable and trap_decision_label:
-                        checkpoint_ids: List[str] = []
-                        for cid in decision_ids:
-                            clause = clauses.get(str(cid))
-                            if clause is None:
-                                continue
-                            if str(clause.node_type or "") != "DECISION":
-                                continue
-                            if int(clause.step_idx) >= int(step_idx):
-                                continue
-                            label = str((clause.metadata or {}).get("decision_label", "") or "").strip().lower()
-                            if not label or label == "handle_binding":
-                                continue
-                            checkpoint_ids.append(str(cid))
+                    checkpoint_ids: List[str] = []
+                    for cid in all_prior_ids:
+                        clause = clauses.get(str(cid))
+                        if clause is None:
+                            continue
+                        if str(clause.node_type or "") != "DECISION":
+                            continue
+                        if not str(clause.text or "").startswith("Decision checkpoint:"):
+                            continue
+                        checkpoint_ids.append(str(cid))
 
-                        controlling_id = ""
-                        if checkpoint_ids:
-                            controlling_id = max(
-                                checkpoint_ids,
-                                key=lambda cid: (int(clauses[cid].step_idx), str(cid)),
-                            )
-                        trap_label_norm = normalize_decision(trap_decision_label)
-                        for cid in checkpoint_ids:
-                            if controlling_id and str(cid) == str(controlling_id):
-                                continue
-                            clause = clauses.get(str(cid))
-                            if clause is None:
-                                continue
-                            label = str((clause.metadata or {}).get("decision_label", "") or "").strip().lower()
-                            if normalize_decision(label) != trap_label_norm:
-                                continue
-                            clause.metadata["trap"] = True
-                            clause.metadata["trap_kind"] = "decision_checkpoint"
-                            clause.metadata["trap_decision_checkpoint"] = True
-                            clause.metadata["trap_decision_label"] = str(trap_decision_label or "")
-                            clause.metadata["trap_decision_flip"] = bool(trap_decision_flip)
-                            decision_checkpoint_trap_ids.append(str(cid))
+                    controlling_id = ""
+                    if checkpoint_ids:
+                        controlling_id = max(
+                            checkpoint_ids,
+                            key=lambda cid: (int(clauses[cid].step_idx), str(cid)),
+                        )
+                    for cid in checkpoint_ids:
+                        clause = clauses.get(str(cid))
+                        if clause is None:
+                            continue
+                        clause.metadata["trap"] = True
+                        clause.metadata["trap_kind"] = "decision_checkpoint"
+                        clause.metadata["trap_decision_checkpoint"] = True
+                        clause.metadata["decision_checkpoint_controlling"] = bool(
+                            controlling_id and str(cid) == str(controlling_id)
+                        )
+                        clause.metadata["trap_decision_label"] = str(trap_decision_label or "")
+                        clause.metadata["trap_decision_flip"] = bool(trap_decision_flip)
+                        clause.tags = _unique_strs(list(clause.tags) + ["decision_checkpoint"])
+                        decision_checkpoint_trap_ids.append(str(cid))
 
                     trap_clause_ids = _unique_strs(list(trap_clause_ids) + list(decision_checkpoint_trap_ids))
                     if trap_clause_ids:
@@ -1269,9 +1276,8 @@ def generate_traceops_threads(
                                 if _trap_kind(str(cid)) == "decision_checkpoint"
                             ]
                             if checkpoint_eligible:
-                                ranked_checkpoint = _rank_distractor_similarity(checkpoint_eligible)
-                                if ranked_checkpoint:
-                                    _force_add(str(ranked_checkpoint[0][1]), "decision_checkpoint")
+                                for checkpoint_id in checkpoint_eligible:
+                                    _force_add(str(checkpoint_id), "decision_checkpoint_all")
 
                         sampled_ids: List[str] = []
                         for cid in eligible:
@@ -1299,12 +1305,30 @@ def generate_traceops_threads(
                         if _trap_kind(str(cid)) == "decision_checkpoint"
                     ]
 
-                    def _ensure_latest_update_step_for_trap() -> TraceStep | None:
+                    def _ensure_latest_update_step_for_trap(
+                        *,
+                        required_ids: Sequence[str] | None = None,
+                    ) -> tuple[TraceStep | None, bool]:
+                        latest_update_step: TraceStep | None = None
                         for s in reversed(steps):
                             if str(s.kind) == "update":
-                                return s
+                                latest_update_step = s
+                                break
+                        required = [str(cid) for cid in (required_ids or []) if str(cid).strip()]
+                        requires_injected_update = latest_update_step is None
+                        if latest_update_step is not None and required:
+                            latest_update_idx = int(latest_update_step.step_idx)
+                            late_required = [
+                                cid
+                                for cid in required
+                                if clauses.get(str(cid)) is not None
+                                and int(clauses[str(cid)].step_idx) > latest_update_idx
+                            ]
+                            requires_injected_update = bool(late_required)
+                        if not requires_injected_update and latest_update_step is not None:
+                            return latest_update_step, False
                         if not steps:
-                            return None
+                            return None, False
                         fallback_step = steps[-1]
                         fallback_step.kind = "update"
                         if "update" not in str(fallback_step.message or "").lower():
@@ -1328,14 +1352,20 @@ def generate_traceops_threads(
                         )
                         update_ids.append(noop_id)
                         update_ids_by_key.setdefault(noop_key, []).append(noop_id)
-                        return fallback_step
+                        return fallback_step, True
 
+                    invalidation_update_injected = False
+                    invalidation_update_step_idx: int | None = None
                     if trap_graph_excludable_ids:
-                        update_step_for_trap = _ensure_latest_update_step_for_trap()
+                        update_step_for_trap, invalidation_update_injected = _ensure_latest_update_step_for_trap(
+                            required_ids=decision_checkpoint_trap_excludable_ids,
+                        )
                         if update_step_for_trap is not None:
                             update_step_for_trap.avoid_target_ids = _unique_strs(
                                 list(update_step_for_trap.avoid_target_ids) + list(trap_graph_excludable_ids)
                             )
+                            invalidation_update_step_idx = int(update_step_for_trap.step_idx)
+                            trap_invalidation_attached_to_update = True
                             active_invalidated.update(trap_graph_excludable_ids)
                             hint_ids = ",".join(list(trap_graph_excludable_ids)[:3])
                             hint_suffix = ""
@@ -1361,7 +1391,6 @@ def generate_traceops_threads(
                                     uclause.metadata["trap_graph_excludable_ids"] = list(
                                         trap_graph_excludable_ids
                                     )
-                                    trap_invalidation_attached_to_update = True
                                     break
 
                     pivot_meta = {
@@ -1391,6 +1420,12 @@ def generate_traceops_threads(
                             decision_checkpoint_trap_excludable_ids
                         ),
                         "trap_invalidation_attached_to_update": bool(trap_invalidation_attached_to_update),
+                        "invalidation_update_injected": bool(invalidation_update_injected),
+                        "invalidation_update_step_idx": (
+                            int(invalidation_update_step_idx)
+                            if isinstance(invalidation_update_step_idx, int)
+                            else None
+                        ),
                         "trap_flip_salience": float(trap_flip_salience),
                         "trap_flip_attach_kind": str(trap_flip_attach_kind),
                         "trap_graph_excludable_rate": float(trap_graph_excludable_rate),

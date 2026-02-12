@@ -159,10 +159,10 @@ def test_phase18_forced_includes_flip_target_when_eligible() -> None:
 
 def test_phase18_forced_includes_decision_checkpoint_when_present() -> None:
     threads, _ = generate_traceops_threads(
-        level=3,
+        level=1,
         scenarios=["indirect"],
         seed=23,
-        threads=10,
+        threads=6,
         indirection_rate=1.0,
         trap_distractor_count=5,
         trap_similarity_boost=0.9,
@@ -177,7 +177,7 @@ def test_phase18_forced_includes_decision_checkpoint_when_present() -> None:
     )
 
     saw_checkpoint_candidate = False
-    saw_forced_checkpoint = False
+    saw_update_attached = False
     for thread in threads:
         for step in thread.steps:
             if str(step.kind) != "pivot_check":
@@ -190,9 +190,55 @@ def test_phase18_forced_includes_decision_checkpoint_when_present() -> None:
                 continue
             saw_checkpoint_candidate = True
             forced_ids = [str(cid) for cid in (md.get("trap_graph_excludable_forced_ids") or []) if str(cid)]
+            forced_reason_rows = list(md.get("trap_graph_excludable_forced_reasons") or [])
+            forced_reason_map = {
+                str(row.get("id", "")): str(row.get("reason", ""))
+                for row in forced_reason_rows
+                if isinstance(row, dict)
+            }
             excludable_ids = [str(cid) for cid in (md.get("trap_graph_excludable_ids") or []) if str(cid)]
-            if any(cid in forced_ids for cid in checkpoint_ids):
-                saw_forced_checkpoint = True
-                assert any(cid in excludable_ids for cid in checkpoint_ids)
+            assert set(checkpoint_ids).issubset(set(forced_ids))
+            assert set(checkpoint_ids).issubset(set(excludable_ids))
+            for cid in checkpoint_ids:
+                assert "decision_checkpoint_all" in str(forced_reason_map.get(cid, ""))
+
+            prior_updates = [
+                s
+                for s in thread.steps
+                if int(s.step_idx) < int(step.step_idx) and str(s.kind) == "update"
+            ]
+            assert prior_updates
+            attached = any(
+                set(checkpoint_ids).issubset(set(str(cid) for cid in (u.avoid_target_ids or [])))
+                for u in prior_updates
+            )
+            assert attached
+            saw_update_attached = saw_update_attached or attached
+            assert bool(md.get("invalidation_update_injected", False))
+            assert isinstance(md.get("invalidation_update_step_idx"), int)
     assert saw_checkpoint_candidate
-    assert saw_forced_checkpoint
+    assert saw_update_attached
+
+
+def test_phase18_decision_checkpoint_prefix_is_always_trap_marked() -> None:
+    threads, _ = generate_traceops_threads(
+        level=1,
+        scenarios=["indirect"],
+        seed=31,
+        threads=2,
+        indirection_rate=1.0,
+        trap_decision_flip_enable=True,
+    )
+    saw_checkpoint = False
+    for thread in threads:
+        for clause in thread.clauses.values():
+            if str(clause.node_type or "") != "DECISION":
+                continue
+            if not str(clause.text or "").startswith("Decision checkpoint:"):
+                continue
+            saw_checkpoint = True
+            meta = dict(clause.metadata or {})
+            assert bool(meta.get("trap", False))
+            assert str(meta.get("trap_kind", "")) == "decision_checkpoint"
+            assert bool(meta.get("trap_decision_checkpoint", False))
+    assert saw_checkpoint

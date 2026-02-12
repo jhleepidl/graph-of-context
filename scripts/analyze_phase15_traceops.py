@@ -554,8 +554,14 @@ def main() -> None:
                     "mean_decision_checkpoint_trap_injected_count": _as_float(
                         metrics.get("mean_decision_checkpoint_trap_injected_count")
                     ),
-                    "decision_checkpoint_trap_injected_rate": _as_float(
-                        metrics.get("decision_checkpoint_trap_injected_rate")
+                    "mean_decision_checkpoint_trap_injected_rate": _as_float(
+                        metrics.get(
+                            "mean_decision_checkpoint_trap_injected_rate",
+                            metrics.get("decision_checkpoint_trap_injected_rate"),
+                        )
+                    ),
+                    "decision_checkpoint_trap_injected_any_rate": _as_float(
+                        metrics.get("decision_checkpoint_trap_injected_any_rate")
                     ),
                     "mean_forced_trap_injected_count": _as_float(
                         metrics.get("mean_forced_trap_injected_count")
@@ -782,7 +788,8 @@ def main() -> None:
             "mean_trap_injected_rate",
             "trap_injected_any_rate",
             "mean_decision_checkpoint_trap_injected_count",
-            "decision_checkpoint_trap_injected_rate",
+            "mean_decision_checkpoint_trap_injected_rate",
+            "decision_checkpoint_trap_injected_any_rate",
             "mean_forced_trap_injected_count",
             "mean_forced_trap_injected_rate",
             "forced_trap_injected_any_rate",
@@ -834,7 +841,8 @@ def main() -> None:
             "mean_trap_injected_rate",
             "trap_injected_any_rate",
             "mean_decision_checkpoint_trap_injected_count",
-            "decision_checkpoint_trap_injected_rate",
+            "mean_decision_checkpoint_trap_injected_rate",
+            "decision_checkpoint_trap_injected_any_rate",
             "mean_forced_trap_injected_count",
             "mean_forced_trap_injected_rate",
             "forced_trap_injected_any_rate",
