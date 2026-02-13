@@ -7858,6 +7858,8 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
 
     base_dir = Path(args.out_dir) if args.out_dir else _default_base_dir()
     scenarios = _parse_traceops_scenarios_arg(getattr(args, "traceops_scenarios", "mixed"))
+    raw_delay = getattr(args, "traceops_delay_to_relevance", None)
+    delay_to_relevance = int(raw_delay) if raw_delay is not None else None
     threads, meta = generate_traceops_threads(
         level=int(getattr(args, "traceops_level", 1) or 1),
         scenarios=scenarios,
@@ -7868,11 +7870,7 @@ def _cmd_generate_traceops(args: argparse.Namespace) -> None:
             if int(getattr(args, "traceops_trace_len", 0) or 0) > 0
             else None
         ),
-        delay_to_relevance=(
-            int(getattr(args, "traceops_delay_to_relevance", 0) or 0)
-            if int(getattr(args, "traceops_delay_to_relevance", 0) or 0) > 0
-            else None
-        ),
+        delay_to_relevance=delay_to_relevance,
         distractor_branching=int(getattr(args, "traceops_distractor_branching", 2) or 2),
         contradiction_rate=float(getattr(args, "traceops_contradiction_rate", 0.35) or 0.35),
         exception_density=float(getattr(args, "traceops_exception_density", 0.35) or 0.35),
