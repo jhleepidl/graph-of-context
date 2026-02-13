@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Set, Tuple
@@ -1236,6 +1237,9 @@ def _choose_traceops_context(
             0,
             int(_arg_get(args, "goc_depwalk_topk_per_hop", 6) or 6),
         )
+        depwalk_mode = str(_arg_get(args, "goc_depwalk_mode", "depends_on") or "depends_on").strip().lower()
+        if depwalk_mode not in {"depends_on", "bag", "random"}:
+            depwalk_mode = "depends_on"
         if depwalk_enable and depwalk_hops > 0 and depwalk_topk_per_hop > 0:
             depwalk_history = [
                 cid
@@ -1245,139 +1249,174 @@ def _choose_traceops_context(
             depwalk_history = [cid for cid in depwalk_history if (not use_avoids or cid not in avoid_set)]
             depwalk_set = set(depwalk_history)
             history_rank = {cid: idx for idx, cid in enumerate(depwalk_history)}
-            neighbors: Dict[str, Set[str]] = {cid: set() for cid in depwalk_history}
-
-            def _connect(aid: str, bid: str) -> None:
-                if aid == bid or aid not in depwalk_set or bid not in depwalk_set:
-                    return
-                neighbors.setdefault(aid, set()).add(bid)
-                neighbors.setdefault(bid, set()).add(aid)
-
-            for cid in depwalk_history:
-                clause = clauses.get(cid)
-                if clause is None:
-                    continue
-                for dep in clause.depends_on:
-                    did = str(dep)
-                    if did in depwalk_set:
-                        _connect(cid, did)
-
-            last_update_by_key: Dict[str, str] = {}
-            for cid in depwalk_history:
-                clause = clauses.get(cid)
-                key = _extract_update_key(clause)
-                if not key:
-                    continue
-                prev = last_update_by_key.get(key)
-                if prev:
-                    _connect(cid, prev)
-                last_update_by_key[key] = cid
-
-            for idx, cid in enumerate(depwalk_history):
-                clause = clauses.get(cid)
-                if clause is None:
-                    continue
-                ctype = str(clause.node_type or "")
-                if ctype == "EXCEPTION":
-                    keys = _extract_trigger_keys(clause)
-                    if not keys:
-                        continue
-                    priors = depwalk_history[:idx]
-                    for key in keys:
-                        linked = 0
-                        for pid in reversed(priors):
-                            pclause = clauses.get(pid)
-                            if pclause is None or str(pclause.node_type or "") not in {"UPDATE", "EVIDENCE"}:
-                                continue
-                            pkey = str(getattr(pclause, "state_key", "") or "").strip().lower()
-                            ptext = str(getattr(pclause, "text", "") or "").lower()
-                            if pkey == key or re.search(rf"\b{re.escape(key)}\b", ptext):
-                                _connect(cid, pid)
-                                linked += 1
-                            if linked >= 2:
-                                break
-                elif ctype == "DECISION":
-                    dtoks = _tokenize(clause.text)
-                    priors = depwalk_history[:idx]
-                    linked = 0
-                    for pid in reversed(priors):
-                        pclause = clauses.get(pid)
-                        if pclause is None or str(pclause.node_type or "") not in {"UPDATE", "EVIDENCE"}:
-                            continue
-                        ptoks = _tokenize(pclause.text)
-                        pkey = str(getattr(pclause, "state_key", "") or "").strip().lower()
-                        pval = str(getattr(pclause, "state_value", "") or "").strip().lower()
-                        key_overlap = bool(pkey and pkey in dtoks)
-                        val_overlap = bool(pval and pval in dtoks)
-                        state_token_overlap = bool((dtoks & state_keys) and (ptoks & state_keys))
-                        state_val_overlap = bool((dtoks & state_vals) and (ptoks & state_vals))
-                        if key_overlap or val_overlap or state_token_overlap or state_val_overlap:
-                            _connect(cid, pid)
-                            linked += 1
-                        if linked >= 3:
-                            break
-
-            selected_set = set(_unique_strs(context_ids))
+            base_selected_set = set(_unique_strs(context_ids))
+            selected_set = set(base_selected_set)
             frontier = [cid for cid in _unique_strs(anchor_ids + seed_ids) if cid in depwalk_set]
             if not frontier:
                 frontier = [cid for cid in _unique_strs(context_ids) if cid in depwalk_set]
-            selected_exception_texts = {
-                _normalize_exception_text(str(clauses[cid].text or ""))
-                for cid in selected_set
-                if cid in clauses and str(clauses[cid].node_type or "") == "EXCEPTION"
-            }
 
-            for _ in range(depwalk_hops):
-                if not frontier:
-                    break
-                frontier_set = set(frontier)
-                cand_ids: List[str] = []
-                for fid in frontier:
-                    for nid in neighbors.get(fid, set()):
-                        if nid in frontier_set or nid in selected_set:
+            if depwalk_mode == "bag":
+                visited = set(frontier) if frontier else set(base_selected_set)
+                for _ in range(depwalk_hops):
+                    hop_added: List[str] = []
+                    for nid in depwalk_history:
+                        if len(hop_added) >= depwalk_topk_per_hop:
+                            break
+                        if nid in visited or nid in selected_set:
                             continue
-                        if nid in avoid_set:
-                            continue
-                        cand_ids.append(nid)
-                cand_ids = _unique_strs(cand_ids)
-                scored_neighbors: List[Tuple[int, int, int, str]] = []
-                for nid in cand_ids:
-                    clause = clauses.get(nid)
-                    if clause is None:
-                        continue
-                    if not _clause_applicable(clause, step.state):
-                        continue
-                    novelty_ok = 1
-                    if str(clause.node_type or "") == "EXCEPTION":
-                        norm_text = _normalize_exception_text(str(clause.text or ""))
-                        if norm_text and norm_text in selected_exception_texts:
-                            novelty_ok = 0
-                    if novelty_ok == 0:
-                        continue
-                    scored_neighbors.append(
-                        (
-                            novelty_ok,
-                            int(clause.step_idx),
-                            -int(history_rank.get(nid, 10**9)),
-                            nid,
-                        )
-                    )
-                scored_neighbors.sort(reverse=True)
-                hop_added: List[str] = []
-                for _, _, _, nid in scored_neighbors:
-                    if len(hop_added) >= depwalk_topk_per_hop:
+                        visited.add(nid)
+                        selected_set.add(nid)
+                        hop_added.append(nid)
+                    if not hop_added:
                         break
-                    clause = clauses.get(nid)
-                    if clause is None:
-                        continue
-                    hop_added.append(nid)
-                    selected_set.add(nid)
-                    depwalk_added.append(nid)
-                    if str(clause.node_type or "") == "EXCEPTION":
-                        norm_text = _normalize_exception_text(str(clause.text or ""))
-                        if norm_text:
-                            selected_exception_texts.add(norm_text)
-                frontier = hop_added
+                depwalk_added = [
+                    cid
+                    for cid in depwalk_history
+                    if cid in selected_set and cid not in base_selected_set
+                ]
+            else:
+                neighbors: Dict[str, Set[str]] = {cid: set() for cid in depwalk_history}
+
+                def _connect(aid: str, bid: str) -> None:
+                    if aid == bid or aid not in depwalk_set or bid not in depwalk_set:
+                        return
+                    neighbors.setdefault(aid, set()).add(bid)
+                    neighbors.setdefault(bid, set()).add(aid)
+
+                if depwalk_mode == "random":
+                    traceops_seed = int(_arg_get(args, "traceops_seed", 0) or 0)
+                    deg = min(depwalk_topk_per_hop, max(0, len(depwalk_history) - 1))
+                    if deg > 0:
+                        for cid in depwalk_history:
+                            pool = [nid for nid in depwalk_history if nid != cid]
+                            seed_material = f"{traceops_seed}|{cid}".encode("utf-8")
+                            node_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+                            rrng = random.Random(node_seed)
+                            rrng.shuffle(pool)
+                            for nid in pool[:deg]:
+                                _connect(cid, nid)
+                else:
+                    for cid in depwalk_history:
+                        clause = clauses.get(cid)
+                        if clause is None:
+                            continue
+                        for dep in clause.depends_on:
+                            did = str(dep)
+                            if did in depwalk_set:
+                                _connect(cid, did)
+
+                    last_update_by_key: Dict[str, str] = {}
+                    for cid in depwalk_history:
+                        clause = clauses.get(cid)
+                        key = _extract_update_key(clause)
+                        if not key:
+                            continue
+                        prev = last_update_by_key.get(key)
+                        if prev:
+                            _connect(cid, prev)
+                        last_update_by_key[key] = cid
+
+                    for idx, cid in enumerate(depwalk_history):
+                        clause = clauses.get(cid)
+                        if clause is None:
+                            continue
+                        ctype = str(clause.node_type or "")
+                        if ctype == "EXCEPTION":
+                            keys = _extract_trigger_keys(clause)
+                            if not keys:
+                                continue
+                            priors = depwalk_history[:idx]
+                            for key in keys:
+                                linked = 0
+                                for pid in reversed(priors):
+                                    pclause = clauses.get(pid)
+                                    if pclause is None or str(pclause.node_type or "") not in {"UPDATE", "EVIDENCE"}:
+                                        continue
+                                    pkey = str(getattr(pclause, "state_key", "") or "").strip().lower()
+                                    ptext = str(getattr(pclause, "text", "") or "").lower()
+                                    if pkey == key or re.search(rf"\b{re.escape(key)}\b", ptext):
+                                        _connect(cid, pid)
+                                        linked += 1
+                                    if linked >= 2:
+                                        break
+                        elif ctype == "DECISION":
+                            dtoks = _tokenize(clause.text)
+                            priors = depwalk_history[:idx]
+                            linked = 0
+                            for pid in reversed(priors):
+                                pclause = clauses.get(pid)
+                                if pclause is None or str(pclause.node_type or "") not in {"UPDATE", "EVIDENCE"}:
+                                    continue
+                                ptoks = _tokenize(pclause.text)
+                                pkey = str(getattr(pclause, "state_key", "") or "").strip().lower()
+                                pval = str(getattr(pclause, "state_value", "") or "").strip().lower()
+                                key_overlap = bool(pkey and pkey in dtoks)
+                                val_overlap = bool(pval and pval in dtoks)
+                                state_token_overlap = bool((dtoks & state_keys) and (ptoks & state_keys))
+                                state_val_overlap = bool((dtoks & state_vals) and (ptoks & state_vals))
+                                if key_overlap or val_overlap or state_token_overlap or state_val_overlap:
+                                    _connect(cid, pid)
+                                    linked += 1
+                                if linked >= 3:
+                                    break
+
+                selected_exception_texts = {
+                    _normalize_exception_text(str(clauses[cid].text or ""))
+                    for cid in selected_set
+                    if cid in clauses and str(clauses[cid].node_type or "") == "EXCEPTION"
+                }
+
+                for _ in range(depwalk_hops):
+                    if not frontier:
+                        break
+                    frontier_set = set(frontier)
+                    cand_ids: List[str] = []
+                    for fid in frontier:
+                        for nid in neighbors.get(fid, set()):
+                            if nid in frontier_set or nid in selected_set:
+                                continue
+                            if nid in avoid_set:
+                                continue
+                            cand_ids.append(nid)
+                    cand_ids = _unique_strs(cand_ids)
+                    scored_neighbors: List[Tuple[int, int, int, str]] = []
+                    for nid in cand_ids:
+                        clause = clauses.get(nid)
+                        if clause is None:
+                            continue
+                        if not _clause_applicable(clause, step.state):
+                            continue
+                        novelty_ok = 1
+                        if str(clause.node_type or "") == "EXCEPTION":
+                            norm_text = _normalize_exception_text(str(clause.text or ""))
+                            if norm_text and norm_text in selected_exception_texts:
+                                novelty_ok = 0
+                        if novelty_ok == 0:
+                            continue
+                        scored_neighbors.append(
+                            (
+                                novelty_ok,
+                                int(clause.step_idx),
+                                -int(history_rank.get(nid, 10**9)),
+                                nid,
+                            )
+                        )
+                    scored_neighbors.sort(reverse=True)
+                    hop_added: List[str] = []
+                    for _, _, _, nid in scored_neighbors:
+                        if len(hop_added) >= depwalk_topk_per_hop:
+                            break
+                        clause = clauses.get(nid)
+                        if clause is None:
+                            continue
+                        hop_added.append(nid)
+                        selected_set.add(nid)
+                        depwalk_added.append(nid)
+                        if str(clause.node_type or "") == "EXCEPTION":
+                            norm_text = _normalize_exception_text(str(clause.text or ""))
+                            if norm_text:
+                                selected_exception_texts.add(norm_text)
+                    frontier = hop_added
 
             context_ids = _unique_strs(context_ids + depwalk_added)
 
@@ -2727,6 +2766,20 @@ def evaluate_traceops_method(
     tokens_pivot_mean = tokens_pivot_mean_actual if math.isfinite(tokens_pivot_mean_actual) else tokens_pivot_mean_est
     tokens_total_mean = tokens_total_mean_actual if math.isfinite(tokens_total_mean_actual) else tokens_total_mean_est
     reason_den = max(1, int(sum(gate_reason_counts.values())))
+    pred_needs_more_info_rate = _mean(pred_needs_more_info_vals)
+    pred_commit_rate = (
+        1.0 - pred_needs_more_info_rate
+        if math.isfinite(pred_needs_more_info_rate)
+        else float("nan")
+    )
+    committed_correct_vals = [
+        1.0 if r.get("decision_correct") else 0.0
+        for r in pivot_records
+        if not bool(r.get("pred_needs_more_info", False))
+    ]
+    pred_committed_accuracy = (
+        _mean(committed_correct_vals) if committed_correct_vals else float("nan")
+    )
 
     def _gate_reason_rate(reason: str) -> float:
         return float(gate_reason_counts.get(reason, 0)) / float(reason_den)
@@ -2750,7 +2803,9 @@ def evaluate_traceops_method(
         "exception_injected_rate": _mean(exception_injected_vals),
         "mean_exception_injected_count": _mean([float(v) for v in exception_injected_counts]),
         "gold_needs_more_info_rate": _mean(gold_needs_more_info_vals),
-        "pred_needs_more_info_rate": _mean(pred_needs_more_info_vals),
+        "pred_needs_more_info_rate": pred_needs_more_info_rate,
+        "pred_commit_rate": pred_commit_rate,
+        "pred_committed_accuracy": pred_committed_accuracy,
         "commit_when_gold_unknown_rate": _mean(commit_when_gold_unknown_vals),
         "noop_update_in_context_rate": _mean(noop_update_in_context_vals),
         "noop_update_dropped_rate": (

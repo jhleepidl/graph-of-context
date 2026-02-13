@@ -406,6 +406,49 @@ def main() -> None:
         if scenario_name not in scenario_threads_cache:
             scenario_threads_cache[scenario_name] = _load_threads_by_scenario(phase15_root, scenario_name)
         thread_lookup = scenario_threads_cache.get(scenario_name, {})
+        pivot_diff_by_key: Dict[Tuple[str, int], bool] = {}
+        pivot_available_total = 0
+        pivot_available_with_diff = 0
+        if isinstance(thread_lookup, dict):
+            for tid, thread_obj in thread_lookup.items():
+                if not isinstance(thread_obj, dict):
+                    continue
+                steps = thread_obj.get("steps")
+                if not isinstance(steps, list):
+                    continue
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    if str(step.get("kind", "") or "") != "pivot_check":
+                        continue
+                    step_idx = int(step.get("step_idx", 0) or 0)
+                    metadata = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+                    has_diff = bool(metadata.get("gold_state_diff_keys"))
+                    pivot_diff_by_key[(str(tid), int(step_idx))] = has_diff
+                    pivot_available_total += 1
+                    if has_diff:
+                        pivot_available_with_diff += 1
+        diff_keys_rate_available = (
+            float(pivot_available_with_diff) / float(pivot_available_total)
+            if pivot_available_total > 0
+            else float("nan")
+        )
+        report_evaluated_keys: set[Tuple[str, int]] = set()
+        for mr_obj in (method_reports.values() if isinstance(method_reports, dict) else []):
+            recs = list((mr_obj or {}).get("records") or [])
+            for rec in recs:
+                if not isinstance(rec, dict):
+                    continue
+                thread_id = str(rec.get("thread_id", "") or "")
+                if not thread_id:
+                    continue
+                step_idx = int(rec.get("step_idx", 0) or 0)
+                key = (thread_id, step_idx)
+                if key in pivot_diff_by_key:
+                    report_evaluated_keys.add(key)
+        diff_keys_rate_evaluated = _mean(
+            [1.0 if pivot_diff_by_key[key] else 0.0 for key in report_evaluated_keys]
+        )
         variant_name = str(run.get("variant") or "variant")
         for method, mr in method_reports.items():
             metrics = dict(mr.get("metrics") or {})
@@ -447,6 +490,42 @@ def main() -> None:
                     tokens_total_mean_actual
                     if np.isfinite(tokens_total_mean_actual)
                     else tokens_total_mean_est
+                )
+            tokens_actual_vals: List[int] = []
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                raw_total = rec.get("total_tokens_actual")
+                if raw_total is None:
+                    continue
+                try:
+                    tokens_actual_vals.append(int(raw_total))
+                except Exception:
+                    continue
+            tokens_pivot_p90_actual = (
+                float(np.percentile(tokens_actual_vals, 90))
+                if tokens_actual_vals
+                else float("nan")
+            )
+            tokens_pivot_p95_actual = (
+                float(np.percentile(tokens_actual_vals, 95))
+                if tokens_actual_vals
+                else float("nan")
+            )
+            pred_needs_more_info_rate = _as_float(metrics.get("pred_needs_more_info_rate"))
+            pred_commit_rate = _as_float(metrics.get("pred_commit_rate"))
+            if not np.isfinite(pred_commit_rate) and np.isfinite(pred_needs_more_info_rate):
+                pred_commit_rate = float(1.0 - pred_needs_more_info_rate)
+            pred_committed_accuracy = _as_float(metrics.get("pred_committed_accuracy"))
+            if not np.isfinite(pred_committed_accuracy):
+                committed_correct_vals = [
+                    1.0 if rec.get("decision_correct") else 0.0
+                    for rec in records
+                    if isinstance(rec, dict)
+                    and not bool(rec.get("pred_needs_more_info", False))
+                ]
+                pred_committed_accuracy = (
+                    _mean(committed_correct_vals) if committed_correct_vals else float("nan")
                 )
             row: Dict[str, Any] = dict(run)
             depwalk_added_vals = [
@@ -521,6 +600,8 @@ def main() -> None:
                     "tokens_total_mean_est": tokens_total_mean_est,
                     "tokens_pivot_mean_actual": tokens_pivot_mean_actual,
                     "tokens_total_mean_actual": tokens_total_mean_actual,
+                    "tokens_pivot_p90_actual": tokens_pivot_p90_actual,
+                    "tokens_pivot_p95_actual": tokens_pivot_p95_actual,
                     "mean_avoid_targets_per_pivot": _as_float(
                         metrics.get("mean_avoid_targets_per_pivot")
                     ),
@@ -536,12 +617,14 @@ def main() -> None:
                     "gold_needs_more_info_rate": _as_float(
                         metrics.get("gold_needs_more_info_rate")
                     ),
-                    "pred_needs_more_info_rate": _as_float(
-                        metrics.get("pred_needs_more_info_rate")
-                    ),
+                    "pred_needs_more_info_rate": pred_needs_more_info_rate,
+                    "pred_commit_rate": pred_commit_rate,
+                    "pred_committed_accuracy": pred_committed_accuracy,
                     "commit_when_gold_unknown_rate": _as_float(
                         metrics.get("commit_when_gold_unknown_rate")
                     ),
+                    "diff_keys_rate_available": diff_keys_rate_available,
+                    "diff_keys_rate_evaluated": diff_keys_rate_evaluated,
                     "noop_update_in_context_rate": _as_float(
                         metrics.get("noop_update_in_context_rate")
                     ),
@@ -846,13 +929,19 @@ def main() -> None:
             "tokens_total_mean_est",
             "tokens_pivot_mean_actual",
             "tokens_total_mean_actual",
+            "tokens_pivot_p90_actual",
+            "tokens_pivot_p95_actual",
             "mean_avoid_targets_per_pivot",
             "avoided_injected_rate",
             "exception_injected_rate",
             "mean_exception_injected_count",
             "gold_needs_more_info_rate",
             "pred_needs_more_info_rate",
+            "pred_commit_rate",
+            "pred_committed_accuracy",
             "commit_when_gold_unknown_rate",
+            "diff_keys_rate_available",
+            "diff_keys_rate_evaluated",
             "noop_update_in_context_rate",
             "noop_update_dropped_rate",
             "gate_forced_needs_more_info_rate",
@@ -922,13 +1011,19 @@ def main() -> None:
             "tokens_total_mean_est",
             "tokens_pivot_mean_actual",
             "tokens_total_mean_actual",
+            "tokens_pivot_p90_actual",
+            "tokens_pivot_p95_actual",
             "mean_avoid_targets_per_pivot",
             "avoided_injected_rate",
             "exception_injected_rate",
             "mean_exception_injected_count",
             "gold_needs_more_info_rate",
             "pred_needs_more_info_rate",
+            "pred_commit_rate",
+            "pred_committed_accuracy",
             "commit_when_gold_unknown_rate",
+            "diff_keys_rate_available",
+            "diff_keys_rate_evaluated",
             "noop_update_in_context_rate",
             "noop_update_dropped_rate",
             "gate_forced_needs_more_info_rate",

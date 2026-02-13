@@ -242,6 +242,8 @@ def main() -> None:
     ap.add_argument("--goc_smart_cap_update", type=int, default=4)
     ap.add_argument("--goc_smart_cap_exception", type=int, default=2)
     ap.add_argument("--goc_smart_cap_evidence", type=int, default=2)
+    ap.add_argument("--include_smart_controls", action="store_true", default=False)
+    ap.add_argument("--include_novelty_ablations", action="store_true", default=False)
     ap.add_argument("--include_ablations", action="store_true")
     ap.add_argument("--include_oracle", action="store_true")
     ap.add_argument("--smoke", action="store_true")
@@ -671,6 +673,7 @@ def main() -> None:
             smart_cap_update: int,
             smart_cap_exception: int,
             smart_cap_evidence: int,
+            depwalk_mode: str = "depends_on",
         ) -> None:
             out_dir = runs_root / scenario / variant
             _ensure_dir(out_dir)
@@ -723,6 +726,8 @@ def main() -> None:
                 cmd += ["--goc_dependency_closure_enable"]
             if depwalk_enable:
                 cmd += ["--goc_depwalk_enable"]
+            if str(depwalk_mode) != "depends_on":
+                cmd += ["--goc_depwalk_mode", str(depwalk_mode)]
             if smart_enable:
                 cmd += ["--goc_smart_context_enable"]
             _run(cmd, cwd=repo_root, env=env)
@@ -837,6 +842,94 @@ def main() -> None:
             smart_cap_exception=int(args.goc_smart_cap_exception),
             smart_cap_evidence=int(args.goc_smart_cap_evidence),
         )
+        if args.include_smart_controls:
+            _run_goc_variant(
+                "goc_phase18_depwalk_nosmart",
+                method_name="goc",
+                seed_enable=True,
+                seed_topk=8,
+                closure_enable=False,
+                closure_topk=12,
+                closure_hops=1,
+                closure_universe="candidates",
+                unfold_max_nodes=999,
+                unfold_hops=1,
+                depwalk_enable=True,
+                depwalk_hops=int(args.goc_depwalk_hops),
+                depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                smart_enable=False,
+                smart_cap_option=int(args.goc_smart_cap_option),
+                smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                smart_cap_update=int(args.goc_smart_cap_update),
+                smart_cap_exception=int(args.goc_smart_cap_exception),
+                smart_cap_evidence=int(args.goc_smart_cap_evidence),
+            )
+            _run_goc_variant(
+                "goc_phase18_smart_nodepwalk",
+                method_name="goc",
+                seed_enable=True,
+                seed_topk=8,
+                closure_enable=False,
+                closure_topk=12,
+                closure_hops=1,
+                closure_universe="candidates",
+                unfold_max_nodes=999,
+                unfold_hops=1,
+                depwalk_enable=False,
+                depwalk_hops=int(args.goc_depwalk_hops),
+                depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                smart_enable=True,
+                smart_cap_option=int(args.goc_smart_cap_option),
+                smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                smart_cap_update=int(args.goc_smart_cap_update),
+                smart_cap_exception=int(args.goc_smart_cap_exception),
+                smart_cap_evidence=int(args.goc_smart_cap_evidence),
+            )
+        if args.include_novelty_ablations:
+            _run_goc_variant(
+                "goc_phase18_depwalk_bag_of_nodes",
+                method_name="goc",
+                seed_enable=True,
+                seed_topk=8,
+                closure_enable=False,
+                closure_topk=12,
+                closure_hops=1,
+                closure_universe="candidates",
+                unfold_max_nodes=999,
+                unfold_hops=1,
+                depwalk_enable=True,
+                depwalk_hops=int(args.goc_depwalk_hops),
+                depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                depwalk_mode="bag",
+                smart_enable=True,
+                smart_cap_option=int(args.goc_smart_cap_option),
+                smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                smart_cap_update=int(args.goc_smart_cap_update),
+                smart_cap_exception=int(args.goc_smart_cap_exception),
+                smart_cap_evidence=int(args.goc_smart_cap_evidence),
+            )
+            _run_goc_variant(
+                "goc_phase18_depwalk_random_edges",
+                method_name="goc",
+                seed_enable=True,
+                seed_topk=8,
+                closure_enable=False,
+                closure_topk=12,
+                closure_hops=1,
+                closure_universe="candidates",
+                unfold_max_nodes=999,
+                unfold_hops=1,
+                depwalk_enable=True,
+                depwalk_hops=int(args.goc_depwalk_hops),
+                depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                depwalk_mode="random",
+                smart_enable=True,
+                smart_cap_option=int(args.goc_smart_cap_option),
+                smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                smart_cap_update=int(args.goc_smart_cap_update),
+                smart_cap_exception=int(args.goc_smart_cap_exception),
+                smart_cap_evidence=int(args.goc_smart_cap_evidence),
+            )
         if args.include_ablations:
             _run_goc_variant(
                 "goc_phase18_depwalk_world",

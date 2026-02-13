@@ -8026,6 +8026,7 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
             "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
             "goc_depwalk_topk_per_hop": int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
+            "goc_depwalk_mode": str(getattr(args, "goc_depwalk_mode", "depends_on") or "depends_on"),
             "goc_smart_context_enable": bool(getattr(args, "goc_smart_context_enable", False)),
             "goc_smart_cap_option": int(
                 getattr(args, "goc_smart_cap_option", 0)
@@ -8243,6 +8244,7 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "goc_depwalk_enable": bool(getattr(args, "goc_depwalk_enable", False)),
             "goc_depwalk_hops": int(getattr(args, "goc_depwalk_hops", 2) or 2),
             "goc_depwalk_topk_per_hop": int(getattr(args, "goc_depwalk_topk_per_hop", 6) or 6),
+            "goc_depwalk_mode": str(getattr(args, "goc_depwalk_mode", "depends_on") or "depends_on"),
             "goc_smart_context_enable": bool(getattr(args, "goc_smart_context_enable", False)),
             "goc_smart_cap_option": int(
                 getattr(args, "goc_smart_cap_option", 0)
@@ -8940,6 +8942,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--goc_depwalk_hops", type=int, default=2)
     ev.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    ev.add_argument(
+        "--goc_depwalk_mode",
+        choices=["depends_on", "bag", "random"],
+        default="depends_on",
+    )
     ev.add_argument("--goc_smart_context_enable", action="store_true", default=False)
     ev.add_argument("--goc_smart_cap_option", type=int, default=0)
     ev.add_argument("--goc_smart_cap_assumption", type=int, default=2)
@@ -9363,6 +9370,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cmp.add_argument("--goc_depwalk_hops", type=int, default=2)
     cmp.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
+    cmp.add_argument(
+        "--goc_depwalk_mode",
+        choices=["depends_on", "bag", "random"],
+        default="depends_on",
+    )
     cmp.add_argument("--goc_smart_context_enable", action="store_true", default=False)
     cmp.add_argument("--goc_smart_cap_option", type=int, default=0)
     cmp.add_argument("--goc_smart_cap_assumption", type=int, default=2)
