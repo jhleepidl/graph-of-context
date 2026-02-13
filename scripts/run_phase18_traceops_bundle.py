@@ -416,8 +416,7 @@ def main() -> None:
             gen_cmd += ["--traceops_hidden_core_enable"]
         if int(args.traceops_trace_len) > 0:
             gen_cmd += ["--traceops_trace_len", str(args.traceops_trace_len)]
-        if int(args.traceops_delay_to_relevance) > 0:
-            gen_cmd += ["--traceops_delay_to_relevance", str(args.traceops_delay_to_relevance)]
+        gen_cmd += ["--traceops_delay_to_relevance", str(args.traceops_delay_to_relevance)]
         _run(gen_cmd, cwd=repo_root, env=env)
 
         meta_path = data_out / "data" / "traceops" / "meta.json"
@@ -508,6 +507,8 @@ def main() -> None:
             str(args.traceops_hidden_core_kind),
             "--traceops_hidden_core_link_mode",
             str(args.traceops_hidden_core_link_mode),
+            "--traceops_delay_to_relevance",
+            str(int(args.traceops_delay_to_relevance)),
             "--parallel_workers",
             "1",
         ]

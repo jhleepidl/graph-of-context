@@ -277,7 +277,9 @@ def generate_traceops_threads(
     levelsafe = max(0, int(level))
     thread_count = max(1, int(threads))
     delay_default = 1 if levelsafe <= 1 else 3 if levelsafe == 2 else 6
-    delay = max(1, int(delay_to_relevance if delay_to_relevance is not None else delay_default))
+    delay_raw = delay_to_relevance if delay_to_relevance is not None else delay_default
+    # delay=0 is allowed to represent "no delay" semantics.
+    delay = max(0, int(delay_raw))
     indirection_rate = max(0.0, min(1.0, float(indirection_rate)))
     trap_similarity_boost = max(0.0, min(1.0, float(trap_similarity_boost)))
     trap_distractor_count = max(0, int(trap_distractor_count))
@@ -762,6 +764,10 @@ def generate_traceops_threads(
                 "policy_anchor_in_gold_core": False,
                 "policy_codebook_id": "",
                 "policy_codebook_in_gold_core": False,
+                "gold_state_mode": "",
+                "gold_state_cutoff_step": None,
+                "gold_state_diff_keys": [],
+                "gold_state_snapshot": {},
             }
             if kind == "pivot_check":
                 all_prior_ids = [
@@ -1143,10 +1149,51 @@ def generate_traceops_threads(
                     if not base_candidate_core:
                         base_candidate_core, _ = _fill_core_ids_minimum([], min_size=1)
 
+                    pivot_step_idx = int(step_idx)
+                    cutoff = pivot_step_idx - int(delay)
+                    # Rebuild delayed stable state so indirect-pivot gold labels match delay_to_relevance semantics.
+                    stable_state_for_gold = dict(initial_state)
+                    ordered_update_ids = sorted(
+                        [str(uid) for uid in update_ids],
+                        key=lambda cid: (
+                            int(clauses[cid].step_idx) if cid in clauses else 10**9,
+                            str(cid),
+                        ),
+                    )
+                    for uid in ordered_update_ids:
+                        clause = clauses.get(uid)
+                        if clause is None or str(clause.node_type or "") != "UPDATE":
+                            continue
+                        if int(clause.step_idx) > cutoff:
+                            continue
+                        metadata = clause.metadata or {}
+                        if bool(metadata.get("trap", False)) or bool(metadata.get("noop_update", False)):
+                            continue
+                        if clause.state_key:
+                            stable_state_for_gold[str(clause.state_key)] = clause.state_value
+                    decision_state = stable_state_for_gold
+                    gold_state_mode = "stable_delay"
+                    gold_state_cutoff_step = int(cutoff)
+                    diff_keys = sorted(
+                        str(k)
+                        for k in (set(state.keys()) | set(decision_state.keys()))
+                        if state.get(k) != decision_state.get(k)
+                    )
+                    gold_state_snapshot = {
+                        key: {
+                            "stable": decision_state.get(key),
+                            "current": state.get(key),
+                        }
+                        for key in ("region", "residency", "budget", "retention_tier")
+                    }
+
                     max_attempts = core_necessity_max_tries if core_necessity_enable else 1
                     accepted_core_required_ids: List[str] = []
-                    accepted_decision = latest_decision or _decision_from_state(state)
-                    accepted_conditions: List[str] = [f"region={state['region']}", f"budget={state['budget']}"]
+                    accepted_decision = latest_decision or _decision_from_state(decision_state)
+                    accepted_conditions: List[str] = [
+                        f"region={decision_state['region']}",
+                        f"budget={decision_state['budget']}",
+                    ]
                     accepted_flip_count = 0
                     accepted_all_required = False
                     accepted_exception = ""
@@ -1293,8 +1340,11 @@ def generate_traceops_threads(
                             if str(clause.node_type or "") == "UPDATE":
                                 chosen_updates.append(cid)
 
-                        fallback_decision = latest_decision or _decision_from_state(state)
-                        fallback_conditions = [f"region={state['region']}", f"budget={state['budget']}"]
+                        fallback_decision = latest_decision or _decision_from_state(decision_state)
+                        fallback_conditions = [
+                            f"region={decision_state['region']}",
+                            f"budget={decision_state['budget']}",
+                        ]
                         if chosen_exception:
                             fallback_decision = "require_exception"
                             fallback_conditions = ["apply_latest_update", f"exception={chosen_exception}"]
@@ -1303,7 +1353,9 @@ def generate_traceops_threads(
                             fallback_conditions = ["apply_latest_update"]
 
                         if core_necessity_enable:
-                            oracle_decision = _oracle_decision_from_evidence(clauses, core_required_ids, state)
+                            oracle_decision = _oracle_decision_from_evidence(
+                                clauses, core_required_ids, decision_state
+                            )
                             decision = oracle_decision if oracle_decision else "unknown"
                             if decision == "require_exception" and chosen_exception:
                                 conditions = ["apply_latest_update", f"exception={chosen_exception}"]
@@ -1318,7 +1370,9 @@ def generate_traceops_threads(
                         flip_count = 0
                         all_required = False
                         if core_necessity_enable and core_required_ids:
-                            base_decision = _oracle_decision_from_evidence(clauses, core_required_ids, state)
+                            base_decision = _oracle_decision_from_evidence(
+                                clauses, core_required_ids, decision_state
+                            )
                             for removed_id in core_required_ids:
                                 reduced = [cid for cid in core_required_ids if cid != removed_id]
                                 removed_clause = clauses.get(str(removed_id))
@@ -1774,6 +1828,10 @@ def generate_traceops_threads(
                         ),
                         "ordinal_key": str(ordinal_key),
                         "handle_token": str(handle_token),
+                        "gold_state_mode": str(gold_state_mode),
+                        "gold_state_cutoff_step": int(gold_state_cutoff_step),
+                        "gold_state_diff_keys": list(diff_keys),
+                        "gold_state_snapshot": dict(gold_state_snapshot),
                     }
                 else:
                     use_latent = (
