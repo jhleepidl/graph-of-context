@@ -234,6 +234,7 @@ def main() -> None:
     ap.add_argument("--traceops_llm_max_pivots", type=int, default=200)
     ap.add_argument("--traceops_llm_eval_scope", choices=["pivots", "all", "sample"], default="pivots")
     ap.add_argument("--traceops_llm_sample_rate", type=float, default=0.2)
+    ap.add_argument("--traceops_llm_prefilter_gold_decisions", type=str, default="")
     ap.add_argument("--goc_depwalk_hops", type=int, default=2)
     ap.add_argument("--goc_depwalk_topk_per_hop", type=int, default=6)
     ap.add_argument("--goc_smart_cap_option", type=int, default=0)
@@ -321,6 +322,7 @@ def main() -> None:
         "traceops_llm_max_pivots": int(args.traceops_llm_max_pivots),
         "traceops_llm_eval_scope": str(args.traceops_llm_eval_scope),
         "traceops_llm_sample_rate": float(args.traceops_llm_sample_rate),
+        "traceops_llm_prefilter_gold_decisions": str(args.traceops_llm_prefilter_gold_decisions or ""),
         "goc_depwalk_hops": int(args.goc_depwalk_hops),
         "goc_depwalk_topk_per_hop": int(args.goc_depwalk_topk_per_hop),
         "goc_smart_cap_option": int(args.goc_smart_cap_option),
@@ -509,6 +511,11 @@ def main() -> None:
             "--parallel_workers",
             "1",
         ]
+        if str(args.traceops_llm_prefilter_gold_decisions or "").strip():
+            base_compare_flags += [
+                "--traceops_llm_prefilter_gold_decisions",
+                str(args.traceops_llm_prefilter_gold_decisions).strip(),
+            ]
         if bool(args.traceops_core_necessity_enable):
             base_compare_flags += ["--traceops_core_necessity_enable"]
         if bool(args.traceops_core_necessity_require_all):

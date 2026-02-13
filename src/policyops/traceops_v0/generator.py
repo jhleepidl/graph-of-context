@@ -494,7 +494,10 @@ def generate_traceops_threads(
                         node_type="EVIDENCE",
                         text=(
                             f"Anchor ledger {handle_token}: lane-alpha qualifies, lane-beta is blocked; "
-                            "resolve outcome through linked chain nodes, not recent wording."
+                            "resolve outcome through linked chain nodes, not recent wording. "
+                            "Rule: if region=eu and residency is not eu, the decision is require_condition (requires residency). "
+                            "When outputting require_condition, include conditions: region=<value>, residency=<value>. "
+                            "Important: do not output allow or deny unless you have non-noop update evidence for the relevant key; if update evidence is missing, prefer require_condition (or needs_more_info) based on the rule evidence."
                         ),
                         tags=["indirect", "policy_anchor", "hidden_core"],
                         metadata={
@@ -903,7 +906,10 @@ def generate_traceops_threads(
                             node_type="EVIDENCE",
                             text=(
                                 f"Anchor ledger {handle_token}: lane-alpha qualifies, lane-beta is blocked; "
-                                "resolve outcome through linked chain nodes, not recent wording."
+                                "resolve outcome through linked chain nodes, not recent wording. "
+                                "Rule: if region=eu and residency is not eu, the decision is require_condition (requires residency). "
+                                "When outputting require_condition, include conditions: region=<value>, residency=<value>. "
+                                "Important: do not output allow or deny unless you have non-noop update evidence for the relevant key; if update evidence is missing, prefer require_condition (or needs_more_info) based on the rule evidence."
                             ),
                             tags=["indirect", "policy_anchor", "hidden_core"],
                             metadata={

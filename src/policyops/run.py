@@ -7960,6 +7960,9 @@ def _cmd_eval_traceops(args: argparse.Namespace) -> None:
             "traceops_llm_max_pivots": int(getattr(args, "traceops_llm_max_pivots", 0) or 0),
             "traceops_llm_eval_scope": str(getattr(args, "traceops_llm_eval_scope", "pivots") or "pivots"),
             "traceops_llm_sample_rate": float(getattr(args, "traceops_llm_sample_rate", 0.2) or 0.2),
+            "traceops_llm_prefilter_gold_decisions": str(
+                getattr(args, "traceops_llm_prefilter_gold_decisions", "") or ""
+            ),
             "traceops_indirection_rate": float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
             "traceops_trap_distractor_count": int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
             "traceops_trap_similarity_boost": float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
@@ -8174,6 +8177,9 @@ def _cmd_compare_traceops(args: argparse.Namespace) -> None:
             "traceops_llm_max_pivots": int(getattr(args, "traceops_llm_max_pivots", 0) or 0),
             "traceops_llm_eval_scope": str(getattr(args, "traceops_llm_eval_scope", "pivots") or "pivots"),
             "traceops_llm_sample_rate": float(getattr(args, "traceops_llm_sample_rate", 0.2) or 0.2),
+            "traceops_llm_prefilter_gold_decisions": str(
+                getattr(args, "traceops_llm_prefilter_gold_decisions", "") or ""
+            ),
             "traceops_indirection_rate": float(getattr(args, "traceops_indirection_rate", 0.4) or 0.4),
             "traceops_trap_distractor_count": int(getattr(args, "traceops_trap_distractor_count", 4) or 4),
             "traceops_trap_similarity_boost": float(getattr(args, "traceops_trap_similarity_boost", 0.7) or 0.7),
@@ -8923,6 +8929,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sampling rate for TraceOps llm scope=sample (0..1).",
     )
     ev.add_argument(
+        "--traceops_llm_prefilter_gold_decisions",
+        type=str,
+        default="",
+        help="Optional comma-separated normalized gold decisions to keep in llm eval (e.g., allow,deny).",
+    )
+    ev.add_argument(
         "--goc_depwalk_enable",
         action="store_true",
         default=False,
@@ -9338,6 +9350,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.2,
         help="Sampling rate for TraceOps llm scope=sample (0..1).",
+    )
+    cmp.add_argument(
+        "--traceops_llm_prefilter_gold_decisions",
+        type=str,
+        default="",
+        help="Optional comma-separated normalized gold decisions to keep in llm eval (e.g., allow,deny).",
     )
     cmp.add_argument(
         "--goc_depwalk_enable",

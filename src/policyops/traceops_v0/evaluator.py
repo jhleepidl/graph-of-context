@@ -1942,9 +1942,19 @@ def evaluate_traceops_method(
     llm_sample_rate = float(getattr(args, "traceops_llm_sample_rate", 0.2) or 0.2)
     llm_sample_rate = max(0.0, min(1.0, llm_sample_rate))
     llm_seed = int(getattr(args, "traceops_llm_seed", 0) or 0)
+    raw_prefilter_gold_decisions = str(
+        getattr(args, "traceops_llm_prefilter_gold_decisions", "") or ""
+    ).strip()
+    prefilter_gold_decisions_set = {
+        normalize_decision(part.strip())
+        for part in raw_prefilter_gold_decisions.split(",")
+        if part.strip()
+    }
     llm_pivots_seen = 0
     llm_steps_seen = 0
     pivots_available_total = 0
+    pivots_prefilter_kept_total = 0
+    pivots_prefilter_filtered_out_total = 0
     steps_available_total = 0
     sampled_steps_evaluated = 0
 
@@ -1981,6 +1991,11 @@ def evaluate_traceops_method(
             is_scored_pivot = bool(step.kind == "pivot_check" and step.gold is not None)
             if is_scored_pivot:
                 pivots_available_total += 1
+                gold_norm = normalize_decision(str(step.gold.decision))
+                if prefilter_gold_decisions_set and gold_norm not in prefilter_gold_decisions_set:
+                    pivots_prefilter_filtered_out_total += 1
+                    continue
+                pivots_prefilter_kept_total += 1
             sampled_step = False
             if use_llm:
                 if llm_eval_scope == "all":
@@ -2806,6 +2821,11 @@ def evaluate_traceops_method(
         "pivot_records": int(len(pivot_records)),
         "thread_records": int(len(thread_records)),
         "pivots_available_total": int(pivots_available_total),
+        "pivots_prefilter_gold_decisions": str(raw_prefilter_gold_decisions),
+        "pivots_prefilter_kept_total": int(pivots_prefilter_kept_total),
+        "pivots_prefilter_filtered_out_total": int(
+            pivots_prefilter_filtered_out_total
+        ),
         "pivots_evaluated": int(len(pivot_records)),
         "steps_available_total": int(steps_available_total),
         "traceops_eval_mode": eval_mode,
