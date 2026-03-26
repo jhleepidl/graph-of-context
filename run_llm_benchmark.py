@@ -42,7 +42,7 @@ def main():
         default=True,
         help="Always trigger unfold when relocation_* required keys appear in the query.",
     )
-    ap.add_argument("--fork_trigger_mode", type=str, default="evidence_gated", help="evidence_gated|always|debug_once|debug_once_no_merge|commit_only|final_only|pivot_only|pivot_and_final")
+    ap.add_argument("--fork_trigger_mode", type=str, default="evidence_gated", help="evidence_gated|gate_probe|always|debug_once|debug_once_no_merge|commit_only|final_only|pivot_only|pivot_and_final")
     ap.add_argument("--fork_min_step", type=int, default=4)
     ap.add_argument("--fork_every_k_steps", type=int, default=3)
     ap.add_argument("--fork_min_open_pages", type=int, default=2)
@@ -53,6 +53,9 @@ def main():
     ap.add_argument("--fork_weak_merge_max_chars", type=int, default=240)
     ap.add_argument("--fork_debug_force_step", type=int, default=10)
     ap.add_argument("--fork_debug_force_max_calls", type=int, default=1)
+    ap.add_argument("--fork_gate_trace", action="store_true", default=True)
+    ap.add_argument("--no_fork_gate_trace", action="store_false", dest="fork_gate_trace")
+    ap.add_argument("--fork_gate_probe_run_on_ready", action="store_true", default=False)
 
     ap.add_argument("--fork_max_tokens", type=int, default=160)
     ap.add_argument("--fork_k", type=int, default=6)
@@ -122,6 +125,8 @@ def main():
         fork_weak_merge_max_chars=int(args.fork_weak_merge_max_chars),
         fork_debug_force_step=int(args.fork_debug_force_step),
         fork_debug_force_max_calls=int(args.fork_debug_force_max_calls),
+        fork_gate_trace=bool(args.fork_gate_trace),
+        fork_gate_probe_run_on_ready=bool(args.fork_gate_probe_run_on_ready),
         fork_max_tokens=int(args.fork_max_tokens),
         fork_k=int(args.fork_k),
         fork_include_recent_active=bool(args.fork_include_recent_active),

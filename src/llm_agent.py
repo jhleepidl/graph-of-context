@@ -266,6 +266,8 @@ class ToolLoopConfig:
     fork_weak_merge_max_chars: int = 240
     fork_debug_force_step: int = 10
     fork_debug_force_max_calls: int = 1
+    fork_gate_trace: bool = True
+    fork_gate_probe_run_on_ready: bool = False
 
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
@@ -1147,7 +1149,7 @@ class ToolLoopLLMAgent:
         text = str(current_user_prompt or "")
         is_commit = ('/ COMMIT' in text) or ('[FOLLOW-UP 1' in text)
         is_final = ('/ FINAL' in text) or ('[FOLLOW-UP 2' in text)
-        if mode in {'always', 'evidence_gated', 'debug_once', 'debug_once_no_merge'}:
+        if mode in {'always', 'evidence_gated', 'debug_once', 'debug_once_no_merge', 'gate_probe'}:
             return True
         if mode == 'commit_only':
             return is_commit
@@ -1157,12 +1159,38 @@ class ToolLoopLLMAgent:
             return is_commit or is_final
         return False
 
+    def _record_fork_gate_event(self, *, step: int, mode: str, ready: bool, reason: str, active_tok: int = 0) -> None:
+        try:
+            self.counters["fork_gate_checks"] += 1
+            if ready:
+                self.counters["fork_gate_ready"] += 1
+            else:
+                self.counters["fork_gate_blocked"] += 1
+            key = f"fork_gate_reason__{str(reason or 'unknown')}"
+            self.counters[key] += 1
+            if bool(getattr(self.cfg, 'fork_gate_trace', True)):
+                self._trace({
+                    'type': 'fork_gate',
+                    'step': int(step),
+                    'mode': str(mode),
+                    'ready': bool(ready),
+                    'reason': str(reason),
+                    'search_calls': int(self.counters.get('search_calls', 0) or 0),
+                    'open_page_calls': int(self.counters.get('open_page_calls', 0) or 0),
+                    'active_tokens_est': int(active_tok or 0),
+                    'fork_calls_so_far': int(self.counters.get('fork_calls', 0) or 0),
+                })
+        except Exception:
+            pass
+
     def _fork_ready_for_single_stage(self, *, step: int) -> Tuple[bool, str]:
         """Trigger policy for single-stage end-to-end tasks.
 
         - evidence_gated / always: require enough grounded evidence before fork
         - debug_once: force exactly one fork at or after a chosen step, bypassing
           evidence thresholds so we can verify plumbing end-to-end.
+        - gate_probe: evaluate the evidence gate and trace reasons, but do not
+          execute a fork unless explicitly enabled via fork_gate_probe_run_on_ready.
         """
         mode = str(getattr(self.cfg, "fork_trigger_mode", "pivot_and_final") or "pivot_and_final").lower()
         if mode in {'debug_once', 'debug_once_no_merge'}:
@@ -1173,10 +1201,14 @@ class ToolLoopLLMAgent:
                 force_step, max_calls = 10, 1
             used = int(self.counters.get('fork_debug_force_calls', 0) or 0)
             if used >= max_calls:
+                self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='debug_once_exhausted', active_tok=0)
                 return False, 'debug_once_exhausted'
             if int(step) < force_step:
+                self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='debug_wait_step', active_tok=0)
                 return False, 'debug_wait_step'
+            self._record_fork_gate_event(step=step, mode=mode, ready=True, reason='debug_force', active_tok=0)
             return True, 'debug_force'
+
         try:
             min_step = int(getattr(self.cfg, "fork_min_step", 4) or 4)
             every_k = int(getattr(self.cfg, "fork_every_k_steps", 3) or 3)
@@ -1186,21 +1218,33 @@ class ToolLoopLLMAgent:
         except Exception:
             min_step, every_k, min_open, min_search, min_active = 4, 3, 2, 1, 500
 
-        if int(step) < min_step:
-            return False, 'step_lt_min'
-        if every_k > 1 and (int(step) % every_k) != 0:
-            return False, 'not_sampling_step'
-        if int(self.counters.get('open_page_calls', 0) or 0) < min_open:
-            return False, 'open_lt_min'
-        if int(self.counters.get('search_calls', 0) or 0) < min_search:
-            return False, 'search_lt_min'
         try:
             active_text = str(self.mem.get_active_text() if hasattr(self.mem, 'get_active_text') else '')
             active_tok = int(approx_token_count(active_text)) if active_text else 0
         except Exception:
             active_tok = 0
+
+        if int(step) < min_step:
+            self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='step_lt_min', active_tok=active_tok)
+            return False, 'step_lt_min'
+        if every_k > 1 and (int(step) % every_k) != 0:
+            self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='not_sampling_step', active_tok=active_tok)
+            return False, 'not_sampling_step'
+        if int(self.counters.get('open_page_calls', 0) or 0) < min_open:
+            self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='open_lt_min', active_tok=active_tok)
+            return False, 'open_lt_min'
+        if int(self.counters.get('search_calls', 0) or 0) < min_search:
+            self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='search_lt_min', active_tok=active_tok)
+            return False, 'search_lt_min'
         if active_tok < min_active:
+            self._record_fork_gate_event(step=step, mode=mode, ready=False, reason='active_lt_min', active_tok=active_tok)
             return False, 'active_lt_min'
+
+        if mode == 'gate_probe' and not bool(getattr(self.cfg, 'fork_gate_probe_run_on_ready', False)):
+            self._record_fork_gate_event(step=step, mode=mode, ready=True, reason='probe_ready_no_run', active_tok=active_tok)
+            return False, 'probe_ready_no_run'
+
+        self._record_fork_gate_event(step=step, mode=mode, ready=True, reason='ok', active_tok=active_tok)
         return True, 'ok'
 
     def _build_fork_query(
@@ -3029,7 +3073,7 @@ class ToolLoopLLMAgent:
                         (not fork_ran_this_step)
                         and str(method or '').lower().startswith('goc')
                         and bool(getattr(self.cfg, 'enable_scoped_fork', False))
-                        and str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower() in {'always', 'evidence_gated', 'debug_once'}
+                        and str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower() in {'always', 'evidence_gated', 'debug_once', 'debug_once_no_merge', 'gate_probe'}
                     ):
                         _ok, _why = self._fork_ready_for_single_stage(step=step)
                         if _ok:
@@ -3038,7 +3082,15 @@ class ToolLoopLLMAgent:
                                 commit_titles=getattr(self, '_committed_supporting_titles', None),
                                 q1_text=getattr(self, '_q1_text', None),
                             )
-                            _fork_reason = 'debug_once' if str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower() == 'debug_once' else 'always_step'
+                            _mode_now = str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower()
+                            if _mode_now == 'debug_once_no_merge':
+                                _fork_reason = 'debug_once_no_merge'
+                            elif _mode_now == 'debug_once':
+                                _fork_reason = 'debug_once'
+                            elif _mode_now == 'gate_probe':
+                                _fork_reason = 'gate_probe'
+                            else:
+                                _fork_reason = 'always_step'
                             _fork_node = self._run_scoped_fork(
                                 query=fq,
                                 reason=_fork_reason,
@@ -4919,6 +4971,14 @@ class ToolLoopLLMAgent:
                             "fork_tokens": int(self.counters.get("fork_tokens", 0)),
                             "fork_empty_view": int(self.counters.get("fork_empty_view", 0)),
                             "fork_errors": int(self.counters.get("fork_errors", 0)),
+                            "fork_gate_checks": int(self.counters.get("fork_gate_checks", 0)),
+                            "fork_gate_ready": int(self.counters.get("fork_gate_ready", 0)),
+                            "fork_gate_blocked": int(self.counters.get("fork_gate_blocked", 0)),
+                            "fork_gate_reason_counts": {
+                                str(k).replace("fork_gate_reason__", ""): int(v)
+                                for k, v in self.counters.items()
+                                if str(k).startswith("fork_gate_reason__")
+                            },
 
                         }
                     }
