@@ -140,6 +140,13 @@ class RunEntry:
     goc_smart_cap_update: int
     goc_smart_cap_exception: int
     goc_smart_cap_evidence: int
+    fork_enabled: bool
+    fork_scope_mode: str
+    fork_max_tokens: int
+    fork_k: int
+    fork_include_recent_active: bool
+    fork_recent_active_n: int
+    fork_trigger_mode: str
     report_json: str
     compare_root: str
 
@@ -242,6 +249,14 @@ def main() -> None:
     ap.add_argument("--goc_smart_cap_update", type=int, default=4)
     ap.add_argument("--goc_smart_cap_exception", type=int, default=2)
     ap.add_argument("--goc_smart_cap_evidence", type=int, default=2)
+    ap.add_argument("--include_fork_variants", action="store_true", default=False)
+    ap.add_argument("--fork_scope_modes", type=str, default="dep_scoped,sim_scoped,full_active")
+    ap.add_argument("--fork_max_tokens_list", type=str, default="160")
+    ap.add_argument("--fork_k", type=int, default=6)
+    ap.add_argument("--fork_include_recent_active", action="store_true", default=True)
+    ap.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
+    ap.add_argument("--fork_recent_active_n", type=int, default=4)
+    ap.add_argument("--fork_trigger_mode", choices=["pivot_only", "commit_only", "final_only", "pivot_and_final"], default="pivot_only")
     ap.add_argument("--include_smart_controls", action="store_true", default=False)
     ap.add_argument("--include_novelty_ablations", action="store_true", default=False)
     ap.add_argument("--include_ablations", action="store_true")
@@ -646,6 +661,13 @@ def main() -> None:
                     goc_smart_cap_update=int(args.goc_smart_cap_update),
                     goc_smart_cap_exception=int(args.goc_smart_cap_exception),
                     goc_smart_cap_evidence=int(args.goc_smart_cap_evidence),
+                    fork_enabled=False,
+                    fork_scope_mode="",
+                    fork_max_tokens=0,
+                    fork_k=0,
+                    fork_include_recent_active=False,
+                    fork_recent_active_n=0,
+                    fork_trigger_mode="",
                     report_json=str(rep_base.relative_to(phase_root)),
                     compare_root=str(out_base.relative_to(phase_root)),
                 )
@@ -674,6 +696,7 @@ def main() -> None:
             smart_cap_exception: int,
             smart_cap_evidence: int,
             depwalk_mode: str = "depends_on",
+            fork_budget: int = 0,
         ) -> None:
             out_dir = runs_root / scenario / variant
             _ensure_dir(out_dir)
@@ -730,6 +753,20 @@ def main() -> None:
                 cmd += ["--goc_depwalk_mode", str(depwalk_mode)]
             if smart_enable:
                 cmd += ["--goc_smart_context_enable"]
+            if str(method_name).startswith("goc_fork_"):
+                scope_mode = "dep_scoped"
+                if method_name == "goc_fork_sim":
+                    scope_mode = "sim_scoped"
+                elif method_name == "goc_fork_full":
+                    scope_mode = "full_active"
+                cmd += [
+                    "--enable_scoped_fork",
+                    "--fork_scope_mode", str(scope_mode),
+                    "--fork_max_tokens", str(int(fork_budget) if int(fork_budget) > 0 else 160),
+                    "--fork_k", str(int(args.fork_k)),
+                    "--fork_recent_active_n", str(int(args.fork_recent_active_n)),
+                    "--fork_trigger_mode", str(args.fork_trigger_mode),
+                ]
             _run(cmd, cwd=repo_root, env=env)
             rep = _discover_report_json(out_dir)
             if not rep:
@@ -794,6 +831,13 @@ def main() -> None:
                         goc_smart_cap_update=int(smart_cap_update),
                         goc_smart_cap_exception=int(smart_cap_exception),
                         goc_smart_cap_evidence=int(smart_cap_evidence),
+                        fork_enabled=str(method_name).startswith("goc_fork_"),
+                        fork_scope_mode=("dep_scoped" if method_name == "goc_fork_dep" else "sim_scoped" if method_name == "goc_fork_sim" else "full_active" if method_name == "goc_fork_full" else ""),
+                        fork_max_tokens=(int(fork_budget) if int(fork_budget) > 0 else 0),
+                        fork_k=(int(args.fork_k) if str(method_name).startswith("goc_fork_") else 0),
+                        fork_include_recent_active=(bool(args.fork_include_recent_active) if str(method_name).startswith("goc_fork_") else False),
+                        fork_recent_active_n=(int(args.fork_recent_active_n) if str(method_name).startswith("goc_fork_") else 0),
+                        fork_trigger_mode=(str(args.fork_trigger_mode) if str(method_name).startswith("goc_fork_") else ""),
                         report_json=str(rep.relative_to(phase_root)),
                         compare_root=str(out_dir.relative_to(phase_root)),
                     )
@@ -974,6 +1018,40 @@ def main() -> None:
                 smart_cap_exception=int(args.goc_smart_cap_exception),
                 smart_cap_evidence=int(args.goc_smart_cap_evidence),
             )
+
+        if bool(args.include_fork_variants):
+            fork_modes = [s.strip() for s in str(args.fork_scope_modes or '').split(',') if s.strip()]
+            fork_budgets = [int(x.strip()) for x in str(args.fork_max_tokens_list or '160').split(',') if x.strip()]
+            for fork_mode in fork_modes:
+                for fork_budget in fork_budgets:
+                    method_name = 'goc_fork_dep'
+                    if fork_mode == 'sim_scoped':
+                        method_name = 'goc_fork_sim'
+                    elif fork_mode == 'full_active':
+                        method_name = 'goc_fork_full'
+                    _run_goc_variant(
+                        f"{method_name}_b{int(fork_budget)}",
+                        method_name=method_name,
+                        seed_enable=True,
+                        seed_topk=8,
+                        closure_enable=False,
+                        closure_topk=12,
+                        closure_hops=1,
+                        closure_universe='candidates',
+                        unfold_max_nodes=999,
+                        unfold_hops=1,
+                        depwalk_enable=True,
+                        depwalk_hops=int(args.goc_depwalk_hops),
+                        depwalk_topk_per_hop=int(args.goc_depwalk_topk_per_hop),
+                        smart_enable=True,
+                        smart_cap_option=int(args.goc_smart_cap_option),
+                        smart_cap_assumption=int(args.goc_smart_cap_assumption),
+                        smart_cap_update=int(args.goc_smart_cap_update),
+                        smart_cap_exception=int(args.goc_smart_cap_exception),
+                        smart_cap_evidence=int(args.goc_smart_cap_evidence),
+                        fork_budget=int(fork_budget),
+                    )
+
 
     (phase_root / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

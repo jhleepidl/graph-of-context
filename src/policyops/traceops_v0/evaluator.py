@@ -1096,7 +1096,7 @@ def _choose_traceops_context(
             if len(keep) >= 6:
                 break
         context_ids = list(reversed(keep))
-    elif method in {"goc", "goc_oracle", "goc_force_required"}:
+    elif method in {"goc", "goc_oracle", "goc_force_required", "goc_fork_dep", "goc_fork_sim", "goc_fork_full"}:
         use_avoids = bool(_arg_get(args, "goc_enable_avoids", True))
         candidates = [cid for cid in ordered_history if (cid not in avoid_set or not use_avoids)]
         if not candidates:
@@ -1688,6 +1688,113 @@ def _choose_traceops_context(
         else:
             context_ids = _unique_strs(context_ids)
 
+        if str(method) in {"goc_fork_dep", "goc_fork_sim", "goc_fork_full"}:
+            base_context_ids = list(_unique_strs(context_ids))
+            scope_mode = str(method).replace("goc_fork_", "")
+            query_tokens = _tokenize(step.message)
+            recent_n = max(0, int(_arg_get(args, "fork_recent_active_n", 4) or 4))
+            include_recent = bool(_arg_get(args, "fork_include_recent_active", True))
+            fork_k = max(1, int(_arg_get(args, "fork_k", 6) or 6))
+            budget = max(1, int(_arg_get(args, "fork_max_tokens", 160) or 160))
+
+            def _cost(cid: str) -> int:
+                clause = clauses.get(cid)
+                return max(1, len(_tokenize(clause.text)) if clause is not None else 1)
+
+            def _serialize_budget(ids: Sequence[str]) -> List[str]:
+                kept: List[str] = []
+                used = 0
+                for cid in _unique_strs(ids):
+                    add = _cost(cid)
+                    if kept and used + add > budget:
+                        continue
+                    kept.append(cid)
+                    used += add
+                return kept
+
+            allowed_pool = set(base_context_ids) | set(_unique_strs(step.pivot_required_ids or [])) | set(_unique_strs((step.gold.evidence_ids if step.gold else []) or []))
+            ordered_base = [cid for cid in ordered_history if cid in allowed_pool]
+            if scope_mode == "full":
+                scoped_ids = list(ordered_base)
+            elif scope_mode == "sim":
+                scored: List[tuple[int, int, str]] = []
+                for idx, cid in enumerate(ordered_base):
+                    clause = clauses.get(cid)
+                    if clause is None:
+                        continue
+                    score = len(query_tokens & _tokenize(clause.text))
+                    scored.append((score, -idx, cid))
+                scored.sort(reverse=True)
+                selected = [cid for _, _, cid in scored[:fork_k]]
+                if include_recent and recent_n > 0:
+                    selected.extend(ordered_base[-recent_n:])
+                scoped_ids = [cid for cid in ordered_base if cid in set(selected)]
+            else:
+                step_meta = step.metadata if isinstance(step.metadata, dict) else {}
+                pivot_required = _unique_strs(step.pivot_required_ids or [])
+                checkpoint_ids = _unique_strs(step_meta.get("trap_decision_checkpoint_ids") or [])
+                seed_pool = _unique_strs(pivot_required + checkpoint_ids)
+                seed_pool = [cid for cid in seed_pool if cid in allowed_pool]
+                if not seed_pool:
+                    scored: List[tuple[int, int, str]] = []
+                    for idx, cid in enumerate(ordered_base):
+                        clause = clauses.get(cid)
+                        if clause is None:
+                            continue
+                        score = len(query_tokens & _tokenize(clause.text))
+                        scored.append((score, -idx, cid))
+                    scored.sort(reverse=True)
+                    seed_pool = [cid for _, _, cid in scored[:fork_k]]
+                closure: set[str] = set()
+                frontier = list(seed_pool)
+                hops = max(1, int(_arg_get(args, "fork_dependency_hops", 2) or 2))
+                for _ in range(hops + 1):
+                    if not frontier:
+                        break
+                    nxt: List[str] = []
+                    for cid in frontier:
+                        if cid in closure or cid not in allowed_pool:
+                            continue
+                        closure.add(cid)
+                        clause = clauses.get(cid)
+                        if clause is None:
+                            continue
+                        for dep in _unique_strs(getattr(clause, 'depends_on', []) or []):
+                            if dep in allowed_pool and dep not in closure:
+                                nxt.append(dep)
+                        for cand in ordered_base:
+                            if cand in closure:
+                                continue
+                            cand_clause = clauses.get(cand)
+                            if cand_clause is None:
+                                continue
+                            if cid in _unique_strs(getattr(cand_clause, 'depends_on', []) or []):
+                                nxt.append(cand)
+                    frontier = nxt
+                selected = list(closure)
+                if include_recent and recent_n > 0:
+                    selected.extend(ordered_base[-recent_n:])
+                scoped_ids = [cid for cid in ordered_base if cid in set(selected)]
+            context_ids = _serialize_budget(scoped_ids)
+            gold_support_ids = set(_unique_strs(list(step.pivot_required_ids or []) + list((step.gold.evidence_ids if step.gold else []) or [])))
+            fork_set = set(context_ids)
+            if gold_support_ids:
+                fork_support_coverage = float(len(fork_set & gold_support_ids)) / float(len(gold_support_ids))
+            else:
+                fork_support_coverage = float('nan')
+            if fork_set:
+                fork_scope_leakage = 1.0 - (float(len(fork_set & gold_support_ids)) / float(len(fork_set)))
+            else:
+                fork_scope_leakage = float('nan')
+            fork_debug = {
+                "fork_enabled": True,
+                "fork_scope_mode": scope_mode,
+                "fork_context_count": int(len(context_ids)),
+                "fork_support_coverage": fork_support_coverage,
+                "fork_scope_leakage": fork_scope_leakage,
+                "fork_base_context_count": int(len(base_context_ids)),
+                "fork_budget_tokens": int(budget),
+            }
         debug = {
             "goc_anchor_ids": list(anchor_ids),
             "goc_applicability_seed_ids": list(seed_ids),
@@ -1749,6 +1856,10 @@ def _choose_traceops_context(
     else:
         context_ids = list(ordered_history)
 
+    try:
+        debug.update(locals().get("fork_debug", {}))
+    except Exception:
+        pass
     return _unique_strs(context_ids), debug
 
 
@@ -2411,6 +2522,13 @@ def evaluate_traceops_method(
                     debug.get("goc_update_keys_missing_after_smart") or []
                 ),
                 "e3_context_clause_ids": list(context_ids),
+                "fork_enabled": bool(debug.get("fork_enabled", False)),
+                "fork_scope_mode": str(debug.get("fork_scope_mode", "") or ""),
+                "fork_context_count": int(debug.get("fork_context_count", 0) or 0),
+                "fork_base_context_count": int(debug.get("fork_base_context_count", 0) or 0),
+                "fork_support_coverage": (float(debug.get("fork_support_coverage")) if isinstance(debug.get("fork_support_coverage"), (int, float)) else float("nan")),
+                "fork_scope_leakage": (float(debug.get("fork_scope_leakage")) if isinstance(debug.get("fork_scope_leakage"), (int, float)) else float("nan")),
+                "fork_budget_tokens": int(debug.get("fork_budget_tokens", 0) or 0),
                 "noop_update_in_context_count": int(noop_update_in_context_count),
                 "noop_update_in_context": bool(noop_update_in_context_count > 0),
                 "goc_exception_injected_ids": list(exception_injected_ids),

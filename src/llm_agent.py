@@ -238,6 +238,35 @@ class ToolLoopConfig:
     goc_tracefirst_max_notes: int = 3
     goc_tracefirst_note_max_chars: int = 180
 
+    # Scoped fork: temporary least-privilege view for a specialist sub-agent.
+    enable_scoped_fork: bool = False
+    fork_trigger_mode: str = "pivot_and_final"
+    fork_scope_mode: str = "dep_scoped"
+    fork_max_tokens: int = 160
+    fork_k: int = 6
+    fork_include_recent_active: bool = True
+    fork_recent_active_n: int = 4
+    fork_allow_kinds: Optional[Tuple[str, ...]] = None
+    fork_deny_kinds: Tuple[str, ...] = ("tool",)
+    fork_result_kind: str = "summary"
+    fork_trace_scoped_text_chars: int = 1200
+    # For single-stage end-to-end benchmarks, an always-on fork is too aggressive.
+    # These guards delay fork until enough grounded evidence exists and throttle frequency.
+    fork_min_step: int = 4
+    fork_every_k_steps: int = 3
+    fork_min_open_pages: int = 2
+    fork_min_search_calls: int = 1
+    fork_min_active_tokens: int = 500
+    fork_merge_min_confidence: float = 0.67
+    # Merge policy for fork artifacts.
+    #   - full: merge the full specialist artifact back into GoC.
+    #   - weak: merge only a shortened support summary.
+    #   - no_merge: execute the fork path but do not rejoin into active context.
+    fork_merge_policy: str = "full"
+    fork_weak_merge_max_chars: int = 240
+    fork_debug_force_step: int = 10
+    fork_debug_force_max_calls: int = 1
+
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
     log_dir: Optional[str] = None         # if set, write per-task JSONL trace logs
@@ -1110,6 +1139,269 @@ class ToolLoopLLMAgent:
             return [], True, raw
 
         return picked, False, raw
+
+    def _should_run_scoped_fork(self, current_user_prompt: str) -> bool:
+        if not bool(getattr(self.cfg, "enable_scoped_fork", False)):
+            return False
+        mode = str(getattr(self.cfg, "fork_trigger_mode", "pivot_and_final") or "pivot_and_final").lower()
+        text = str(current_user_prompt or "")
+        is_commit = ('/ COMMIT' in text) or ('[FOLLOW-UP 1' in text)
+        is_final = ('/ FINAL' in text) or ('[FOLLOW-UP 2' in text)
+        if mode in {'always', 'evidence_gated', 'debug_once', 'debug_once_no_merge'}:
+            return True
+        if mode == 'commit_only':
+            return is_commit
+        if mode == 'final_only':
+            return is_final
+        if mode in {'pivot_only', 'pivot_and_final'}:
+            return is_commit or is_final
+        return False
+
+    def _fork_ready_for_single_stage(self, *, step: int) -> Tuple[bool, str]:
+        """Trigger policy for single-stage end-to-end tasks.
+
+        - evidence_gated / always: require enough grounded evidence before fork
+        - debug_once: force exactly one fork at or after a chosen step, bypassing
+          evidence thresholds so we can verify plumbing end-to-end.
+        """
+        mode = str(getattr(self.cfg, "fork_trigger_mode", "pivot_and_final") or "pivot_and_final").lower()
+        if mode in {'debug_once', 'debug_once_no_merge'}:
+            try:
+                force_step = int(getattr(self.cfg, 'fork_debug_force_step', 10) or 10)
+                max_calls = int(getattr(self.cfg, 'fork_debug_force_max_calls', 1) or 1)
+            except Exception:
+                force_step, max_calls = 10, 1
+            used = int(self.counters.get('fork_debug_force_calls', 0) or 0)
+            if used >= max_calls:
+                return False, 'debug_once_exhausted'
+            if int(step) < force_step:
+                return False, 'debug_wait_step'
+            return True, 'debug_force'
+        try:
+            min_step = int(getattr(self.cfg, "fork_min_step", 4) or 4)
+            every_k = int(getattr(self.cfg, "fork_every_k_steps", 3) or 3)
+            min_open = int(getattr(self.cfg, "fork_min_open_pages", 2) or 2)
+            min_search = int(getattr(self.cfg, "fork_min_search_calls", 1) or 1)
+            min_active = int(getattr(self.cfg, "fork_min_active_tokens", 500) or 500)
+        except Exception:
+            min_step, every_k, min_open, min_search, min_active = 4, 3, 2, 1, 500
+
+        if int(step) < min_step:
+            return False, 'step_lt_min'
+        if every_k > 1 and (int(step) % every_k) != 0:
+            return False, 'not_sampling_step'
+        if int(self.counters.get('open_page_calls', 0) or 0) < min_open:
+            return False, 'open_lt_min'
+        if int(self.counters.get('search_calls', 0) or 0) < min_search:
+            return False, 'search_lt_min'
+        try:
+            active_text = str(self.mem.get_active_text() if hasattr(self.mem, 'get_active_text') else '')
+            active_tok = int(approx_token_count(active_text)) if active_text else 0
+        except Exception:
+            active_tok = 0
+        if active_tok < min_active:
+            return False, 'active_lt_min'
+        return True, 'ok'
+
+    def _build_fork_query(
+        self,
+        *,
+        current_user_prompt: str,
+        commit_titles: Optional[List[str]] = None,
+        q1_text: Optional[str] = None,
+    ) -> str:
+        parts: List[str] = []
+        q1 = str(q1_text or '').strip()
+        if q1:
+            parts.append(q1)
+        if commit_titles:
+            parts.append(' '.join([str(x) for x in commit_titles[:8] if str(x).strip()]))
+        cur = str(current_user_prompt or '').strip()
+        if cur:
+            parts.append(cur)
+        parts.append('Return only support-complete evidence for the current pivot decision.')
+        return ' | '.join([p for p in parts if p])
+
+    def _run_scoped_fork(
+        self,
+        *,
+        query: str,
+        reason: str,
+        step: int,
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> Optional[str]:
+        if not str(method or '').lower().startswith('goc'):
+            return None
+        if not hasattr(self.mem, 'build_fork_view') or not hasattr(self.mem, 'record_fork_result'):
+            return None
+
+        scope_mode = str(getattr(self.cfg, 'fork_scope_mode', 'dep_scoped') or 'dep_scoped').lower()
+        if scope_mode == 'full_active':
+            active_ids = list(getattr(self.mem, 'active', []) or [])
+            scoped_text, kept_ids, used_tokens = self.mem.serialize_node_ids(  # type: ignore[attr-defined]
+                active_ids,
+                max_tokens=int(getattr(self.cfg, 'fork_max_tokens', 160) or 160),
+            )
+            from .memory import ForkView  # local import to avoid cycles in type checking
+            fork = ForkView(
+                fork_id=f'FK_manual_{step}',
+                query=query,
+                seed_ids=[],
+                node_ids=list(kept_ids),
+                scoped_text=scoped_text,
+                token_count=int(used_tokens),
+            )
+        else:
+            old_recent = getattr(self.mem, 'fork_keep_recent_active', None)
+            try:
+                setattr(self.mem, 'fork_keep_recent_active', int(getattr(self.cfg, 'fork_recent_active_n', 4) or 4))
+            except Exception:
+                old_recent = None
+            try:
+                fork = self.mem.build_fork_view(  # type: ignore[attr-defined]
+                    query=query,
+                    k=int(getattr(self.cfg, 'fork_k', 6) or 6),
+                    max_tokens=int(getattr(self.cfg, 'fork_max_tokens', 160) or 160),
+                    include_recent_active=bool(getattr(self.cfg, 'fork_include_recent_active', True)),
+                    allow_kinds=getattr(self.cfg, 'fork_allow_kinds', None),
+                    deny_kinds=getattr(self.cfg, 'fork_deny_kinds', ('tool',)),
+                    scope_mode=scope_mode,
+                )
+            finally:
+                if old_recent is not None:
+                    try:
+                        setattr(self.mem, 'fork_keep_recent_active', old_recent)
+                    except Exception:
+                        pass
+
+        if not str(getattr(fork, 'scoped_text', '') or '').strip():
+            self.counters['fork_empty_view'] += 1
+            return None
+
+        specialist_messages = [
+            {
+                'role': 'system',
+                'content': (
+                    'You are a specialist reviewer. Use only the provided scoped context. '
+                    'Do not assume access to hidden context. Return a concise support-focused note '
+                    'for the current pivot decision as JSON.'
+                ),
+            },
+            {
+                'role': 'user',
+                'content': (
+                    f'[Scoped Fork Context]\n{fork.scoped_text}\n\n'
+                    f'[Current Objective]\n{query}\n\n'
+                    'Return JSON with keys: status, support_summary, decision_hint, critical_items, confidence. Use status=ready only when the available scoped context is sufficient; otherwise use status=need_more_evidence. Keep support_summary concise and evidence-grounded.'
+                ),
+            },
+        ]
+
+        try:
+            resp = self.llm.generate(messages=specialist_messages, tools=None)
+            raw_text = str(getattr(resp, 'text', '') or '').strip()
+        except Exception:
+            self.counters['fork_errors'] += 1
+            return None
+        if not raw_text:
+            self.counters['fork_errors'] += 1
+            return None
+
+        # Guard against low-evidence fork summaries dominating the main agent.
+        try:
+            raw_obj = raw_text
+            if raw_obj.startswith('```'):
+                raw_obj = raw_obj.strip('`')
+                if raw_obj.lower().startswith('json'):
+                    raw_obj = raw_obj[4:].strip()
+            parsed = json.loads(raw_obj)
+        except Exception:
+            parsed = None
+
+        mode = str(getattr(self.cfg, 'fork_trigger_mode', 'pivot_and_final') or 'pivot_and_final').lower()
+        merge_policy = str(getattr(self.cfg, 'fork_merge_policy', 'full') or 'full').lower()
+        if mode == 'debug_once_no_merge':
+            merge_policy = 'no_merge'
+
+        status = ''
+        conf = 0.0
+        if isinstance(parsed, dict):
+            status = str(parsed.get('status', '') or '').strip().lower()
+            try:
+                conf = float(parsed.get('confidence', 0.0) or 0.0)
+            except Exception:
+                conf = 0.0
+            min_conf = float(getattr(self.cfg, 'fork_merge_min_confidence', 0.67) or 0.67)
+            if mode not in {'debug_once', 'debug_once_no_merge'}:
+                if status and status != 'ready':
+                    self.counters['fork_deferred'] += 1
+                    return None
+                if conf < min_conf:
+                    self.counters['fork_deferred'] += 1
+                    return None
+
+        result_node: Optional[str] = None
+        merge_payload = raw_text
+        if merge_policy == 'weak' and isinstance(parsed, dict):
+            weak_chars = int(getattr(self.cfg, 'fork_weak_merge_max_chars', 240) or 240)
+            support_summary = str(parsed.get('support_summary', '') or '').strip()[:weak_chars]
+            critical_items = parsed.get('critical_items', [])
+            if not isinstance(critical_items, list):
+                critical_items = []
+            merge_obj = {
+                'status': status or 'ready',
+                'support_summary': support_summary,
+                'critical_items': [str(x)[:80] for x in critical_items[:3]],
+                'confidence': conf,
+                'merge_policy': 'weak',
+            }
+            merge_payload = json.dumps(merge_obj, ensure_ascii=False)
+
+        if merge_policy == 'no_merge':
+            self.counters['fork_no_merge_calls'] += 1
+        else:
+            try:
+                result_node = self.mem.record_fork_result(  # type: ignore[attr-defined]
+                    fork,
+                    merge_payload,
+                    kind=str(getattr(self.cfg, 'fork_result_kind', 'summary') or 'summary'),
+                )
+            except Exception:
+                self.counters['fork_errors'] += 1
+                return None
+
+        self.counters['fork_calls'] += 1
+        self.counters['fork_tokens'] += int(getattr(fork, 'token_count', 0) or 0)
+        if reason == 'stage_commit':
+            self.counters['fork_commit_calls'] += 1
+        if reason == 'stage_final':
+            self.counters['fork_final_calls'] += 1
+        if reason in {'debug_once', 'debug_once_no_merge'}:
+            self.counters['fork_debug_force_calls'] += 1
+
+        self._trace({
+            'type': 'scoped_fork',
+            'task_id': task_id,
+            'method': method,
+            'run_tag': run_tag,
+            'step': step,
+            'reason': reason,
+            'query': query,
+            'fork_id': str(getattr(fork, 'fork_id', '')),
+            'scope_mode': scope_mode,
+            'merge_policy': merge_policy,
+            'fork_status': status,
+            'fork_confidence': conf,
+            'fork_token_count': int(getattr(fork, 'token_count', 0) or 0),
+            'fork_node_count': int(len(getattr(fork, 'node_ids', []) or [])),
+            'fork_seed_ids': list(getattr(fork, 'seed_ids', []) or [])[:20],
+            'fork_node_ids': list(getattr(fork, 'node_ids', []) or [])[:40],
+            'fork_scoped_text_preview': str(getattr(fork, 'scoped_text', '') or '')[: int(getattr(self.cfg, 'fork_trace_scoped_text_chars', 1200) or 1200)],
+            'result_node': result_node,
+        })
+        return result_node
 
     def _run_unfold(
         self,
@@ -2475,6 +2767,7 @@ class ToolLoopLLMAgent:
         try:
             for step in range(self.cfg.max_steps):
                 last_step_snapshot = int(step) + 1
+                fork_ran_this_step = False
                 self._write_internal_graph_snapshot(
                     task_id=task_id,
                     method=method,
@@ -2564,6 +2857,23 @@ class ToolLoopLLMAgent:
                                     'k': int(self.cfg.stage_commit_unfold_k),
                                     'have_q': bool(q),
                                 })
+                                if self._should_run_scoped_fork(current_user_prompt):
+                                    fq = self._build_fork_query(
+                                        current_user_prompt=current_user_prompt,
+                                        commit_titles=self._committed_supporting_titles,
+                                        q1_text=self._q1_text,
+                                    )
+                                    _fork_node = self._run_scoped_fork(
+                                        query=fq,
+                                        reason='stage_commit',
+                                        step=step,
+                                        task_id=task_id,
+                                        method=method,
+                                        run_tag=run_tag,
+                                    )
+                                    if _fork_node is not None:
+                                        fork_ran_this_step = True
+                                    self._trace({'type':'stage_commit_fork','task_id':task_id,'method':method,'run_tag':run_tag,'step':step,'commit_idx':ci,'query':fq,'result_node':_fork_node})
                 except Exception:
                     self.counters['stage_commit_unfold_errors'] += 1
 
@@ -2602,6 +2912,23 @@ class ToolLoopLLMAgent:
                         query = " | ".join([p for p in q_parts if p])
                         if query:
                             self._run_unfold(query, k=int(self.cfg.stage_final_unfold_k), reason='stage_final', step=step, task_id=task_id, method=method, run_tag=run_tag)
+                            if self._should_run_scoped_fork(current_user_prompt):
+                                fq = self._build_fork_query(
+                                    current_user_prompt=current_user_prompt,
+                                    commit_titles=titles,
+                                    q1_text=self._q1_text,
+                                )
+                                _fork_node = self._run_scoped_fork(
+                                    query=fq,
+                                    reason='stage_final',
+                                    step=step,
+                                    task_id=task_id,
+                                    method=method,
+                                    run_tag=run_tag,
+                                )
+                                if _fork_node is not None:
+                                    fork_ran_this_step = True
+                                self._trace({'type':'stage_final_fork','task_id':task_id,'method':method,'run_tag':run_tag,'step':step,'query':fq,'result_node':_fork_node})
                             self._stage_final_unfold_done = True
                             self.counters["stage_final_unfold_calls"] += 1
                             self._trace({
@@ -2692,6 +3019,53 @@ class ToolLoopLLMAgent:
                             "activated_count": int(len(activated_ids)),
                             "activated": (activated_ids or [])[:20],
                         })
+
+                # Generic scoped-fork trigger for single-stage benchmarks (e.g., BrowseComp-like tasks)
+                # that do not expose explicit /COMMIT or /FINAL prompts. When fork_trigger_mode is "always",
+                # run one scoped fork before prompt construction so the merged fork artifact can influence
+                # the next main-agent step.
+                try:
+                    if (
+                        (not fork_ran_this_step)
+                        and str(method or '').lower().startswith('goc')
+                        and bool(getattr(self.cfg, 'enable_scoped_fork', False))
+                        and str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower() in {'always', 'evidence_gated', 'debug_once'}
+                    ):
+                        _ok, _why = self._fork_ready_for_single_stage(step=step)
+                        if _ok:
+                            fq = self._build_fork_query(
+                                current_user_prompt=current_user_prompt,
+                                commit_titles=getattr(self, '_committed_supporting_titles', None),
+                                q1_text=getattr(self, '_q1_text', None),
+                            )
+                            _fork_reason = 'debug_once' if str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower() == 'debug_once' else 'always_step'
+                            _fork_node = self._run_scoped_fork(
+                                query=fq,
+                                reason=_fork_reason,
+                                step=step,
+                                task_id=task_id,
+                                method=method,
+                                run_tag=run_tag,
+                            )
+                            if _fork_node is not None:
+                                fork_ran_this_step = True
+                                self.counters['fork_always_step_calls'] += 1
+                                ctx = self.mem.get_active_text()
+                        else:
+                            _fork_node = None
+                        self._trace({
+                            'type': 'always_step_fork',
+                            'task_id': task_id,
+                            'method': method,
+                            'run_tag': run_tag,
+                            'step': step,
+                            'query': (fq[:400] if _ok else ''),
+                            'ready': bool(_ok),
+                            'ready_reason': str(_why),
+                            'result_node': _fork_node,
+                        })
+                except Exception:
+                    self.counters['fork_errors'] += 1
 
                 # Candidate commit injection for MERGE/FINAL (fair across methods).
                 try:
@@ -4541,6 +4915,10 @@ class ToolLoopLLMAgent:
                             "prompt_est_total": int(self.counters.get("prompt_est_total", 0)),
                             "prompt_est_active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
                             "prompt_est_active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
+                            "fork_calls": int(self.counters.get("fork_calls", 0)),
+                            "fork_tokens": int(self.counters.get("fork_tokens", 0)),
+                            "fork_empty_view": int(self.counters.get("fork_empty_view", 0)),
+                            "fork_errors": int(self.counters.get("fork_errors", 0)),
 
                         }
                     }

@@ -8778,7 +8778,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument(
         "--method",
-        choices=["topk", "full", "full_history", "goc", "goc_base", "oracle", "engine", "similarity_only", "agent_fold"],
+        choices=["topk", "full", "full_history", "goc", "goc_base", "oracle", "engine", "similarity_only", "agent_fold", "goc_fork_dep", "goc_fork_sim", "goc_fork_full"],
         required=True,
     )
     ev.add_argument("--model", type=str, default="gpt-4.1-mini")
@@ -9021,6 +9021,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="TraceOps debug-only oracle mode: force include required/pivot evidence IDs in GoC context.",
     )
+    ev.add_argument("--enable_scoped_fork", action="store_true", default=False)
+    ev.add_argument("--fork_scope_mode", choices=["dep_scoped", "sim_scoped", "full_active"], default="dep_scoped")
+    ev.add_argument("--fork_max_tokens", type=int, default=160)
+    ev.add_argument("--fork_k", type=int, default=6)
+    ev.add_argument("--fork_include_recent_active", action="store_true", default=True)
+    ev.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
+    ev.add_argument("--fork_recent_active_n", type=int, default=4)
+    ev.add_argument("--fork_trigger_mode", choices=["pivot_only", "commit_only", "final_only", "pivot_and_final"], default="pivot_only")
     ev.set_defaults(func=cmd_eval)
 
     cmp = sub.add_parser("compare", help="Compare methods in one run")
@@ -9381,6 +9389,14 @@ def build_parser() -> argparse.ArgumentParser:
     cmp.add_argument("--goc_smart_cap_update", type=int, default=4)
     cmp.add_argument("--goc_smart_cap_exception", type=int, default=2)
     cmp.add_argument("--goc_smart_cap_evidence", type=int, default=2)
+    cmp.add_argument("--enable_scoped_fork", action="store_true", default=False)
+    cmp.add_argument("--fork_scope_mode", choices=["dep_scoped", "sim_scoped", "full_active"], default="dep_scoped")
+    cmp.add_argument("--fork_max_tokens", type=int, default=160)
+    cmp.add_argument("--fork_k", type=int, default=6)
+    cmp.add_argument("--fork_include_recent_active", action="store_true", default=True)
+    cmp.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
+    cmp.add_argument("--fork_recent_active_n", type=int, default=4)
+    cmp.add_argument("--fork_trigger_mode", choices=["pivot_only", "commit_only", "final_only", "pivot_and_final"], default="pivot_only")
     cmp.add_argument("--traceops_indirection_rate", type=float, default=0.4)
     cmp.add_argument("--traceops_delay_to_relevance", type=int, default=0)
     cmp.add_argument("--traceops_trap_distractor_count", type=int, default=4)

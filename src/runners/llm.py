@@ -103,6 +103,31 @@ def run_llm(
     unfold_trigger_log_missing_limit: int = 12,
     unfold_trigger_always_on_required_keys: bool = True,
 
+    # Scoped fork for end-to-end GoC variants
+    fork_trigger_mode: str = "evidence_gated",
+    # Canonical evidence-gating knobs used by the phase19 CLI/scripts.
+    fork_min_step: int = 4,
+    fork_every_k_steps: int = 3,
+    fork_min_open_pages: int = 2,
+    fork_min_search_calls: int = 1,
+    fork_min_active_tokens: int = 500,
+    fork_merge_min_confidence: float = 0.67,
+    fork_merge_policy: str = "full",
+    fork_weak_merge_max_chars: int = 240,
+    fork_debug_force_step: int = 10,
+    fork_debug_force_max_calls: int = 1,
+    # Back-compat aliases accepted by some earlier patch revisions.
+    fork_min_searches: Optional[int] = None,
+    fork_min_opens: Optional[int] = None,
+    fork_min_active_nodes: Optional[int] = None,
+    fork_ready_confidence: Optional[float] = None,
+    fork_max_tokens: int = 160,
+    fork_k: int = 6,
+    fork_include_recent_active: bool = True,
+    fork_recent_active_n: int = 4,
+    fork_allow_kinds: Optional[List[str]] = None,
+    fork_deny_kinds: Optional[List[str]] = None,
+
     # Optional: override LLM-assisted GoC annotation settings (prompt gating + schema)
     # If None, defaults are used (and per-method overrides like GoC-HybridDep apply).
     goc_annotation_mode: Optional[str] = None,
@@ -260,6 +285,36 @@ def run_llm(
                 trace_unfold_candidates=True,
             ),
         ),
+        "GoC-Fork-Dep": MethodSpec(
+            "GoC-Fork-Dep",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Fork-Sim": MethodSpec(
+            "GoC-Fork-Sim",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Fork-Full": MethodSpec(
+            "GoC-Fork-Full",
+            lambda: GoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
         "SimilarityOnly": MethodSpec(
             "SimilarityOnly",
             lambda: SimilarityOnlyMemory(
@@ -352,6 +407,12 @@ def run_llm(
             )
 
     # Shared bandit controller instance (read-only during evaluation).
+    # Normalize fork gating aliases across patch revisions before task execution.
+    eff_fork_min_open_pages = int(fork_min_open_pages if fork_min_open_pages is not None else (fork_min_opens if fork_min_opens is not None else 2))
+    eff_fork_min_search_calls = int(fork_min_search_calls if fork_min_search_calls is not None else (fork_min_searches if fork_min_searches is not None else 1))
+    eff_fork_min_active_tokens = int(fork_min_active_tokens if fork_min_active_tokens is not None else ((int(fork_min_active_nodes) * 80) if fork_min_active_nodes is not None else 500))
+    eff_fork_merge_min_confidence = float(fork_merge_min_confidence if fork_merge_min_confidence is not None else (fork_ready_confidence if fork_ready_confidence is not None else 0.67))
+
     # Training is typically done offline from traces via scripts/build_bandit_dataset.py
     # and scripts/train_bandit_linucb.py.
     shared_bandit: Optional[BanditUnfoldController] = None
@@ -385,6 +446,78 @@ def run_llm(
             cfg = replace(cfg, goc_annotation_mode="hybrid_depends")
         elif str(ms_name) == "GoC-TraceFirst":
             cfg = replace(cfg, goc_annotation_mode="tracefirst")
+
+        fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
+        fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
+        if str(ms_name) == "GoC-Fork-Dep":
+            cfg = replace(
+                cfg,
+                enable_scoped_fork=True,
+                fork_scope_mode="dep_scoped",
+                fork_trigger_mode=str(fork_trigger_mode),
+                fork_min_step=int(fork_min_step),
+                fork_every_k_steps=int(fork_every_k_steps),
+                fork_min_search_calls=int(eff_fork_min_search_calls),
+                fork_min_open_pages=int(eff_fork_min_open_pages),
+                fork_min_active_tokens=int(eff_fork_min_active_tokens),
+                fork_merge_min_confidence=float(eff_fork_merge_min_confidence),
+                fork_merge_policy=str(fork_merge_policy),
+                fork_weak_merge_max_chars=int(fork_weak_merge_max_chars),
+                fork_debug_force_step=int(fork_debug_force_step),
+                fork_debug_force_max_calls=int(fork_debug_force_max_calls),
+                fork_max_tokens=int(fork_max_tokens),
+                fork_k=int(fork_k),
+                fork_include_recent_active=bool(fork_include_recent_active),
+                fork_recent_active_n=int(fork_recent_active_n),
+                fork_allow_kinds=fork_allow_tuple,
+                fork_deny_kinds=fork_deny_tuple,
+            )
+        elif str(ms_name) == "GoC-Fork-Sim":
+            cfg = replace(
+                cfg,
+                enable_scoped_fork=True,
+                fork_scope_mode="sim_scoped",
+                fork_trigger_mode=str(fork_trigger_mode),
+                fork_min_step=int(fork_min_step),
+                fork_every_k_steps=int(fork_every_k_steps),
+                fork_min_search_calls=int(eff_fork_min_search_calls),
+                fork_min_open_pages=int(eff_fork_min_open_pages),
+                fork_min_active_tokens=int(eff_fork_min_active_tokens),
+                fork_merge_min_confidence=float(eff_fork_merge_min_confidence),
+                fork_merge_policy=str(fork_merge_policy),
+                fork_weak_merge_max_chars=int(fork_weak_merge_max_chars),
+                fork_debug_force_step=int(fork_debug_force_step),
+                fork_debug_force_max_calls=int(fork_debug_force_max_calls),
+                fork_max_tokens=int(fork_max_tokens),
+                fork_k=int(fork_k),
+                fork_include_recent_active=bool(fork_include_recent_active),
+                fork_recent_active_n=int(fork_recent_active_n),
+                fork_allow_kinds=fork_allow_tuple,
+                fork_deny_kinds=fork_deny_tuple,
+            )
+        elif str(ms_name) == "GoC-Fork-Full":
+            cfg = replace(
+                cfg,
+                enable_scoped_fork=True,
+                fork_scope_mode="full_active",
+                fork_trigger_mode=str(fork_trigger_mode),
+                fork_min_step=int(fork_min_step),
+                fork_every_k_steps=int(fork_every_k_steps),
+                fork_min_search_calls=int(eff_fork_min_search_calls),
+                fork_min_open_pages=int(eff_fork_min_open_pages),
+                fork_min_active_tokens=int(eff_fork_min_active_tokens),
+                fork_merge_min_confidence=float(eff_fork_merge_min_confidence),
+                fork_merge_policy=str(fork_merge_policy),
+                fork_weak_merge_max_chars=int(fork_weak_merge_max_chars),
+                fork_debug_force_step=int(fork_debug_force_step),
+                fork_debug_force_max_calls=int(fork_debug_force_max_calls),
+                fork_max_tokens=int(fork_max_tokens),
+                fork_k=int(fork_k),
+                fork_include_recent_active=bool(fork_include_recent_active),
+                fork_recent_active_n=int(fork_recent_active_n),
+                fork_allow_kinds=fork_allow_tuple,
+                fork_deny_kinds=fork_deny_tuple,
+            )
 
         # CLI overrides (if provided) take precedence over per-method defaults.
         if goc_annotation_mode is not None:
@@ -535,17 +668,21 @@ def run_llm(
     def _avg(xs): return sum(xs)/max(1,len(xs))
     lines = []
     lines.append(f"# LLM Report ({benchmark.name})\n")
-    lines.append("| method | n | accuracy | accuracy_strict | avg_total_tokens | avg_steps | avg_elapsed_sec | avg_tool_calls | avg_search | avg_open | avg_repeat_search | json_fail | json_recover | avg_docid_coverage |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| method | n | accuracy | accuracy_strict | avg_total_tokens | p95_total_tokens | avg_steps | avg_elapsed_sec | avg_tool_calls | avg_fork_calls | avg_fork_tokens | avg_search | avg_open | avg_repeat_search | json_fail | json_recover | avg_docid_coverage |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for name, rs in by_method.items():
         n = len(rs)
         acc = sum(1 for x in rs if x["correct"]) / max(1, n)
         strict_vals = [x.get("correct_strict") for x in rs if x.get("correct_strict") is not None]
         acc_strict = (sum(1 for v in strict_vals if v) / max(1, len(strict_vals))) if strict_vals else 0.0
-        avg_tok = _avg([(x.get("usage", {}).get("total_tokens") or 0) for x in rs])
+        tok_vals = sorted([(x.get("usage", {}).get("total_tokens") or 0) for x in rs])
+        avg_tok = _avg(tok_vals)
+        p95_tok = tok_vals[min(len(tok_vals)-1, int(0.95 * (len(tok_vals)-1)))] if tok_vals else 0
         avg_steps = _avg([(x.get("steps") or 0) for x in rs])
         avg_elapsed = _avg([(x.get("elapsed_sec") or 0.0) for x in rs])
         avg_tools = _avg([(x.get("tool_stats", {}).get("tool_calls_total") or 0) for x in rs])
+        avg_fork_calls = _avg([(x.get("tool_stats", {}).get("fork_calls") or 0) for x in rs])
+        avg_fork_tokens = _avg([(x.get("tool_stats", {}).get("fork_tokens") or 0) for x in rs])
         avg_search = _avg([(x.get("tool_stats", {}).get("search_calls") or 0) for x in rs])
         avg_open = _avg([(x.get("tool_stats", {}).get("open_page_calls") or 0) for x in rs])
         avg_rep = _avg([(x.get("tool_stats", {}).get("repeated_search_count") or 0) for x in rs])
@@ -553,8 +690,8 @@ def run_llm(
         json_rec = sum((x.get("tool_stats", {}).get("json_recoveries") or 0) for x in rs)
         avg_cov = _avg([x.get("docid_cov",0.0) for x in rs])
         lines.append(
-            f"| {name} | {n} | {acc:.3f} | {acc_strict:.3f} | {avg_tok:.1f} | {avg_steps:.1f} | {avg_elapsed:.2f} | "
-            f"{avg_tools:.1f} | {avg_search:.1f} | {avg_open:.1f} | {avg_rep:.1f} | "
+            f"| {name} | {n} | {acc:.3f} | {acc_strict:.3f} | {avg_tok:.1f} | {p95_tok:.1f} | {avg_steps:.1f} | {avg_elapsed:.2f} | "
+            f"{avg_tools:.1f} | {avg_fork_calls:.1f} | {avg_fork_tokens:.1f} | {avg_search:.1f} | {avg_open:.1f} | {avg_rep:.1f} | "
             f"{json_fail} | {json_rec} | {avg_cov:.3f} |"
         )
 

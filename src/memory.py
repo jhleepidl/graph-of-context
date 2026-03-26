@@ -72,6 +72,21 @@ class MemoryNode:
         if self.token_len <= 0:
             self.token_len = approx_token_count(self.text)
 
+@dataclass(frozen=True)
+class ForkView:
+    """A scoped, recoverable view over a subset of the GoC graph.
+
+    The fork does *not* mutate ACTIVE context by itself. Instead it materializes
+    the minimal node set that a specialist sub-agent should see, together with a
+    serialized prompt view and provenance (seed ids + scoped node ids).
+    """
+    fork_id: str
+    query: str
+    seed_ids: List[str]
+    node_ids: List[str]
+    scoped_text: str
+    token_count: int
+
 @dataclass
 class MemoryManagerBase:
     budget_active: int = 2000
@@ -531,6 +546,10 @@ class GoCMemory(MemoryManagerBase):
     trace_unfold_candidates: bool = False
     unfold_candidate_preview_chars: int = 240
     unfold_candidate_max_closure_ids: int = 40
+
+    # Scoped fork support
+    fork_default_max_tokens: int = 160
+    fork_keep_recent_active: int = 4
 
     # preserved but not active
     storage: List[str] = field(default_factory=list)
@@ -2768,6 +2787,152 @@ class GoCMemory(MemoryManagerBase):
             pass
 
         return activated
+
+
+
+    def serialize_node_ids(self, node_ids: List[str], *, max_tokens: Optional[int] = None) -> Tuple[str, List[str], int]:
+        """Serialize node ids into a stable, chronological text view.
+
+        Returns (text, kept_ids, used_tokens). Nodes are ordered by step index
+        so the scoped context remains auditable and deterministic.
+        """
+        budget = int(max_tokens) if max_tokens is not None else None
+        kept: List[str] = []
+        used = 0
+        parts: List[str] = []
+        ordered = [nid for nid in sorted(set(node_ids or []), key=lambda x: int(self.nodes[x].step_idx) if x in self.nodes else 10**9) if nid in self.nodes]
+        for nid in ordered:
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            add_cost = int(n.token_len)
+            if budget is not None and kept and used + add_cost > budget:
+                continue
+            kept.append(nid)
+            used += add_cost
+            parts.append(n.text)
+        return "\n".join(parts), kept, int(used)
+
+    def build_fork_view(
+        self,
+        query: str,
+        *,
+        seed_ids: Optional[List[str]] = None,
+        k: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        include_recent_active: bool = True,
+        allow_kinds: Optional[Tuple[str, ...]] = None,
+        deny_kinds: Optional[Tuple[str, ...]] = None,
+        scope_mode: str = "dep_scoped",
+    ) -> ForkView:
+        """Materialize a scoped, least-privilege view for a specialist sub-agent.
+
+        Scope modes:
+          - dep_scoped: retrieve candidate seeds and expand through dependency/doc-ref closure.
+          - sim_scoped: retrieve similarity seeds only (no closure), useful as a control.
+        """
+        budget = int(max_tokens or self.fork_default_max_tokens or self.budget_unfold or 600)
+        kk = int(k or self.unfold_k or 6)
+        chosen_seed_ids: List[str] = []
+        chosen_nodes: Set[str] = set()
+        scope_mode = str(scope_mode or 'dep_scoped').strip().lower()
+
+        if seed_ids:
+            chosen_seed_ids = [str(x) for x in seed_ids if str(x) in self.nodes]
+            for sid in chosen_seed_ids:
+                if scope_mode == 'sim_scoped':
+                    chosen_nodes.add(sid)
+                    continue
+                closure = self._dep_closure([sid], int(self.max_dep_depth), None)
+                closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+                closure = self._apply_avoids_filter(closure, selected_nodes=set(closure) | set(chosen_nodes))
+                for x in closure:
+                    if x in self.nodes:
+                        chosen_nodes.add(x)
+        else:
+            candidates = self.compute_unfold_candidates(query, k=kk, topk=max(kk * 3, 10))
+            if scope_mode == 'sim_scoped':
+                for cand in candidates:
+                    sid = str(cand.get('seed_id') or '')
+                    if not sid or sid not in self.nodes:
+                        continue
+                    chosen_seed_ids.append(sid)
+                    chosen_nodes.add(sid)
+                    if len(chosen_seed_ids) >= kk:
+                        break
+            else:
+                chosen_seed_ids, chosen_nodes, _used = self._select_unfold_seeds(candidates, k=kk)
+
+        if include_recent_active and self.active:
+            recent_n = max(0, int(getattr(self, 'fork_keep_recent_active', 4) or 4))
+            for nid in self.active[-recent_n:]:
+                if nid in self.nodes:
+                    chosen_nodes.add(nid)
+
+        allow = set(allow_kinds or ())
+        deny = set(deny_kinds or ())
+        filtered: List[str] = []
+        for nid in sorted(chosen_nodes, key=lambda x: int(self.nodes[x].step_idx) if x in self.nodes else 10**9):
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            kind = str(n.kind or '')
+            if allow and kind not in allow:
+                continue
+            if deny and kind in deny:
+                continue
+            filtered.append(nid)
+
+        scoped_text, kept_ids, used_tokens = self.serialize_node_ids(filtered, max_tokens=budget)
+        fork_id = _new_id('FK')
+        try:
+            self._emit_event({
+                'type': 'fork_view',
+                'mem': 'GoC',
+                'global_step': int(self._global_step),
+                'fork_id': fork_id,
+                'query': query,
+                'k': int(kk),
+                'budget_fork': int(budget),
+                'scope_mode': scope_mode,
+                'seed_ids': list(chosen_seed_ids)[:30],
+                'node_ids': list(kept_ids)[:60],
+                'node_count': int(len(kept_ids)),
+                'token_count': int(used_tokens),
+            })
+        except Exception:
+            pass
+        return ForkView(
+            fork_id=fork_id,
+            query=query,
+            seed_ids=list(chosen_seed_ids),
+            node_ids=list(kept_ids),
+            scoped_text=scoped_text,
+            token_count=int(used_tokens),
+        )
+
+    def record_fork_result(self, fork: ForkView, result_text: str, *, kind: str = 'summary') -> str:
+        """Reintegrate a fork result into the main graph with provenance edges."""
+        prefix = f"[FORK_RESULT id={fork.fork_id}]"
+        nid = self.add_node(thread='main', kind=kind, text=f"{prefix} {result_text}")
+        self.active.append(nid)
+        support_ids = list(fork.seed_ids or []) or list(fork.node_ids or [])
+        for sid in support_ids:
+            if sid in self.nodes and sid != nid:
+                self._add_edge('depends', nid, sid)
+        try:
+            self._emit_event({
+                'type': 'fork_result',
+                'mem': 'GoC',
+                'global_step': int(self._global_step),
+                'fork_id': str(fork.fork_id),
+                'result_node': str(nid),
+                'support_count': int(len(support_ids)),
+            })
+        except Exception:
+            pass
+        self.maybe_fold()
+        return nid
 
 class SimilarityOnlyMemory(GoCMemory):
     """RAG-style baseline: unfold purely by retrieval similarity (no dependency closure).

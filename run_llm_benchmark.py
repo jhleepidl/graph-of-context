@@ -42,6 +42,23 @@ def main():
         default=True,
         help="Always trigger unfold when relocation_* required keys appear in the query.",
     )
+    ap.add_argument("--fork_trigger_mode", type=str, default="evidence_gated", help="evidence_gated|always|debug_once|debug_once_no_merge|commit_only|final_only|pivot_only|pivot_and_final")
+    ap.add_argument("--fork_min_step", type=int, default=4)
+    ap.add_argument("--fork_every_k_steps", type=int, default=3)
+    ap.add_argument("--fork_min_open_pages", type=int, default=2)
+    ap.add_argument("--fork_min_search_calls", type=int, default=1)
+    ap.add_argument("--fork_min_active_tokens", type=int, default=500)
+    ap.add_argument("--fork_merge_min_confidence", type=float, default=0.67)
+    ap.add_argument("--fork_merge_policy", type=str, default="full", help="full|weak|no_merge")
+    ap.add_argument("--fork_weak_merge_max_chars", type=int, default=240)
+    ap.add_argument("--fork_debug_force_step", type=int, default=10)
+    ap.add_argument("--fork_debug_force_max_calls", type=int, default=1)
+
+    ap.add_argument("--fork_max_tokens", type=int, default=160)
+    ap.add_argument("--fork_k", type=int, default=6)
+    ap.add_argument("--fork_include_recent_active", action="store_true", default=True)
+    ap.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
+    ap.add_argument("--fork_recent_active_n", type=int, default=4)
     ap.add_argument(
         "--no_unfold_trigger_always_on_required_keys",
         action="store_false",
@@ -94,6 +111,21 @@ def main():
         unfold_trigger_always_on_required_keys=bool(
             args.unfold_trigger_always_on_required_keys
         ),
+        fork_trigger_mode=str(args.fork_trigger_mode),
+        fork_min_step=int(args.fork_min_step),
+        fork_every_k_steps=int(args.fork_every_k_steps),
+        fork_min_open_pages=int(args.fork_min_open_pages),
+        fork_min_search_calls=int(args.fork_min_search_calls),
+        fork_min_active_tokens=int(args.fork_min_active_tokens),
+        fork_merge_min_confidence=float(args.fork_merge_min_confidence),
+        fork_merge_policy=str(args.fork_merge_policy),
+        fork_weak_merge_max_chars=int(args.fork_weak_merge_max_chars),
+        fork_debug_force_step=int(args.fork_debug_force_step),
+        fork_debug_force_max_calls=int(args.fork_debug_force_max_calls),
+        fork_max_tokens=int(args.fork_max_tokens),
+        fork_k=int(args.fork_k),
+        fork_include_recent_active=bool(args.fork_include_recent_active),
+        fork_recent_active_n=int(args.fork_recent_active_n),
     )
     print("Done:", res)
 
