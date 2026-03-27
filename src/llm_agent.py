@@ -1378,12 +1378,42 @@ class ToolLoopLLMAgent:
             except Exception:
                 conf = 0.0
             min_conf = float(getattr(self.cfg, 'fork_merge_min_confidence', 0.67) or 0.67)
-            if mode not in {'debug_once', 'debug_once_no_merge'}:
+            # In gate_probe+run_on_ready, the outer evidence gate has already decided this step is ready.
+            # Do not silently suppress the fork a second time on specialist status/confidence, or probe runs
+            # will look like successful gates with zero actual fork calls.
+            bypass_inner_gate = (
+                mode == 'gate_probe'
+                and bool(getattr(self.cfg, 'fork_gate_probe_run_on_ready', False))
+            )
+            if not bypass_inner_gate and mode not in {'debug_once', 'debug_once_no_merge'}:
                 if status and status != 'ready':
                     self.counters['fork_deferred'] += 1
+                    self._trace({
+                        'type': 'fork_deferred',
+                        'task_id': task_id,
+                        'method': method,
+                        'run_tag': run_tag,
+                        'step': step,
+                        'reason': reason,
+                        'defer_reason': 'status_not_ready',
+                        'fork_status': status,
+                        'fork_confidence': conf,
+                    })
                     return None
                 if conf < min_conf:
                     self.counters['fork_deferred'] += 1
+                    self._trace({
+                        'type': 'fork_deferred',
+                        'task_id': task_id,
+                        'method': method,
+                        'run_tag': run_tag,
+                        'step': step,
+                        'reason': reason,
+                        'defer_reason': 'confidence_lt_min',
+                        'fork_status': status,
+                        'fork_confidence': conf,
+                        'fork_confidence_min': min_conf,
+                    })
                     return None
 
         result_node: Optional[str] = None
