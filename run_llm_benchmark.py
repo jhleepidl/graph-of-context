@@ -62,6 +62,13 @@ def main():
     ap.add_argument("--fork_include_recent_active", action="store_true", default=True)
     ap.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
     ap.add_argument("--fork_recent_active_n", type=int, default=4)
+    ap.add_argument("--enable_context_controller", action="store_true", default=False)
+    ap.add_argument("--context_controller_policy", type=str, default="uncertainty_aware", help="stage_aware|budget_aware|uncertainty_aware")
+    ap.add_argument("--context_controller_trace", action="store_true", default=True)
+    ap.add_argument("--no_context_controller_trace", action="store_false", dest="context_controller_trace")
+    ap.add_argument("--context_controller_support_gap_threshold", type=float, default=0.20)
+    ap.add_argument("--context_controller_budget_pressure_threshold", type=float, default=0.80)
+    ap.add_argument("--context_controller_fork_ambiguity_threshold", type=float, default=0.45)
     ap.add_argument(
         "--no_unfold_trigger_always_on_required_keys",
         action="store_false",
@@ -131,6 +138,12 @@ def main():
         fork_k=int(args.fork_k),
         fork_include_recent_active=bool(args.fork_include_recent_active),
         fork_recent_active_n=int(args.fork_recent_active_n),
+        enable_context_controller=bool(args.enable_context_controller),
+        context_controller_policy=str(args.context_controller_policy),
+        context_controller_trace=bool(args.context_controller_trace),
+        context_controller_support_gap_threshold=float(args.context_controller_support_gap_threshold),
+        context_controller_budget_pressure_threshold=float(args.context_controller_budget_pressure_threshold),
+        context_controller_fork_ambiguity_threshold=float(args.context_controller_fork_ambiguity_threshold),
     )
     print("Done:", res)
 

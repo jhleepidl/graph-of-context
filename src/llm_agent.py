@@ -14,6 +14,7 @@ from .tools import ToolBox
 from .memory import MemoryManagerBase
 from .utils import approx_token_count
 from .bandit_controller import BanditUnfoldController
+from .context_controller import ContextController, ControllerDecision
 from .unfold_trigger import UnfoldTrigger
 
 def _extract_first_json_object(text: str) -> Optional[str]:
@@ -269,6 +270,14 @@ class ToolLoopConfig:
     fork_gate_trace: bool = True
     fork_gate_probe_run_on_ready: bool = False
 
+    # Operator controller: decides when to use unfold / fork.
+    enable_context_controller: bool = False
+    context_controller_policy: str = "uncertainty_aware"
+    context_controller_trace: bool = True
+    context_controller_support_gap_threshold: float = 0.20
+    context_controller_budget_pressure_threshold: float = 0.80
+    context_controller_fork_ambiguity_threshold: float = 0.45
+
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
     log_dir: Optional[str] = None         # if set, write per-task JSONL trace logs
@@ -318,6 +327,15 @@ class ToolLoopLLMAgent:
             max_keywords=int(getattr(self.cfg, "unfold_trigger_max_keywords", 48) or 48),
             always_trigger_on_required_keys=bool(getattr(self.cfg, "unfold_trigger_always_on_required_keys", True)),
         )
+        self.context_controller: Optional[ContextController] = None
+        if bool(getattr(self.cfg, "enable_context_controller", False)):
+            self.context_controller = ContextController(
+                policy=str(getattr(self.cfg, "context_controller_policy", "uncertainty_aware") or "uncertainty_aware"),
+                support_gap_threshold=float(getattr(self.cfg, "context_controller_support_gap_threshold", 0.20) or 0.20),
+                budget_pressure_threshold=float(getattr(self.cfg, "context_controller_budget_pressure_threshold", 0.80) or 0.80),
+                fork_ambiguity_threshold=float(getattr(self.cfg, "context_controller_fork_ambiguity_threshold", 0.45) or 0.45),
+                active_tokens_fork_threshold=int(getattr(self.cfg, "fork_min_active_tokens", 500) or 500),
+            )
 
         self.usage_accum: Dict[str, int] = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
         self.counters: Counter = Counter()
@@ -1265,6 +1283,166 @@ class ToolLoopLLMAgent:
             parts.append(cur)
         parts.append('Return only support-complete evidence for the current pivot decision.')
         return ' | '.join([p for p in parts if p])
+
+    def _build_context_controller_features(self, *, step: int, current_user_prompt: str, fork_ready: bool, fork_gate_reason: str) -> Dict[str, Any]:
+        prompt = str(current_user_prompt or "")
+        prompt_low = prompt.lower()
+        active_text = ""
+        try:
+            active_text = str(self.mem.get_active_text() if hasattr(self.mem, "get_active_text") else "")
+        except Exception:
+            active_text = ""
+        active_tokens = int(approx_token_count(active_text)) if active_text else 0
+        active_nodes = int(len(getattr(self.mem, "active", []) or []))
+        budget_active = int(getattr(self.mem, "budget_active", 0) or 0)
+        budget_utilization = (float(active_tokens) / float(max(1, budget_active))) if budget_active > 0 else 0.0
+
+        should_unfold = False
+        missing_terms: List[str] = []
+        keywords: List[str] = []
+        try:
+            keywords = self.unfold_trigger.extract_keywords(prompt)
+            should_unfold, _reason, missing_terms = self.unfold_trigger.should_unfold(prompt, active_text)
+        except Exception:
+            keywords = []
+            missing_terms = []
+        support_gap_score = (float(len(missing_terms)) / float(max(1, len(keywords)))) if keywords else 0.0
+
+        titles = [str(x).strip() for x in (getattr(self, '_committed_supporting_titles', None) or []) if str(x).strip()]
+        candidate_count = len(titles)
+        title_bonus = 0.25 if candidate_count >= 2 else 0.0
+        lexical_ambiguity_hits = sum(
+            1 for pat in [
+                ' which ', ' choose ', ' best ', ' final ', ' verify ', ' evidence ',
+                ' support ', ' decide ', ' pivot ', ' candidate ', ' compare ', ' conflict ',
+            ]
+            if pat in f' {prompt_low} '
+        )
+        ambiguity_score = min(1.0, 0.12 * lexical_ambiguity_hits + title_bonus + (0.20 if should_unfold else 0.0))
+        has_conflict = bool(re.search(r'(conflict|contradict|however|unless|except|but)', prompt_low))
+
+        is_commit_like = ('/ commit' in prompt_low) or ('[follow-up 1' in prompt_low)
+        is_final_like = ('/ final' in prompt_low) or ('[follow-up 2' in prompt_low)
+        is_verification_like = any(tok in prompt_low for tok in ['verify', 'double-check', 'confirm'])
+        is_pivot_like = bool(is_commit_like or is_final_like or is_verification_like or candidate_count >= 2)
+        pivot_risk = min(
+            1.0,
+            (0.40 if is_pivot_like else 0.0)
+            + (0.25 if is_commit_like or is_final_like else 0.0)
+            + (0.20 if has_conflict else 0.0)
+            + min(0.35, support_gap_score),
+        )
+        specialist_subtask_flag = bool(is_pivot_like or active_tokens >= int(getattr(self.cfg, 'fork_min_active_tokens', 500) or 500) or candidate_count >= 2)
+
+        return {
+            'step': int(step),
+            'active_tokens_est': int(active_tokens),
+            'active_nodes': int(active_nodes),
+            'budget_active': int(budget_active),
+            'budget_utilization': float(budget_utilization),
+            'search_calls': int(self.counters.get('search_calls', 0) or 0),
+            'open_page_calls': int(self.counters.get('open_page_calls', 0) or 0),
+            'support_gap_score': float(support_gap_score),
+            'missing_terms_count': int(len(missing_terms)),
+            'missing_terms': list(missing_terms[:12]),
+            'keyword_count': int(len(keywords)),
+            'is_commit_like': bool(is_commit_like),
+            'is_final_like': bool(is_final_like),
+            'is_verification_like': bool(is_verification_like),
+            'is_pivot_like': bool(is_pivot_like),
+            'pivot_risk': float(pivot_risk),
+            'candidate_count': int(candidate_count),
+            'ambiguity_score': float(ambiguity_score),
+            'has_conflict': bool(has_conflict),
+            'specialist_subtask_flag': bool(specialist_subtask_flag),
+            'fork_ready': bool(fork_ready),
+            'fork_gate_reason': str(fork_gate_reason or ''),
+        }
+
+    def _maybe_run_context_controller(
+        self,
+        *,
+        step: int,
+        current_user_prompt: str,
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> Tuple[Optional[ControllerDecision], bool]:
+        if not bool(getattr(self.cfg, 'enable_context_controller', False)):
+            return None, False
+        if self.context_controller is None:
+            return None, False
+        if not str(method or '').lower().startswith('goc'):
+            return None, False
+
+        fork_ready, fork_gate_reason = self._fork_ready_for_single_stage(step=step)
+        features = self._build_context_controller_features(
+            step=step,
+            current_user_prompt=current_user_prompt,
+            fork_ready=fork_ready,
+            fork_gate_reason=fork_gate_reason,
+        )
+        decision = self.context_controller.decide(
+            current_user_prompt=current_user_prompt,
+            features=features,
+            q1_text=getattr(self, '_q1_text', None),
+            commit_titles=getattr(self, '_committed_supporting_titles', None),
+        )
+
+        trace_payload = {
+            'type': 'context_controller',
+            'task_id': task_id,
+            'method': method,
+            'run_tag': run_tag,
+            'step': int(step),
+            'policy': str(getattr(self.cfg, 'context_controller_policy', 'uncertainty_aware') or 'uncertainty_aware'),
+            'action': str(getattr(decision, 'action', 'none') or 'none'),
+            'reason': str(getattr(decision, 'reason', '') or ''),
+            'features': dict(features),
+            'metadata': dict(getattr(decision, 'metadata', {}) or {}),
+        }
+        if bool(getattr(self.cfg, 'context_controller_trace', True)):
+            self._trace(trace_payload)
+
+        executed = False
+        action = str(getattr(decision, 'action', 'none') or 'none').lower()
+        if action in {'unfold', 'unfold_then_fork'}:
+            uq = str(getattr(decision, 'unfold_query', '') or '').strip() or str(current_user_prompt or '').strip()
+            activated = self._run_unfold(
+                uq,
+                k=int(getattr(self.cfg, 'unfold_trigger_k', 0) or getattr(self.mem, 'unfold_k', 6) or 6),
+                reason=f'context_controller:{getattr(decision, "reason", "")}',
+                step=step,
+                task_id=task_id,
+                method=method,
+                run_tag=run_tag,
+            )
+            executed = bool(activated) or executed
+
+        if action in {'fork', 'unfold_then_fork'}:
+            if fork_ready:
+                fq = str(getattr(decision, 'fork_query', '') or '').strip() or str(current_user_prompt or '').strip()
+                node = self._run_scoped_fork(
+                    query=fq,
+                    reason=f'context_controller:{getattr(decision, "reason", "")}',
+                    step=step,
+                    task_id=task_id,
+                    method=method,
+                    run_tag=run_tag,
+                )
+                executed = (node is not None) or executed
+            else:
+                self._trace({
+                    'type': 'context_controller_fork_blocked',
+                    'task_id': task_id,
+                    'method': method,
+                    'run_tag': run_tag,
+                    'step': int(step),
+                    'reason': str(getattr(decision, 'reason', '') or ''),
+                    'fork_gate_reason': str(fork_gate_reason or ''),
+                })
+
+        return decision, executed
 
     def _run_scoped_fork(
         self,
@@ -3094,6 +3272,28 @@ class ToolLoopLLMAgent:
                             "activated": (activated_ids or [])[:20],
                         })
 
+                # Optional operator controller: decide when to run UNFOLD / FORK for
+                # single-stage long-horizon tasks. This is intentionally conservative and
+                # only runs when explicitly enabled.
+                try:
+                    if (
+                        (not fork_ran_this_step)
+                        and str(method or '').lower().startswith('goc')
+                        and bool(getattr(self.cfg, 'enable_context_controller', False))
+                    ):
+                        _ctl_decision, _ctl_executed = self._maybe_run_context_controller(
+                            step=step,
+                            current_user_prompt=current_user_prompt,
+                            task_id=task_id,
+                            method=method,
+                            run_tag=run_tag,
+                        )
+                        if _ctl_executed:
+                            fork_ran_this_step = True
+                            ctx = self.mem.get_active_text()
+                except Exception:
+                    self.counters['context_controller_errors'] += 1
+
                 # Generic scoped-fork trigger for single-stage benchmarks (e.g., BrowseComp-like tasks)
                 # that do not expose explicit /COMMIT or /FINAL prompts. When fork_trigger_mode is "always",
                 # run one scoped fork before prompt construction so the merged fork artifact can influence
@@ -3103,6 +3303,7 @@ class ToolLoopLLMAgent:
                         (not fork_ran_this_step)
                         and str(method or '').lower().startswith('goc')
                         and bool(getattr(self.cfg, 'enable_scoped_fork', False))
+                        and not bool(getattr(self.cfg, 'enable_context_controller', False))
                         and str(getattr(self.cfg, 'fork_trigger_mode', '') or '').lower() in {'always', 'evidence_gated', 'debug_once', 'debug_once_no_merge', 'gate_probe'}
                     ):
                         _ok, _why = self._fork_ready_for_single_stage(step=step)

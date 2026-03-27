@@ -130,6 +130,14 @@ def run_llm(
     fork_allow_kinds: Optional[List[str]] = None,
     fork_deny_kinds: Optional[List[str]] = None,
 
+    # Operator controller for deciding NONE / UNFOLD / FORK / UNFOLD_THEN_FORK
+    enable_context_controller: bool = False,
+    context_controller_policy: str = "uncertainty_aware",
+    context_controller_trace: bool = True,
+    context_controller_support_gap_threshold: float = 0.20,
+    context_controller_budget_pressure_threshold: float = 0.80,
+    context_controller_fork_ambiguity_threshold: float = 0.45,
+
     # Optional: override LLM-assisted GoC annotation settings (prompt gating + schema)
     # If None, defaults are used (and per-method overrides like GoC-HybridDep apply).
     goc_annotation_mode: Optional[str] = None,
@@ -451,6 +459,37 @@ def run_llm(
 
         fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
         fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
+        if bool(enable_context_controller) and str(ms_name).lower().startswith('goc'):
+            cfg = replace(
+                cfg,
+                enable_context_controller=True,
+                context_controller_policy=str(context_controller_policy),
+                context_controller_trace=bool(context_controller_trace),
+                context_controller_support_gap_threshold=float(context_controller_support_gap_threshold),
+                context_controller_budget_pressure_threshold=float(context_controller_budget_pressure_threshold),
+                context_controller_fork_ambiguity_threshold=float(context_controller_fork_ambiguity_threshold),
+                enable_scoped_fork=True,
+                fork_scope_mode="dep_scoped",
+                fork_trigger_mode=str(fork_trigger_mode),
+                fork_min_step=int(fork_min_step),
+                fork_every_k_steps=int(fork_every_k_steps),
+                fork_min_search_calls=int(eff_fork_min_search_calls),
+                fork_min_open_pages=int(eff_fork_min_open_pages),
+                fork_min_active_tokens=int(eff_fork_min_active_tokens),
+                fork_merge_min_confidence=float(eff_fork_merge_min_confidence),
+                fork_merge_policy=str(fork_merge_policy),
+                fork_weak_merge_max_chars=int(fork_weak_merge_max_chars),
+                fork_debug_force_step=int(fork_debug_force_step),
+                fork_debug_force_max_calls=int(fork_debug_force_max_calls),
+                fork_gate_trace=bool(fork_gate_trace),
+                fork_gate_probe_run_on_ready=bool(fork_gate_probe_run_on_ready),
+                fork_max_tokens=int(fork_max_tokens),
+                fork_k=int(fork_k),
+                fork_include_recent_active=bool(fork_include_recent_active),
+                fork_recent_active_n=int(fork_recent_active_n),
+                fork_allow_kinds=fork_allow_tuple,
+                fork_deny_kinds=fork_deny_tuple,
+            )
         if str(ms_name) == "GoC-Fork-Dep":
             cfg = replace(
                 cfg,
