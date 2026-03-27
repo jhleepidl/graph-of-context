@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import pickle
+from pathlib import Path
+
+from sklearn.tree import DecisionTreeClassifier
+
 from src.context_controller import ContextController
 
 
@@ -72,3 +77,51 @@ def test_budget_aware_forks_under_pressure_when_gap_is_small() -> None:
     dec = ctl.decide(current_user_prompt="choose best supported candidate", features=feats)
     assert dec.action == "fork"
     assert dec.reason == "budget_pressure_fork"
+
+
+def _write_learned_payload(path: Path) -> None:
+    feature_names = ["feature_a", "feature_b"]
+    X = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [2.0, 0.0]]
+    y = [0, 1, 2, 3]  # none, unfold, fork, unfold_then_fork
+    model = DecisionTreeClassifier(max_depth=3, random_state=7)
+    model.fit(X, y)
+    payload = {
+        "model": model,
+        "feature_names": feature_names,
+        "actions": ["none", "unfold", "fork", "unfold_then_fork"],
+        "model_type": "tree",
+    }
+    with path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
+def test_learned_controller_uses_pickled_model(tmp_path: Path) -> None:
+    model_path = tmp_path / "controller.pkl"
+    _write_learned_payload(model_path)
+    ctl = ContextController(
+        policy="learned_tree",
+        learned_model_path=str(model_path),
+        learned_min_confidence=0.0,
+    )
+    feats = dict(BASE)
+    feats.update({"feature_a": 2.0, "feature_b": 0.0, "fork_ready": True, "fork_gate_reason": "ok"})
+    dec = ctl.decide(current_user_prompt="decide now", features=feats)
+    assert dec.action == "unfold_then_fork"
+    assert dec.metadata["learned_model_type"] == "tree"
+    assert dec.metadata["learned_predicted_action"] == "unfold_then_fork"
+
+
+def test_learned_controller_falls_back_when_none_disabled(tmp_path: Path) -> None:
+    model_path = tmp_path / "controller.pkl"
+    _write_learned_payload(model_path)
+    ctl = ContextController(
+        policy="learned_tree",
+        learned_model_path=str(model_path),
+        learned_disable_none_action=True,
+        learned_fallback_action="unfold",
+    )
+    feats = dict(BASE)
+    feats.update({"feature_a": 0.0, "feature_b": 0.0})
+    dec = ctl.decide(current_user_prompt="noop maybe", features=feats)
+    assert dec.action == "unfold"
+    assert dec.reason == "learned_none_disabled_fallback"

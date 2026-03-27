@@ -137,6 +137,10 @@ def run_llm(
     context_controller_support_gap_threshold: float = 0.20,
     context_controller_budget_pressure_threshold: float = 0.80,
     context_controller_fork_ambiguity_threshold: float = 0.45,
+    context_controller_model_path: Optional[str] = None,
+    context_controller_min_confidence: float = 0.0,
+    context_controller_fallback_action: str = "unfold",
+    context_controller_disable_none_action: bool = False,
 
     # Optional: override LLM-assisted GoC annotation settings (prompt gating + schema)
     # If None, defaults are used (and per-method overrides like GoC-HybridDep apply).
@@ -468,6 +472,10 @@ def run_llm(
                 context_controller_support_gap_threshold=float(context_controller_support_gap_threshold),
                 context_controller_budget_pressure_threshold=float(context_controller_budget_pressure_threshold),
                 context_controller_fork_ambiguity_threshold=float(context_controller_fork_ambiguity_threshold),
+                context_controller_model_path=str(context_controller_model_path) if context_controller_model_path else None,
+                context_controller_min_confidence=float(context_controller_min_confidence),
+                context_controller_fallback_action=str(context_controller_fallback_action),
+                context_controller_disable_none_action=bool(context_controller_disable_none_action),
                 enable_scoped_fork=True,
                 fork_scope_mode="dep_scoped",
                 fork_trigger_mode=str(fork_trigger_mode),

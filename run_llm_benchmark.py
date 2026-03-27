@@ -63,12 +63,16 @@ def main():
     ap.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
     ap.add_argument("--fork_recent_active_n", type=int, default=4)
     ap.add_argument("--enable_context_controller", action="store_true", default=False)
-    ap.add_argument("--context_controller_policy", type=str, default="uncertainty_aware", help="stage_aware|budget_aware|uncertainty_aware")
+    ap.add_argument("--context_controller_policy", type=str, default="uncertainty_aware", help="stage_aware|budget_aware|uncertainty_aware|learned_tree|learned_logreg|learned")
     ap.add_argument("--context_controller_trace", action="store_true", default=True)
     ap.add_argument("--no_context_controller_trace", action="store_false", dest="context_controller_trace")
     ap.add_argument("--context_controller_support_gap_threshold", type=float, default=0.20)
     ap.add_argument("--context_controller_budget_pressure_threshold", type=float, default=0.80)
     ap.add_argument("--context_controller_fork_ambiguity_threshold", type=float, default=0.45)
+    ap.add_argument("--context_controller_model_path", type=str, default=None)
+    ap.add_argument("--context_controller_min_confidence", type=float, default=0.0)
+    ap.add_argument("--context_controller_fallback_action", type=str, default="unfold")
+    ap.add_argument("--context_controller_disable_none_action", action="store_true", default=False)
     ap.add_argument(
         "--no_unfold_trigger_always_on_required_keys",
         action="store_false",
@@ -144,6 +148,10 @@ def main():
         context_controller_support_gap_threshold=float(args.context_controller_support_gap_threshold),
         context_controller_budget_pressure_threshold=float(args.context_controller_budget_pressure_threshold),
         context_controller_fork_ambiguity_threshold=float(args.context_controller_fork_ambiguity_threshold),
+        context_controller_model_path=str(args.context_controller_model_path) if args.context_controller_model_path else None,
+        context_controller_min_confidence=float(args.context_controller_min_confidence),
+        context_controller_fallback_action=str(args.context_controller_fallback_action),
+        context_controller_disable_none_action=bool(args.context_controller_disable_none_action),
     )
     print("Done:", res)
 

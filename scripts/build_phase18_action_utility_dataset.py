@@ -4,7 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Sequence
@@ -81,10 +84,25 @@ def _default_args_from_meta(meta: Dict[str, Any], overrides: Dict[str, Any]) -> 
     return SimpleNamespace(**base)
 
 
-def _iter_dataset_roots(inputs: Sequence[str]) -> Iterable[Path]:
+def _materialize_input_path(raw: str, scratch_dirs: List[Path]) -> Path:
+    path = Path(raw)
+    if path.is_file() and path.suffix.lower() == ".zip":
+        tmp_dir = Path(tempfile.mkdtemp(prefix="phase18_bundle_"))
+        with zipfile.ZipFile(path, "r") as zf:
+            zf.extractall(tmp_dir)
+        scratch_dirs.append(tmp_dir)
+        roots = sorted([cand for cand in tmp_dir.iterdir() if cand.is_dir()])
+        if len(roots) == 1:
+            return roots[0]
+        return tmp_dir
+    return path
+
+
+def _iter_dataset_roots(inputs: Sequence[str], scratch_dirs: List[Path]) -> Iterable[Path]:
     seen = set()
     for raw in inputs:
-        for ds in _discover_dataset_dirs(Path(raw)):
+        materialized = _materialize_input_path(raw, scratch_dirs)
+        for ds in _discover_dataset_dirs(materialized):
             if ds in seen:
                 continue
             seen.add(ds)
@@ -129,12 +147,24 @@ def main() -> None:
         "fork_dependency_hops": int(args.fork_dependency_hops),
     }
 
+    scratch_dirs: List[Path] = []
+    dataset_roots = list(_iter_dataset_roots(args.inputs, scratch_dirs))
+    if not dataset_roots:
+        for scratch in scratch_dirs:
+            shutil.rmtree(scratch, ignore_errors=True)
+        joined = ", ".join(args.inputs)
+        raise SystemExit(
+            "No TraceOps dataset directories were found under the provided --input path(s): "
+            f"{joined}. Expected a TraceOps directory containing data/traceops/threads.jsonl, "
+            "or a phase bundle zip that contains those files."
+        )
+
     written = 0
     flat_written = 0
     with args.out_jsonl.open("w", encoding="utf-8") as f_out:
         f_flat = args.out_flat_jsonl.open("w", encoding="utf-8") if args.out_flat_jsonl is not None else None
         try:
-            for ds_root in _iter_dataset_roots(args.inputs):
+            for ds_root in dataset_roots:
                 threads, meta = load_traceops_dataset(ds_root)
                 if args.max_threads > 0:
                     threads = threads[: int(args.max_threads)]
@@ -186,6 +216,14 @@ def main() -> None:
         finally:
             if f_flat is not None:
                 f_flat.close()
+            for scratch in scratch_dirs:
+                shutil.rmtree(scratch, ignore_errors=True)
+
+    if written == 0:
+        raise SystemExit(
+            "TraceOps datasets were found, but no pivot rows were generated. "
+            "Check whether the dataset contains pivot_check steps with gold annotations."
+        )
 
     print(f"Wrote {written} pivot rows to {args.out_jsonl}")
     if args.out_flat_jsonl is not None:

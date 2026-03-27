@@ -277,6 +277,10 @@ class ToolLoopConfig:
     context_controller_support_gap_threshold: float = 0.20
     context_controller_budget_pressure_threshold: float = 0.80
     context_controller_fork_ambiguity_threshold: float = 0.45
+    context_controller_model_path: Optional[str] = None
+    context_controller_min_confidence: float = 0.0
+    context_controller_fallback_action: str = "unfold"
+    context_controller_disable_none_action: bool = False
 
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
@@ -335,6 +339,10 @@ class ToolLoopLLMAgent:
                 budget_pressure_threshold=float(getattr(self.cfg, "context_controller_budget_pressure_threshold", 0.80) or 0.80),
                 fork_ambiguity_threshold=float(getattr(self.cfg, "context_controller_fork_ambiguity_threshold", 0.45) or 0.45),
                 active_tokens_fork_threshold=int(getattr(self.cfg, "fork_min_active_tokens", 500) or 500),
+                learned_model_path=getattr(self.cfg, "context_controller_model_path", None),
+                learned_min_confidence=float(getattr(self.cfg, "context_controller_min_confidence", 0.0) or 0.0),
+                learned_fallback_action=str(getattr(self.cfg, "context_controller_fallback_action", "unfold") or "unfold"),
+                learned_disable_none_action=bool(getattr(self.cfg, "context_controller_disable_none_action", False)),
             )
 
         self.usage_accum: Dict[str, int] = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
@@ -1284,17 +1292,179 @@ class ToolLoopLLMAgent:
         parts.append('Return only support-complete evidence for the current pivot decision.')
         return ' | '.join([p for p in parts if p])
 
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        return out if out == out and out not in {float("inf"), float("-inf")} else float(default)
+
+    def _controller_node_ids_all(self) -> List[str]:
+        nodes = getattr(self.mem, 'nodes', {}) or {}
+        try:
+            ordered = sorted(
+                [str(nid) for nid in nodes.keys()],
+                key=lambda nid: int(getattr(nodes.get(nid), 'step_idx', 0) or 0),
+            )
+        except Exception:
+            ordered = [str(nid) for nid in nodes.keys()]
+        return ordered
+
+    def _controller_node_text(self, nid: str) -> str:
+        node = (getattr(self.mem, 'nodes', {}) or {}).get(nid)
+        return str(getattr(node, 'text', '') or '') if node is not None else ''
+
+    def _controller_recent_count(self, node_ids: List[str], *, window: int = 6) -> int:
+        nodes = getattr(self.mem, 'nodes', {}) or {}
+        step_now = int(getattr(self.mem, '_global_step', 0) or 0)
+        low = max(0, step_now - int(window))
+        out = 0
+        for nid in node_ids or []:
+            node = nodes.get(nid)
+            if node is None:
+                continue
+            if int(getattr(node, 'step_idx', 0) or 0) >= low:
+                out += 1
+        return int(out)
+
+    def _controller_mean_query_overlap(self, prompt: str, node_ids: List[str]) -> float:
+        toks = set(re.findall(r"[A-Za-z_]{3,}", str(prompt or '').lower()))
+        if not toks or not node_ids:
+            return 0.0
+        vals: List[float] = []
+        for nid in node_ids:
+            txt = self._controller_node_text(nid).lower()
+            if not txt:
+                continue
+            ntoks = set(re.findall(r"[A-Za-z_]{3,}", txt))
+            vals.append(float(len(toks & ntoks)))
+        return float(sum(vals) / max(1, len(vals))) if vals else 0.0
+
+    def _controller_exception_like_count(self, node_ids: List[str]) -> int:
+        pats = (' except ', ' unless ', ' however ', ' but ', ' conflict ', ' contradict ', ' stale ', ' outdated ')
+        out = 0
+        for nid in node_ids or []:
+            txt = f" {self._controller_node_text(nid).lower()} "
+            if any(p in txt for p in pats):
+                out += 1
+        return int(out)
+
+    def _controller_update_like_count(self, node_ids: List[str]) -> int:
+        pats = (' update', ' changed', ' confirmed', ' revised', ' latest', ' current', '[tool:open_page]', '[tool:search]')
+        out = 0
+        for nid in node_ids or []:
+            txt = self._controller_node_text(nid).lower()
+            if any(p in txt for p in pats):
+                out += 1
+        return int(out)
+
+    def _controller_avoids_target_count(self) -> int:
+        try:
+            edges_out = getattr(self.mem, 'edges_out', {}) or {}
+            avoids = edges_out.get('avoids', {}) or {}
+            targets = set()
+            for vals in avoids.values():
+                for x in vals or []:
+                    targets.add(str(x))
+            return int(len(targets))
+        except Exception:
+            return 0
+
+    def _controller_context_stats(self, *, prompt: str, node_ids: List[str], token_est: Optional[int] = None) -> Dict[str, Any]:
+        ids = [str(nid) for nid in (node_ids or []) if str(nid)]
+        tok = int(token_est) if token_est is not None else int(sum(int(getattr((getattr(self.mem, 'nodes', {}) or {}).get(nid), 'token_len', 0) or 0) for nid in ids))
+        recent = self._controller_recent_count(ids, window=6)
+        return {
+            'context_count': int(len(ids)),
+            'token_est': int(tok),
+            'recent_context_ratio_w6': float(recent) / float(max(1, len(ids))),
+            'update_count': int(self._controller_update_like_count(ids)),
+            'exception_count': int(self._controller_exception_like_count(ids)),
+            'mean_query_overlap': float(self._controller_mean_query_overlap(prompt, ids)),
+        }
+
+    def _preview_unfold_context(self, *, prompt: str, active_ids: List[str]) -> Dict[str, Any]:
+        base = self._controller_context_stats(prompt=prompt, node_ids=active_ids)
+        if not hasattr(self.mem, 'compute_unfold_candidates') or not hasattr(self.mem, '_select_unfold_seeds'):
+            return dict(base)
+        try:
+            k = int(getattr(self.cfg, 'unfold_trigger_k', 0) or getattr(self.mem, 'unfold_k', 6) or 6)
+            cands = self.mem.compute_unfold_candidates(prompt, k=k, topk=max(10, k * 3))  # type: ignore[attr-defined]
+            _seed_ids, chosen_nodes, used_tokens = self.mem._select_unfold_seeds(cands, k=k)  # type: ignore[attr-defined]
+            post_ids = list(dict.fromkeys(list(active_ids) + list(chosen_nodes or [])))
+            return self._controller_context_stats(
+                prompt=prompt,
+                node_ids=post_ids,
+                token_est=int(base.get('token_est', 0) or 0) + int(used_tokens or 0),
+            )
+        except Exception:
+            return dict(base)
+
+    def _preview_fork_context(self, *, query: str, scope_mode: str, active_override: Optional[List[str]] = None) -> Dict[str, Any]:
+        active_ids = list(active_override) if active_override is not None else list(getattr(self.mem, 'active', []) or [])
+        if hasattr(self.mem, 'build_fork_view'):
+            old_active = list(getattr(self.mem, 'active', []) or [])
+            old_recent = getattr(self.mem, 'fork_keep_recent_active', None)
+            ev_len = None
+            try:
+                buf = getattr(self.mem, '_event_buf', None)
+                ev_len = len(buf) if isinstance(buf, list) else None
+            except Exception:
+                ev_len = None
+            try:
+                setattr(self.mem, 'active', list(active_ids))
+                try:
+                    setattr(self.mem, 'fork_keep_recent_active', int(getattr(self.cfg, 'fork_recent_active_n', 4) or 4))
+                except Exception:
+                    pass
+                fork = self.mem.build_fork_view(  # type: ignore[attr-defined]
+                    query=query,
+                    k=int(getattr(self.cfg, 'fork_k', 6) or 6),
+                    max_tokens=int(getattr(self.cfg, 'fork_max_tokens', 160) or 160),
+                    include_recent_active=bool(getattr(self.cfg, 'fork_include_recent_active', True)),
+                    allow_kinds=getattr(self.cfg, 'fork_allow_kinds', None),
+                    deny_kinds=getattr(self.cfg, 'fork_deny_kinds', ('tool',)),
+                    scope_mode=str(scope_mode or 'dep_scoped'),
+                )
+                return self._controller_context_stats(
+                    prompt=query,
+                    node_ids=list(getattr(fork, 'node_ids', []) or []),
+                    token_est=int(getattr(fork, 'token_count', 0) or 0),
+                )
+            except Exception:
+                return self._controller_context_stats(prompt=query, node_ids=active_ids)
+            finally:
+                try:
+                    setattr(self.mem, 'active', old_active)
+                except Exception:
+                    pass
+                if old_recent is not None:
+                    try:
+                        setattr(self.mem, 'fork_keep_recent_active', old_recent)
+                    except Exception:
+                        pass
+                if ev_len is not None:
+                    try:
+                        buf = getattr(self.mem, '_event_buf', None)
+                        if isinstance(buf, list) and len(buf) > ev_len:
+                            del buf[ev_len:]
+                    except Exception:
+                        pass
+        return self._controller_context_stats(prompt=query, node_ids=active_ids)
+
     def _build_context_controller_features(self, *, step: int, current_user_prompt: str, fork_ready: bool, fork_gate_reason: str) -> Dict[str, Any]:
         prompt = str(current_user_prompt or "")
         prompt_low = prompt.lower()
+        active_ids = list(getattr(self.mem, 'active', []) or [])
+        history_ids = self._controller_node_ids_all()
         active_text = ""
         try:
-            active_text = str(self.mem.get_active_text() if hasattr(self.mem, "get_active_text") else "")
+            active_text = str(self.mem.get_active_text() if hasattr(self.mem, 'get_active_text') else '')
         except Exception:
-            active_text = ""
+            active_text = ''
         active_tokens = int(approx_token_count(active_text)) if active_text else 0
-        active_nodes = int(len(getattr(self.mem, "active", []) or []))
-        budget_active = int(getattr(self.mem, "budget_active", 0) or 0)
+        active_nodes = int(len(active_ids))
+        budget_active = int(getattr(self.mem, 'budget_active', 0) or 0)
         budget_utilization = (float(active_tokens) / float(max(1, budget_active))) if budget_active > 0 else 0.0
 
         should_unfold = False
@@ -1334,7 +1504,29 @@ class ToolLoopLLMAgent:
         )
         specialist_subtask_flag = bool(is_pivot_like or active_tokens >= int(getattr(self.cfg, 'fork_min_active_tokens', 500) or 500) or candidate_count >= 2)
 
-        return {
+        history_token_est = int(sum(int(getattr((getattr(self.mem, 'nodes', {}) or {}).get(nid), 'token_len', 0) or 0) for nid in history_ids))
+        history_recent_count = self._controller_recent_count(history_ids, window=6)
+        none_stats = self._controller_context_stats(prompt=prompt, node_ids=active_ids, token_est=active_tokens)
+        unfold_stats = self._preview_unfold_context(prompt=prompt, active_ids=active_ids)
+        unfold_added_ids: List[str] = []
+        try:
+            k = int(getattr(self.cfg, 'unfold_trigger_k', 0) or getattr(self.mem, 'unfold_k', 6) or 6)
+            if hasattr(self.mem, 'compute_unfold_candidates') and hasattr(self.mem, '_select_unfold_seeds'):
+                cands = self.mem.compute_unfold_candidates(prompt, k=k, topk=max(10, k * 3))  # type: ignore[attr-defined]
+                _seed_ids, chosen_nodes, _used_tokens = self.mem._select_unfold_seeds(cands, k=k)  # type: ignore[attr-defined]
+                unfold_added_ids = [str(x) for x in (chosen_nodes or []) if str(x)]
+        except Exception:
+            unfold_added_ids = []
+        fork_query = self._build_fork_query(
+            current_user_prompt=prompt,
+            commit_titles=titles,
+            q1_text=getattr(self, '_q1_text', None),
+        )
+        fork_stats = self._preview_fork_context(query=fork_query or prompt, scope_mode='dep_scoped', active_override=None)
+        utf_active = list(dict.fromkeys(active_ids + unfold_added_ids))
+        utf_stats = self._preview_fork_context(query=fork_query or prompt, scope_mode='dep_scoped', active_override=utf_active)
+
+        features = {
             'step': int(step),
             'active_tokens_est': int(active_tokens),
             'active_nodes': int(active_nodes),
@@ -1357,7 +1549,38 @@ class ToolLoopLLMAgent:
             'specialist_subtask_flag': bool(specialist_subtask_flag),
             'fork_ready': bool(fork_ready),
             'fork_gate_reason': str(fork_gate_reason or ''),
+            # phase18-style learned-controller features
+            'level': 3,
+            'scenario_mixed': 1,
+            'scenario_indirect': 0,
+            'scenario_budget': 0,
+            'step_idx': int(step),
+            'history_count': int(len(history_ids)),
+            'history_token_est': int(history_token_est),
+            'history_recent_count_w6': int(history_recent_count),
+            'history_invalidated_count': int(self._controller_avoids_target_count()),
+            'pivot_message_token_count': int(len(re.findall(r"[A-Za-z_]{2,}", prompt))),
+            'trap_decision_checkpoint_count': int(candidate_count),
+            'none_context_count': int(none_stats.get('context_count', 0) or 0),
+            'none_token_est': int(none_stats.get('token_est', 0) or 0),
+            'none_recent_ratio_w6': float(none_stats.get('recent_context_ratio_w6', 0.0) or 0.0),
+            'none_update_count': int(none_stats.get('update_count', 0) or 0),
+            'none_exception_count': int(none_stats.get('exception_count', 0) or 0),
+            'none_mean_query_overlap': float(none_stats.get('mean_query_overlap', 0.0) or 0.0),
+            'unfold_context_count': int(unfold_stats.get('context_count', 0) or 0),
+            'unfold_token_est': int(unfold_stats.get('token_est', 0) or 0),
+            'unfold_update_count': int(unfold_stats.get('update_count', 0) or 0),
+            'unfold_exception_count': int(unfold_stats.get('exception_count', 0) or 0),
+            'fork_context_count': int(fork_stats.get('context_count', 0) or 0),
+            'fork_token_est': int(fork_stats.get('token_est', 0) or 0),
+            'utf_context_count': int(utf_stats.get('context_count', 0) or 0),
+            'utf_token_est': int(utf_stats.get('token_est', 0) or 0),
         }
+        features['budget_pressure_proxy'] = float(int(features['none_token_est']) / float(max(1, int(features['history_token_est']) or 1)))
+        features['unfold_cost_jump'] = float(int(features['unfold_token_est']) - int(features['none_token_est']))
+        features['fork_cost_jump'] = float(int(features['fork_token_est']) - int(features['none_token_est']))
+        features['utf_cost_jump'] = float(int(features['utf_token_est']) - int(features['none_token_est']))
+        return features
 
     def _maybe_run_context_controller(
         self,
