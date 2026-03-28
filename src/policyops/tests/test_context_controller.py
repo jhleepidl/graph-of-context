@@ -104,7 +104,14 @@ def test_learned_controller_uses_pickled_model(tmp_path: Path) -> None:
         learned_min_confidence=0.0,
     )
     feats = dict(BASE)
-    feats.update({"feature_a": 2.0, "feature_b": 0.0, "fork_ready": True, "fork_gate_reason": "ok"})
+    feats.update({
+        "feature_a": 2.0,
+        "feature_b": 0.0,
+        "fork_ready": True,
+        "fork_gate_reason": "ok",
+        "branch_score": 0.35,
+        "candidate_count": 2,
+    })
     dec = ctl.decide(current_user_prompt="decide now", features=feats)
     assert dec.action == "unfold_then_fork"
     assert dec.metadata["learned_model_type"] == "tree"

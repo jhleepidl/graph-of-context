@@ -281,6 +281,20 @@ class ToolLoopConfig:
     context_controller_min_confidence: float = 0.0
     context_controller_fallback_action: str = "unfold"
     context_controller_disable_none_action: bool = False
+    # New integrated controller/fork path.
+    #   - legacy: controller still delegates final fork readiness to the generic gate.
+    #   - integrated: controller owns the escalation decision; the gate only enforces
+    #                 lightweight safety constraints (cooldown / max calls / minimum evidence).
+    context_controller_fork_gate_mode: str = "integrated"
+    context_controller_recheck_after_unfold: bool = True
+    fork_controller_max_calls: int = 2
+    fork_controller_cooldown_steps: int = 5
+    fork_controller_min_open_pages: int = 2
+    fork_controller_min_active_tokens: int = 350
+    fork_controller_min_branch_score: float = 0.18
+    fork_controller_min_ambiguity: float = 0.35
+    fork_controller_min_pressure: float = 0.45
+    fork_controller_allow_open_only: bool = True
 
     # Debug / logging
     verbose: bool = False                 # print step progress to stdout
@@ -405,6 +419,8 @@ class ToolLoopLLMAgent:
         # For multi-commit tasks, run stage-aware commit unfold per commit index.
         self._stage_commit_unfold_done: bool = False
         self._stage_commit_unfold_done_for: set = set()
+        # Integrated controller/fork execution bookkeeping.
+        self._last_fork_step: Optional[int] = None
 
         # Optional: LLM-declared GoC connectivity (per-task reset in run()).
         self._llm_step_to_tool_nid: Dict[int, str] = {}
@@ -1209,6 +1225,106 @@ class ToolLoopLLMAgent:
         except Exception:
             pass
 
+    def _controller_fork_readiness(self, *, step: int, features: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """Unified controller-owned fork gate.
+
+        The old setup let the controller request a fork and then passed the request
+        through the generic single-stage gate, which often vetoed the action for
+        reasons that were only loosely related to the pivot state (for example,
+        missing search calls even when the task had already branched via open_page).
+
+        In integrated mode, the controller owns the escalation decision and this
+        helper only enforces lightweight safety constraints plus graph/evidence
+        readiness derived from the controller feature space.
+        """
+        mode = str(getattr(self.cfg, 'context_controller_fork_gate_mode', 'integrated') or 'integrated').lower()
+        if mode == 'legacy':
+            ready, reason = self._fork_ready_for_single_stage(step=step)
+            return ready, reason, {'gate_mode': 'legacy'}
+
+        active_tok = int(features.get('active_tokens_est', 0) or 0)
+        open_calls = int(features.get('open_page_calls', 0) or 0)
+        search_calls = int(features.get('search_calls', 0) or 0)
+        ambiguity = self._safe_float(features.get('ambiguity_score', 0.0), 0.0)
+        support_gap = self._safe_float(features.get('support_gap_score', 0.0), 0.0)
+        pivot_risk = self._safe_float(features.get('pivot_risk', 0.0), 0.0)
+        branch_score = self._safe_float(features.get('branch_score', 0.0), 0.0)
+        pressure = self._safe_float(features.get('evidence_pressure_score', 0.0), 0.0)
+        candidate_count = int(features.get('candidate_count', 0) or 0)
+        has_conflict = bool(features.get('has_conflict', False))
+
+        try:
+            min_step = int(getattr(self.cfg, 'fork_min_step', 4) or 4)
+            min_open = int(getattr(self.cfg, 'fork_controller_min_open_pages', 2) or 2)
+            min_active = int(getattr(self.cfg, 'fork_controller_min_active_tokens', 350) or 350)
+            min_branch = float(getattr(self.cfg, 'fork_controller_min_branch_score', 0.18) or 0.18)
+            min_ambiguity = float(getattr(self.cfg, 'fork_controller_min_ambiguity', 0.35) or 0.35)
+            min_pressure = float(getattr(self.cfg, 'fork_controller_min_pressure', 0.45) or 0.45)
+            max_calls = int(getattr(self.cfg, 'fork_controller_max_calls', 2) or 2)
+            cooldown_steps = int(getattr(self.cfg, 'fork_controller_cooldown_steps', 5) or 5)
+            allow_open_only = bool(getattr(self.cfg, 'fork_controller_allow_open_only', True))
+        except Exception:
+            min_step, min_open, min_active = 4, 2, 350
+            min_branch, min_ambiguity, min_pressure = 0.18, 0.35, 0.45
+            max_calls, cooldown_steps, allow_open_only = 2, 5, True
+
+        meta = {
+            'gate_mode': 'integrated',
+            'branch_score': float(branch_score),
+            'evidence_pressure_score': float(pressure),
+            'candidate_count': int(candidate_count),
+            'has_conflict': bool(has_conflict),
+            'fork_calls_so_far': int(self.counters.get('fork_calls', 0) or 0),
+        }
+
+        def _blocked(reason: str) -> Tuple[bool, str, Dict[str, Any]]:
+            self._record_fork_gate_event(step=step, mode='controller_integrated', ready=False, reason=reason, active_tok=active_tok)
+            if bool(getattr(self.cfg, 'fork_gate_trace', True)):
+                self._trace({
+                    'type': 'controller_fork_gate',
+                    'step': int(step),
+                    'ready': False,
+                    'reason': str(reason),
+                    'active_tokens_est': int(active_tok),
+                    'open_page_calls': int(open_calls),
+                    'search_calls': int(search_calls),
+                    **meta,
+                })
+            return False, reason, meta
+
+        used = int(self.counters.get('fork_calls', 0) or 0)
+        if used >= max_calls:
+            return _blocked('max_calls_exhausted')
+        if int(step) < min_step:
+            return _blocked('step_lt_min')
+        if self._last_fork_step is not None and cooldown_steps > 0 and (int(step) - int(self._last_fork_step)) < cooldown_steps:
+            meta['last_fork_step'] = int(self._last_fork_step)
+            return _blocked('cooldown')
+        if open_calls < min_open:
+            return _blocked('open_lt_min')
+        if active_tok < min_active:
+            return _blocked('active_lt_min')
+        if (not allow_open_only) and search_calls < int(getattr(self.cfg, 'fork_min_search_calls', 1) or 1):
+            return _blocked('search_lt_min')
+        if branch_score < min_branch and candidate_count < 2:
+            return _blocked('branch_lt_min')
+        if (ambiguity < min_ambiguity) and (pressure < min_pressure) and (not has_conflict) and (pivot_risk < 0.55) and (support_gap < float(getattr(self.cfg, 'context_controller_support_gap_threshold', 0.20) or 0.20)):
+            return _blocked('pressure_lt_min')
+
+        self._record_fork_gate_event(step=step, mode='controller_integrated', ready=True, reason='ok', active_tok=active_tok)
+        if bool(getattr(self.cfg, 'fork_gate_trace', True)):
+            self._trace({
+                'type': 'controller_fork_gate',
+                'step': int(step),
+                'ready': True,
+                'reason': 'ok',
+                'active_tokens_est': int(active_tok),
+                'open_page_calls': int(open_calls),
+                'search_calls': int(search_calls),
+                **meta,
+            })
+        return True, 'ok', meta
+
     def _fork_ready_for_single_stage(self, *, step: int) -> Tuple[bool, str]:
         """Trigger policy for single-stage end-to-end tasks.
 
@@ -1580,6 +1696,30 @@ class ToolLoopLLMAgent:
         features['unfold_cost_jump'] = float(int(features['unfold_token_est']) - int(features['none_token_est']))
         features['fork_cost_jump'] = float(int(features['fork_token_est']) - int(features['none_token_est']))
         features['utf_cost_jump'] = float(int(features['utf_token_est']) - int(features['none_token_est']))
+        exception_density = float(int(features['none_exception_count']) / float(max(1, int(features['none_context_count']) or 1)))
+        open_search_delta = int(features['open_page_calls']) - int(features['search_calls'])
+        branch_score = min(
+            1.0,
+            (0.24 * min(1.0, float(int(features['candidate_count']) / 2.0)))
+            + (0.22 * min(1.0, float(int(features['open_page_calls']) / 3.0)))
+            + (0.12 * min(1.0, float(max(0, int(features['active_nodes']) - 3)) / 6.0))
+            + (0.18 if bool(features['has_conflict']) else 0.0)
+            + (0.16 * min(1.0, exception_density * 2.0))
+            + (0.08 if open_search_delta > 0 else 0.0)
+        )
+        evidence_pressure_score = min(
+            1.0,
+            (0.30 * float(features['support_gap_score']))
+            + (0.24 * float(features['ambiguity_score']))
+            + (0.24 * float(features['pivot_risk']))
+            + (0.14 if bool(features['has_conflict']) else 0.0)
+            + (0.08 * min(1.0, float(int(features['missing_terms_count']) / 4.0)))
+        )
+        features['exception_density'] = float(exception_density)
+        features['open_search_delta'] = int(open_search_delta)
+        features['branch_score'] = float(branch_score)
+        features['evidence_pressure_score'] = float(evidence_pressure_score)
+        features['search_scarce_but_open_rich'] = bool(int(features['search_calls']) == 0 and int(features['open_page_calls']) >= 2)
         return features
 
     def _maybe_run_context_controller(
@@ -1598,13 +1738,17 @@ class ToolLoopLLMAgent:
         if not str(method or '').lower().startswith('goc'):
             return None, False
 
-        fork_ready, fork_gate_reason = self._fork_ready_for_single_stage(step=step)
         features = self._build_context_controller_features(
             step=step,
             current_user_prompt=current_user_prompt,
-            fork_ready=fork_ready,
-            fork_gate_reason=fork_gate_reason,
+            fork_ready=False,
+            fork_gate_reason='',
         )
+        fork_ready, fork_gate_reason, gate_meta = self._controller_fork_readiness(step=step, features=features)
+        features['fork_ready'] = bool(fork_ready)
+        features['fork_gate_reason'] = str(fork_gate_reason or '')
+        features.update({f'fork_gate_{k}': v for k, v in (gate_meta or {}).items()})
+
         decision = self.context_controller.decide(
             current_user_prompt=current_user_prompt,
             features=features,
@@ -1619,6 +1763,7 @@ class ToolLoopLLMAgent:
             'run_tag': run_tag,
             'step': int(step),
             'policy': str(getattr(self.cfg, 'context_controller_policy', 'uncertainty_aware') or 'uncertainty_aware'),
+            'fork_gate_mode': str(getattr(self.cfg, 'context_controller_fork_gate_mode', 'integrated') or 'integrated'),
             'action': str(getattr(decision, 'action', 'none') or 'none'),
             'reason': str(getattr(decision, 'reason', '') or ''),
             'features': dict(features),
@@ -1629,6 +1774,10 @@ class ToolLoopLLMAgent:
 
         executed = False
         action = str(getattr(decision, 'action', 'none') or 'none').lower()
+        post_features = features
+        post_fork_ready = fork_ready
+        post_fork_gate_reason = fork_gate_reason
+
         if action in {'unfold', 'unfold_then_fork'}:
             uq = str(getattr(decision, 'unfold_query', '') or '').strip() or str(current_user_prompt or '').strip()
             activated = self._run_unfold(
@@ -1641,9 +1790,35 @@ class ToolLoopLLMAgent:
                 run_tag=run_tag,
             )
             executed = bool(activated) or executed
+            if bool(getattr(self.cfg, 'context_controller_recheck_after_unfold', True)):
+                post_features = self._build_context_controller_features(
+                    step=step,
+                    current_user_prompt=current_user_prompt,
+                    fork_ready=False,
+                    fork_gate_reason='',
+                )
+                post_fork_ready, post_fork_gate_reason, post_gate_meta = self._controller_fork_readiness(step=step, features=post_features)
+                post_features['fork_ready'] = bool(post_fork_ready)
+                post_features['fork_gate_reason'] = str(post_fork_gate_reason or '')
+                post_features.update({f'fork_gate_{k}': v for k, v in (post_gate_meta or {}).items()})
+                if bool(getattr(self.cfg, 'context_controller_trace', True)):
+                    self._trace({
+                        'type': 'context_controller_post_unfold',
+                        'task_id': task_id,
+                        'method': method,
+                        'run_tag': run_tag,
+                        'step': int(step),
+                        'action': str(action),
+                        'activated_count': int(len(activated or [])),
+                        'fork_ready': bool(post_fork_ready),
+                        'fork_gate_reason': str(post_fork_gate_reason or ''),
+                        'features': dict(post_features),
+                    })
 
         if action in {'fork', 'unfold_then_fork'}:
-            if fork_ready:
+            allow_fork = bool(post_fork_ready if action == 'unfold_then_fork' else fork_ready)
+            block_reason = str(post_fork_gate_reason if action == 'unfold_then_fork' else fork_gate_reason)
+            if allow_fork:
                 fq = str(getattr(decision, 'fork_query', '') or '').strip() or str(current_user_prompt or '').strip()
                 node = self._run_scoped_fork(
                     query=fq,
@@ -1662,7 +1837,8 @@ class ToolLoopLLMAgent:
                     'run_tag': run_tag,
                     'step': int(step),
                     'reason': str(getattr(decision, 'reason', '') or ''),
-                    'fork_gate_reason': str(fork_gate_reason or ''),
+                    'fork_gate_reason': str(block_reason or ''),
+                    'post_unfold_recheck': bool(action == 'unfold_then_fork' and bool(getattr(self.cfg, 'context_controller_recheck_after_unfold', True))),
                 })
 
         return decision, executed
@@ -1783,8 +1959,14 @@ class ToolLoopLLMAgent:
             # Do not silently suppress the fork a second time on specialist status/confidence, or probe runs
             # will look like successful gates with zero actual fork calls.
             bypass_inner_gate = (
-                mode == 'gate_probe'
-                and bool(getattr(self.cfg, 'fork_gate_probe_run_on_ready', False))
+                (
+                    mode == 'gate_probe'
+                    and bool(getattr(self.cfg, 'fork_gate_probe_run_on_ready', False))
+                )
+                or (
+                    str(reason or '').startswith('context_controller:')
+                    and str(getattr(self.cfg, 'context_controller_fork_gate_mode', 'integrated') or 'integrated').lower() == 'integrated'
+                )
             )
             if not bypass_inner_gate and mode not in {'debug_once', 'debug_once_no_merge'}:
                 if status and status != 'ready':
@@ -1849,6 +2031,7 @@ class ToolLoopLLMAgent:
 
         self.counters['fork_calls'] += 1
         self.counters['fork_tokens'] += int(getattr(fork, 'token_count', 0) or 0)
+        self._last_fork_step = int(step)
         if reason == 'stage_commit':
             self.counters['fork_commit_calls'] += 1
         if reason == 'stage_final':

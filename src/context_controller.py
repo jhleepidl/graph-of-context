@@ -245,12 +245,19 @@ class ContextController:
             reason = "learned_none_disabled_fallback"
 
         fork_ready = bool(features.get("fork_ready", False))
+        branch_score = self._as_float(features.get("branch_score", 0.0), 0.0)
+        candidate_count = int(features.get("candidate_count", 0) or 0)
+        has_conflict = bool(features.get("has_conflict", False))
         if action == "fork" and not fork_ready:
             action = self.learned_fallback_action if self.learned_fallback_action != "fork" else "unfold"
             reason = "learned_fork_gate_blocked"
         elif action == "unfold_then_fork" and not fork_ready:
             action = "unfold"
             reason = "learned_utf_fork_gate_blocked"
+        elif action in {"fork", "unfold_then_fork"} and branch_score < 0.12 and candidate_count < 2 and not has_conflict:
+            action = self.learned_fallback_action if action == "fork" else "unfold"
+            reason = "learned_low_branch_fallback"
+            meta["learned_branch_score"] = float(branch_score)
 
         if action not in self.VALID_ACTIONS:
             action = "unfold"
@@ -462,9 +469,14 @@ class ContextController:
         fork_ready = bool(features.get("fork_ready", False))
         specialist = bool(features.get("specialist_subtask_flag", False))
         has_conflict = bool(features.get("has_conflict", False))
+        branch_score = float(features.get("branch_score", 0.0) or 0.0)
+        pressure = float(features.get("evidence_pressure_score", 0.0) or 0.0)
+        candidate_count = int(features.get("candidate_count", 0) or 0)
+        strong_branch = bool(branch_score >= 0.18 or candidate_count >= 2 or has_conflict)
+        strong_pressure = bool(pressure >= 0.45 or ambiguity >= self.fork_ambiguity_threshold or pivot_risk >= 0.75 or has_conflict)
 
         if support_gap >= self.support_gap_threshold:
-            if fork_ready and specialist and (ambiguity >= self.fork_ambiguity_threshold or has_conflict or pivot_risk >= 0.75):
+            if fork_ready and specialist and strong_branch and strong_pressure:
                 return self._finalize(
                     action="unfold_then_fork",
                     reason="uncertainty_gap_unfold_then_fork",
@@ -472,6 +484,7 @@ class ContextController:
                     features=features,
                     q1_text=q1_text,
                     commit_titles=commit_titles,
+                    extra={"branch_score": float(branch_score), "evidence_pressure_score": float(pressure)},
                 )
             return self._finalize(
                 action="unfold",
@@ -480,9 +493,10 @@ class ContextController:
                 features=features,
                 q1_text=q1_text,
                 commit_titles=commit_titles,
+                extra={"branch_score": float(branch_score), "evidence_pressure_score": float(pressure)},
             )
 
-        if fork_ready and specialist and (ambiguity >= self.fork_ambiguity_threshold or has_conflict) and pivot_risk >= 0.40:
+        if fork_ready and specialist and strong_branch and strong_pressure and pivot_risk >= 0.40:
             return self._finalize(
                 action="fork",
                 reason="uncertainty_specialist_fork",
@@ -490,9 +504,10 @@ class ContextController:
                 features=features,
                 q1_text=q1_text,
                 commit_titles=commit_titles,
+                extra={"branch_score": float(branch_score), "evidence_pressure_score": float(pressure)},
             )
 
-        if pivot_risk >= 0.65:
+        if pivot_risk >= 0.65 or pressure >= 0.52:
             return self._finalize(
                 action="unfold",
                 reason="uncertainty_pivot_unfold",
@@ -500,6 +515,7 @@ class ContextController:
                 features=features,
                 q1_text=q1_text,
                 commit_titles=commit_titles,
+                extra={"branch_score": float(branch_score), "evidence_pressure_score": float(pressure)},
             )
 
         return self._finalize(

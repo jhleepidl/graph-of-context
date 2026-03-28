@@ -98,6 +98,18 @@ def main() -> None:
     ap.add_argument('--context_controller_min_confidence', type=float, default=0.0)
     ap.add_argument('--context_controller_fallback_action', type=str, default='unfold')
     ap.add_argument('--context_controller_disable_none_action', action='store_true', default=False)
+    ap.add_argument('--context_controller_fork_gate_mode', type=str, default='integrated')
+    ap.add_argument('--context_controller_recheck_after_unfold', action='store_true', default=True)
+    ap.add_argument('--no_context_controller_recheck_after_unfold', action='store_false', dest='context_controller_recheck_after_unfold')
+    ap.add_argument('--fork_controller_max_calls', type=int, default=2)
+    ap.add_argument('--fork_controller_cooldown_steps', type=int, default=5)
+    ap.add_argument('--fork_controller_min_open_pages', type=int, default=2)
+    ap.add_argument('--fork_controller_min_active_tokens', type=int, default=350)
+    ap.add_argument('--fork_controller_min_branch_score', type=float, default=0.18)
+    ap.add_argument('--fork_controller_min_ambiguity', type=float, default=0.35)
+    ap.add_argument('--fork_controller_min_pressure', type=float, default=0.45)
+    ap.add_argument('--fork_controller_allow_open_only', action='store_true', default=True)
+    ap.add_argument('--no_fork_controller_allow_open_only', action='store_false', dest='fork_controller_allow_open_only')
     ap.add_argument('--methods', type=str, default='FullHistory,SimilarityOnly,GoC,GoC-Fork-Dep,GoC-Fork-Sim,GoC-Fork-Full')
     ap.add_argument('--seeds', type=str, default='7,13,23')
     ap.add_argument('--n_entities', type=int, default=100)
@@ -163,6 +175,16 @@ def main() -> None:
             'context_controller_min_confidence': float(args.context_controller_min_confidence),
             'context_controller_fallback_action': str(args.context_controller_fallback_action),
             'context_controller_disable_none_action': bool(args.context_controller_disable_none_action),
+            'context_controller_fork_gate_mode': str(args.context_controller_fork_gate_mode),
+            'context_controller_recheck_after_unfold': bool(args.context_controller_recheck_after_unfold),
+            'fork_controller_max_calls': int(args.fork_controller_max_calls),
+            'fork_controller_cooldown_steps': int(args.fork_controller_cooldown_steps),
+            'fork_controller_min_open_pages': int(args.fork_controller_min_open_pages),
+            'fork_controller_min_active_tokens': int(args.fork_controller_min_active_tokens),
+            'fork_controller_min_branch_score': float(args.fork_controller_min_branch_score),
+            'fork_controller_min_ambiguity': float(args.fork_controller_min_ambiguity),
+            'fork_controller_min_pressure': float(args.fork_controller_min_pressure),
+            'fork_controller_allow_open_only': bool(args.fork_controller_allow_open_only),
         },
         'prepare_kwargs': {
             'n_entities': n_entities,
@@ -258,6 +280,16 @@ def main() -> None:
             context_controller_min_confidence=float(args.context_controller_min_confidence),
             context_controller_fallback_action=str(args.context_controller_fallback_action),
             context_controller_disable_none_action=bool(args.context_controller_disable_none_action),
+            context_controller_fork_gate_mode=str(args.context_controller_fork_gate_mode),
+            context_controller_recheck_after_unfold=bool(args.context_controller_recheck_after_unfold),
+            fork_controller_max_calls=int(args.fork_controller_max_calls),
+            fork_controller_cooldown_steps=int(args.fork_controller_cooldown_steps),
+            fork_controller_min_open_pages=int(args.fork_controller_min_open_pages),
+            fork_controller_min_active_tokens=int(args.fork_controller_min_active_tokens),
+            fork_controller_min_branch_score=float(args.fork_controller_min_branch_score),
+            fork_controller_min_ambiguity=float(args.fork_controller_min_ambiguity),
+            fork_controller_min_pressure=float(args.fork_controller_min_pressure),
+            fork_controller_allow_open_only=bool(args.fork_controller_allow_open_only),
             save_goc_internal_graph=False,
             resume=False,
         )

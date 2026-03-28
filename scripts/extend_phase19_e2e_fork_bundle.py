@@ -180,6 +180,18 @@ def main() -> None:
     ap.add_argument('--context_controller_fallback_action', type=str, default=None)
     ap.add_argument('--context_controller_disable_none_action', action='store_true', default=None)
     ap.add_argument('--no_context_controller_disable_none_action', action='store_false', dest='context_controller_disable_none_action')
+    ap.add_argument('--context_controller_fork_gate_mode', type=str, default=None)
+    ap.add_argument('--context_controller_recheck_after_unfold', action='store_true', default=None)
+    ap.add_argument('--no_context_controller_recheck_after_unfold', action='store_false', dest='context_controller_recheck_after_unfold')
+    ap.add_argument('--fork_controller_max_calls', type=int, default=None)
+    ap.add_argument('--fork_controller_cooldown_steps', type=int, default=None)
+    ap.add_argument('--fork_controller_min_open_pages', type=int, default=None)
+    ap.add_argument('--fork_controller_min_active_tokens', type=int, default=None)
+    ap.add_argument('--fork_controller_min_branch_score', type=float, default=None)
+    ap.add_argument('--fork_controller_min_ambiguity', type=float, default=None)
+    ap.add_argument('--fork_controller_min_pressure', type=float, default=None)
+    ap.add_argument('--fork_controller_allow_open_only', action='store_true', default=None)
+    ap.add_argument('--no_fork_controller_allow_open_only', action='store_false', dest='fork_controller_allow_open_only')
     ap.add_argument('--dry_run', action='store_true')
     args = ap.parse_args()
 
@@ -236,6 +248,16 @@ def main() -> None:
         'context_controller_min_confidence': float(pick('context_controller_min_confidence', ctrl_cfg.get('context_controller_min_confidence', 0.0))),
         'context_controller_fallback_action': str(pick('context_controller_fallback_action', ctrl_cfg.get('context_controller_fallback_action', 'unfold'))),
         'context_controller_disable_none_action': bool(pick('context_controller_disable_none_action', ctrl_cfg.get('context_controller_disable_none_action', False))),
+        'context_controller_fork_gate_mode': str(pick('context_controller_fork_gate_mode', ctrl_cfg.get('context_controller_fork_gate_mode', 'integrated'))),
+        'context_controller_recheck_after_unfold': bool(pick('context_controller_recheck_after_unfold', ctrl_cfg.get('context_controller_recheck_after_unfold', True))),
+        'fork_controller_max_calls': int(pick('fork_controller_max_calls', ctrl_cfg.get('fork_controller_max_calls', 2))),
+        'fork_controller_cooldown_steps': int(pick('fork_controller_cooldown_steps', ctrl_cfg.get('fork_controller_cooldown_steps', 5))),
+        'fork_controller_min_open_pages': int(pick('fork_controller_min_open_pages', ctrl_cfg.get('fork_controller_min_open_pages', 2))),
+        'fork_controller_min_active_tokens': int(pick('fork_controller_min_active_tokens', ctrl_cfg.get('fork_controller_min_active_tokens', 350))),
+        'fork_controller_min_branch_score': float(pick('fork_controller_min_branch_score', ctrl_cfg.get('fork_controller_min_branch_score', 0.18))),
+        'fork_controller_min_ambiguity': float(pick('fork_controller_min_ambiguity', ctrl_cfg.get('fork_controller_min_ambiguity', 0.35))),
+        'fork_controller_min_pressure': float(pick('fork_controller_min_pressure', ctrl_cfg.get('fork_controller_min_pressure', 0.45))),
+        'fork_controller_allow_open_only': bool(pick('fork_controller_allow_open_only', ctrl_cfg.get('fork_controller_allow_open_only', True))),
     }
 
     if args.dry_run:
