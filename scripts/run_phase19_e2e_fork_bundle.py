@@ -116,6 +116,10 @@ def main() -> None:
     ap.add_argument('--n_tasks', type=int, default=48)
     ap.add_argument('--noise_docs', type=int, default=180)
     ap.add_argument('--distractors_per_entity', type=int, default=3)
+    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard'])
+    ap.add_argument('--hard_compare_ratio', type=float, default=0.35)
+    ap.add_argument('--hard_late_binding_ratio', type=float, default=0.35)
+    ap.add_argument('--hard_branch_merge_ratio', type=float, default=0.30)
     ap.add_argument('--smoke', action='store_true')
     args = ap.parse_args()
 
@@ -147,6 +151,7 @@ def main() -> None:
         'bundle_name': bundle_name,
         'created_at': ts,
         'benchmark': 'synthetic_browsecomp',
+        'benchmark_profile': str(args.benchmark_profile),
         'model': args.model,
         'task_limit': task_limit,
         'methods': methods,
@@ -203,6 +208,11 @@ def main() -> None:
             'branch_merge': True,
             'branch_merge_ratio': 0.35,
             'branch_merge_group_min': 2,
+            'benchmark_profile': str(args.benchmark_profile),
+            'hard_mode': bool(str(args.benchmark_profile) == 'hard'),
+            'hard_compare_ratio': float(args.hard_compare_ratio),
+            'hard_late_binding_ratio': float(args.hard_late_binding_ratio),
+            'hard_branch_merge_ratio': float(args.hard_branch_merge_ratio),
         },
         'runs': [],
     }
@@ -231,6 +241,11 @@ def main() -> None:
             branch_merge=True,
             branch_merge_ratio=0.35,
             branch_merge_group_min=2,
+            benchmark_profile=str(args.benchmark_profile),
+            hard_mode=bool(str(args.benchmark_profile) == 'hard'),
+            hard_compare_ratio=float(args.hard_compare_ratio),
+            hard_late_binding_ratio=float(args.hard_late_binding_ratio),
+            hard_branch_merge_ratio=float(args.hard_branch_merge_ratio),
         )
         out_jsonl = seed_runs / 'phase19_results.jsonl'
         out_report = seed_runs / 'phase19_report.md'

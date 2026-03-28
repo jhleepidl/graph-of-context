@@ -28,6 +28,7 @@ class SyntheticBrowseComp(Benchmark):
         corpus_path = data / "corpus.json"
         tasks_path = data / "tasks.json"
 
+        benchmark_profile = str(kwargs.get("benchmark_profile", "standard") or "standard")
         make_corpus_and_tasks(
             out_corpus_path=str(corpus_path),
             out_tasks_path=str(tasks_path),
@@ -42,14 +43,17 @@ class SyntheticBrowseComp(Benchmark):
             n_projects_per_task=int(kwargs.get("n_projects_per_task", 10)),
             hop_steps=int(kwargs.get("hop_steps", 4)),
             long_task_ratio=float(kwargs.get("long_task_ratio", 0.7)),
-            # Late-binding multi-turn extension
             late_binding=bool(kwargs.get("late_binding", False)),
             late_binding_ratio=float(kwargs.get("late_binding_ratio", 0.5)),
             late_binding_topn=int(kwargs.get("late_binding_topn", 2)),
-            # Branch-merge late-binding extension
             branch_merge=bool(kwargs.get("branch_merge", False)),
             branch_merge_ratio=float(kwargs.get("branch_merge_ratio", 0.35)),
             branch_merge_group_min=int(kwargs.get("branch_merge_group_min", 2)),
+            benchmark_profile=benchmark_profile,
+            hard_mode=bool(kwargs.get("hard_mode", benchmark_profile == "hard")),
+            hard_compare_ratio=float(kwargs.get("hard_compare_ratio", 0.35)),
+            hard_late_binding_ratio=float(kwargs.get("hard_late_binding_ratio", 0.35)),
+            hard_branch_merge_ratio=float(kwargs.get("hard_branch_merge_ratio", 0.30)),
         )
         return {
             "corpus_path": str(corpus_path),
@@ -59,6 +63,7 @@ class SyntheticBrowseComp(Benchmark):
             "distractors_per_entity": distractors_per_entity,
             "noise_docs": noise_docs,
             "seed": seed,
+            "benchmark_profile": benchmark_profile,
         }
 
     def load_tasks(self, data_dir: str, limit: Optional[int] = None, **kwargs) -> List[Task]:

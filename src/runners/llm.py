@@ -631,6 +631,17 @@ def run_llm(
             controller_llm=controller_llm,
             bandit_controller=bandit_ctl,
         )
+        task_meta_raw = getattr(t, 'meta', None)
+        task_meta_small: Dict[str, Any] = {}
+        if isinstance(task_meta_raw, dict):
+            keep_meta_keys = {
+                'benchmark_profile', 'task_type', 'task_slice', 'needs_alias_resolution', 'needs_rule_doc',
+                'needs_multi_support', 'has_stale_rule_distractor', 'late_binding_style', 'n_turns',
+                'late_binding_topn', 'code_initial', 'active_policy_docid', 'active_policy_cutoff_year'
+            }
+            for k, v in task_meta_raw.items():
+                if (k in keep_meta_keys) and isinstance(v, (str, int, float, bool)):
+                    task_meta_small[k] = v
         internal_graph_path = (
             str(internal_graph_dir / f"{t.id}.jsonl")
             if bool(save_goc_internal_graph)
@@ -667,6 +678,10 @@ def run_llm(
                 "explanation": expl,
                 "run_tag": run_tag,
                 "retriever_kind": retriever_kind,
+                "task_type": task_meta_small.get('task_type'),
+                "task_slice": task_meta_small.get('task_slice'),
+                "benchmark_profile": task_meta_small.get('benchmark_profile'),
+                "task_meta": task_meta_small,
                 "goc_internal_graph_jsonl_path": internal_graph_path,
             }
         except Exception as e:
@@ -689,6 +704,10 @@ def run_llm(
                 "explanation": "",
                 "run_tag": run_tag,
                 "retriever_kind": retriever_kind,
+                "task_type": task_meta_small.get('task_type'),
+                "task_slice": task_meta_small.get('task_slice'),
+                "benchmark_profile": task_meta_small.get('benchmark_profile'),
+                "task_meta": task_meta_small,
                 "goc_internal_graph_jsonl_path": internal_graph_path,
                 "error": str(e),
             }
