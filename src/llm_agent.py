@@ -2621,6 +2621,42 @@ class ToolLoopLLMAgent:
             return out
         return None
 
+    def _find_exact_structured_result_docid(self, query: str, results: List[Dict[str, Any]]) -> Optional[str]:
+        qinfo = self._classify_structured_lookup_query(query)
+        if not qinfo:
+            return None
+        kind = str(qinfo.get("kind") or "")
+        handle = str(qinfo.get("handle") or "")
+        project = str(qinfo.get("project") or "")
+        expected_title: Optional[str] = None
+        if kind == "field_note" and handle:
+            expected_title = f"{handle} Field Note"
+        elif kind == "official_profile" and project:
+            expected_title = f"{project} Official"
+        elif kind == "approval" and project:
+            expected_title = f"Operating City Approval - {project}"
+        elif kind == "revocation" and project:
+            expected_title = f"Exception Revocation - {project}"
+        elif kind == "exception" and project:
+            expected_title = f"Legacy Operating Exception - {project}"
+        if not expected_title:
+            return None
+        expected_norm = self._normalize_query(expected_title)
+        best_docid: Optional[str] = None
+        for r in results or []:
+            try:
+                did = str(r.get("docid") or "").strip()
+                title = str(r.get("title") or "").strip()
+            except Exception:
+                continue
+            if not did or not title:
+                continue
+            if self._normalize_query(title) == expected_norm:
+                return did
+            if best_docid is None and expected_norm in self._normalize_query(title):
+                best_docid = did
+        return best_docid
+
     def _record_structured_page_signals(self, *, docid: Optional[str], title: str, content: str) -> None:
         txt = str(content or "")
         ttl = str(title or "")
@@ -4551,6 +4587,62 @@ class ToolLoopLLMAgent:
                         "args": {"query": query, "topk": topk},
                         "result_docids": [x["docid"] for x in out[: min(20, len(out))]],
                     })
+
+                    # Structured dependency tasks often waste many steps on exact lookup loops
+                    # (e.g., repeating '<handle> field note' and then separately opening the obvious top hit).
+                    # When the search query already targets a unique structured page and the result title
+                    # matches exactly, open it immediately as a policy optimization.
+                    try:
+                        auto_open_docid = None
+                        if str(task_meta.get("task_slice") or "") == "dependency_necessary":
+                            auto_open_docid = self._find_exact_structured_result_docid(query, out)
+                        if auto_open_docid and auto_open_docid not in self.opened_cache:
+                            self.counters["policy_overrides"] += 1
+                            self.counters["structured_lookup_exact_auto_open"] += 1
+                            outp = self.tools.open_page(docid=auto_open_docid)
+                            self.counters["open_page_calls"] += 1
+                            content = (outp.get("content") or "")
+                            self.opened_cache[outp["docid"]] = content
+                            if outp["docid"] not in self.evidence_docids:
+                                self.evidence_docids.append(outp["docid"])
+                            prefix = self._authority_prefix(content) if content else ""
+                            view = self._select_open_page_view(content, {"section": "head"})
+                            view_content = view.get("view") or ""
+                            tag = "[POLICY OVERRIDE] " + (view.get("tag") or "")
+                            obs = self._compose_open_page_observation_view(content, view_content, prefix, tag)
+                            view_key = self._open_view_key(outp["docid"], None, {"section": "head"})
+                            self.opened_view_cache[view_key] = view_content
+                            self._record_structured_page_signals(docid=outp.get("docid"), title=str(outp.get("title") or ""), content=content)
+                            self._record_tool_step(
+                                step0=step,
+                                call=call,
+                                tool_name="open_page",
+                                args={"docid": auto_open_docid, "section": "head"},
+                                observation=obs,
+                                docids=[outp["docid"], self._sig_open_docid(outp["docid"])],
+                                storage_text=content,
+                                task_id=task_id,
+                                method=method,
+                                run_tag=run_tag,
+                            )
+                            self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
+                            self._last_progress_step = step
+                            self._trace({
+                                "type": "policy_override",
+                                "task_id": task_id,
+                                "method": method,
+                                "run_tag": run_tag,
+                                "step": step,
+                                "from_tool": "search",
+                                "to_tool": "open_page",
+                                "reason": "structured_exact_auto_open",
+                                "query": query,
+                                "opened_docid": auto_open_docid,
+                            })
+                            if self.cfg.verbose:
+                                print(f"[{run_tag}][{method}][{task_id}] OVERRIDE structured exact search->open_page docid={auto_open_docid}", flush=True)
+                    except Exception:
+                        pass
 
                 elif tool == "open_page":
 
