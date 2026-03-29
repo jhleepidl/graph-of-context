@@ -343,13 +343,13 @@ def make_corpus_and_tasks(
     if structured_mode:
         if profile_name == "structured_lite":
             default_compare_candidates = 4
-            default_dependency_candidates = 3
+            default_dependency_candidates = 2
         elif profile_name == "structured_extreme":
             default_compare_candidates = 6
-            default_dependency_candidates = 5
+            default_dependency_candidates = 4
         else:
             default_compare_candidates = 5
-            default_dependency_candidates = 4
+            default_dependency_candidates = 3
         structured_compare_candidates = int(structured_compare_candidates or default_compare_candidates)
         structured_dependency_candidates = int(structured_dependency_candidates or default_dependency_candidates)
     entities = [gen_entity(rng, i) for i in range(n_entities)]
@@ -453,6 +453,28 @@ def make_corpus_and_tasks(
     def _revocation_docid_for(name: str) -> str | None:
         return revocation_map.get(name)
 
+    def _alias_family(entity: Dict[str, Any]) -> str:
+        return str(entity.get("alias_handle", "")).split("-", 1)[0]
+
+    def _pick_structured_dependency_entities(k: int, allow_active: bool) -> List[Dict[str, Any]]:
+        pool = [e for e in entities if allow_active or str(e.get("exception_state", "none")) in {"none", "revoked"}]
+        if len(pool) < k:
+            pool = list(entities)
+        best: List[Dict[str, Any]] | None = None
+        best_score: tuple[int, int, int] | None = None
+        for _ in range(64):
+            es = rng.sample(pool, k)
+            families = {_alias_family(e) for e in es}
+            years = sorted(int(e.get("start_year", 0)) for e in es)
+            min_gap = min((b - a) for a, b in zip(years, years[1:])) if len(years) > 1 else 99
+            score = (len(families), min_gap, len({int(e.get("start_year", 0)) for e in es}))
+            if len(families) == len(es) and min_gap >= 2:
+                return es
+            if best_score is None or score > best_score:
+                best = es
+                best_score = score
+        return best or rng.sample(pool, k)
+
     def _structured_support_docids(name: str) -> List[str]:
         docs = [_docid_for(name), _approval_docid_for(name), _archived_docid_for(name)]
         exc = _exception_docid_for(name)
@@ -460,6 +482,21 @@ def make_corpus_and_tasks(
         if exc:
             docs.append(exc)
         if rev:
+            docs.append(rev)
+        return docs
+
+    def _structured_dependency_docids(
+        name: str,
+        *,
+        include_exception: bool,
+        include_revocation: bool,
+    ) -> List[str]:
+        docs = [_docid_for(name), _approval_docid_for(name)]
+        exc = _exception_docid_for(name)
+        rev = _revocation_docid_for(name)
+        if include_exception and exc:
+            docs.append(exc)
+        if include_revocation and rev:
             docs.append(rev)
         return docs
 
@@ -501,25 +538,49 @@ def make_corpus_and_tasks(
         }
 
     def _structured_dependency_task(task_id: str) -> Dict[str, Any]:
-        k = max(3, int(structured_dependency_candidates or 3))
-        es = _pick_entities(k)
+        profile_name_local = str(benchmark_profile or "structured").strip().lower()
+        lite_mode = profile_name_local == "structured_lite"
+        min_candidates = 2 if lite_mode else 3
+        k = max(min_candidates, int(structured_dependency_candidates or min_candidates))
+        es = _pick_structured_dependency_entities(k=k, allow_active=not lite_mode)
         target = min(es, key=lambda x: x["start_year"])
         handles = [e["alias_handle"] for e in es]
         projects = [e["name"] for e in es]
         final_city = _final_operating_city(target)
-        gold_docids = [_alias_docid_for(e["name"]) for e in es] + [_docid_for(e["name"]) for e in es] + _structured_support_docids(target["name"])
-        q = (
-            "You must use evidence from opened pages.\n"
-            f"Candidate handles: {', '.join(handles)}.\n"
-            "First resolve each handle via its FIELD NOTE page to the canonical project. Then open the OFFICIAL PROFILE pages and identify the project with the earliest start_year.\n"
-            "For that selected project, determine the CURRENT operating city using the OFFICIAL PROFILE plus any Operating City Approval, Legacy Operating Exception, and Exception Revocation notices for the same project. Archived status boards may be stale and should not be used for current reporting.\n"
-            "Answer exactly as '<ProjectName> | <City>'."
+        exception_state = str(target.get("exception_state", "none"))
+        include_exception = (not lite_mode) and bool(_exception_docid_for(target["name"]))
+        include_revocation = bool(_revocation_docid_for(target["name"]))
+        dependency_docids = _structured_dependency_docids(
+            target["name"],
+            include_exception=include_exception,
+            include_revocation=include_revocation,
         )
+        gold_docids = [_alias_docid_for(e["name"]) for e in es] + [_docid_for(e["name"]) for e in es] + dependency_docids
+        if lite_mode:
+            q = (
+                "You must use evidence from opened pages.\n"
+                f"Candidate handles ({len(handles)} total): {', '.join(handles)}.\n"
+                "Resolve each handle via its FIELD NOTE page, then open the matching OFFICIAL PROFILE pages and identify the project with the earliest start_year.\n"
+                "For that selected project, determine the CURRENT operating city using the Operating City Approval notice. If there is a later Exception Revocation notice for the same project, treat the approval as current again.\n"
+                "Answer exactly as '<ProjectName> | <City>'."
+            )
+            required = ["alias_handle", "start_year", "approval_ticket"]
+            support_variant = "approval_or_revoked"
+        else:
+            q = (
+                "You must use evidence from opened pages.\n"
+                f"Candidate handles ({len(handles)} total): {', '.join(handles)}.\n"
+                "First resolve each handle via its FIELD NOTE page to the canonical project. Then open the OFFICIAL PROFILE pages and identify the project with the earliest start_year.\n"
+                "For that selected project, determine the CURRENT operating city using the OFFICIAL PROFILE plus any Operating City Approval, Legacy Operating Exception, and Exception Revocation notices for the same project.\n"
+                "Answer exactly as '<ProjectName> | <City>'."
+            )
+            required = ["alias_handle", "start_year", "headquarters", "approval_ticket", "exception_ticket"]
+            support_variant = "full_chain"
         return {
             "id": task_id,
             "question": q,
             "entities": projects,
-            "required": ["alias_handle", "start_year", "headquarters", "approval_ticket", "exception_ticket"],
+            "required": required,
             "answer": f"{target['name']} | {final_city}",
             "gold_docids": list(dict.fromkeys(gold_docids)),
             **_structured_meta(
@@ -528,8 +589,10 @@ def make_corpus_and_tasks(
                 extra={
                     "candidate_handles": handles,
                     "target_project": target["name"],
+                    "target_exception_state": exception_state,
                     "n_candidates": len(projects),
-                    "required_support_count": len(_structured_support_docids(target["name"])),
+                    "required_support_count": len(dependency_docids),
+                    "support_variant": support_variant,
                 },
             ),
         }

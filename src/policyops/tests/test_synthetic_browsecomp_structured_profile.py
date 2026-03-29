@@ -73,3 +73,31 @@ def test_structured_branch_tasks_require_natural_support_chain(tmp_path: Path) -
             assert any(str(d).startswith('D_REVOCATION_') for d in gold_docids)
             rev_docs = [docs[str(d)] for d in gold_docids if str(d).startswith('D_REVOCATION_')]
             assert rev_docs and all('revokes_exception_ticket' in str(doc.get('content')) for doc in rev_docs)
+
+
+def test_structured_lite_dependency_tasks_are_calibrated_for_runtime(tmp_path: Path) -> None:
+    bench = SyntheticBrowseComp()
+    bench.prepare(
+        data_dir=str(tmp_path),
+        n_entities=20,
+        n_tasks=16,
+        distractors_per_entity=1,
+        noise_docs=8,
+        seed=17,
+        long_horizon=True,
+        benchmark_profile='structured_lite',
+    )
+    _corpus, tasks = _load(tmp_path)
+
+    dep_tasks = [task for task in tasks if task.get('task_slice') == 'dependency_necessary']
+    assert dep_tasks
+    for task in dep_tasks:
+        assert task.get('task_type') == 'structured_dependency_current_city'
+        assert int(task.get('n_candidates') or 0) <= 2
+        assert str(task.get('target_exception_state')) in {'none', 'revoked'}
+        assert str(task.get('support_variant')) == 'approval_or_revoked'
+        assert int(task.get('required_support_count') or 0) <= 3
+        q = str(task.get('question') or '').lower()
+        assert 'candidate handles (2 total)' in q
+        assert 'legacy operating exception' not in q
+        assert 'archived status boards' not in q
