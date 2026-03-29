@@ -384,6 +384,12 @@ class ToolLoopLLMAgent:
         self._structured_candidate_handles: List[str] = []
         self._structured_handle_to_project: Dict[str, str] = {}
         self._structured_project_docids: Dict[str, str] = {}
+        self._structured_project_years: Dict[str, int] = {}
+        self._structured_project_hq: Dict[str, str] = {}
+        self._structured_project_approval_city: Dict[str, str] = {}
+        self._structured_project_exception_city: Dict[str, str] = {}
+        self._structured_project_exception_ticket: Dict[str, str] = {}
+        self._structured_project_revoked: set[str] = set()
         self._structured_lookup_seen: Counter = Counter()
         self._finish_block_counts: Counter = Counter()
         self._deadline_nudged: bool = False
@@ -2592,6 +2598,54 @@ class ToolLoopLLMAgent:
             pass
         return target_call
 
+    def _maybe_override_structured_lookup_search(
+        self,
+        *,
+        query: str,
+        qnorm: str,
+        step: int,
+        topk: int,
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        qinfo = self._classify_structured_lookup_query(query)
+        if not qinfo:
+            return None
+
+        kind = str(qinfo.get("kind") or "")
+        handle = str(qinfo.get("handle") or "").strip()
+        project = str(qinfo.get("project") or "").strip()
+
+        desired_q: Optional[str] = None
+        reason: Optional[str] = None
+
+        if kind == "field_note" and handle:
+            resolved_project = self._structured_handle_to_project.get(handle.lower())
+            if resolved_project:
+                desired_q = f"{resolved_project} official profile"
+                reason = "structured_handle_resolved_rewrite"
+        elif kind == "official_profile" and project and bool(getattr(self.cfg, "structured_dependency_planner", True)):
+            # If the profile is already parsed for a current-city chain task, move to the next required support.
+            current_city_task = bool(getattr(self, "_structured_candidate_handles", None))
+            if current_city_task and project in self._structured_project_years and project not in self._structured_project_approval_city:
+                desired_q = f"{project} operating city approval"
+                reason = "structured_profile_to_approval"
+
+        if not desired_q or self._normalize_query(desired_q) == qnorm:
+            return None
+
+        self.counters["policy_overrides"] += 1
+        self.counters["structured_lookup_rewrites"] += 1
+        self._policy_record_constraint_once(
+            key=f"structured_lookup:{reason}:{self._normalize_query(desired_q)}",
+            text=(
+                "[CONSTRAINT] Structured lookup task: stop repeating already-resolved handle lookups. "
+                f"Focus next on: {desired_q}"
+            ),
+        )
+        return reason, {"tool": "search", "args": {"query": desired_q, "topk": topk}}
+
     def _classify_structured_lookup_query(self, query: str) -> Optional[Dict[str, str]]:
         q = str(query or "").strip()
         if not q:
@@ -2700,6 +2754,18 @@ class ToolLoopLLMAgent:
                         f"[SYSTEM] Parsed current operating-city approval for {project}: {city.group(1)}."
                     )
 
+            if project and ("LEGACY OPERATING EXCEPTION" in txt or "Legacy Operating Exception" in ttl):
+                city = re.search(r"(?im)^override_city:\s*(City_\d+)\s*$", txt)
+                ticket = re.search(r"(?im)^exception_ticket:\s*([A-Z]{3}-\d{4}-[A-Z]{3})\s*$", txt)
+                if city:
+                    self._structured_project_exception_city[project] = city.group(1)
+                if ticket:
+                    self._structured_project_exception_ticket[project] = ticket.group(1)
+                if city:
+                    self.mem.record_msg(
+                        f"[SYSTEM] Parsed active legacy exception for {project}: override_city={city.group(1)} until a later revocation is opened."
+                    )
+
             if project and ("EXCEPTION REVOCATION" in txt or "Exception Revocation" in ttl):
                 self._structured_project_revoked.add(project)
                 self.mem.record_msg(
@@ -2708,8 +2774,21 @@ class ToolLoopLLMAgent:
         except Exception:
             return
 
+    def _structured_expected_current_city(self, project: Optional[str]) -> Optional[str]:
+        if not project:
+            return None
+        if project in self._structured_project_revoked:
+            return self._structured_project_approval_city.get(project) or self._structured_project_hq.get(project)
+        if project in self._structured_project_exception_city:
+            return self._structured_project_exception_city.get(project)
+        return self._structured_project_approval_city.get(project) or self._structured_project_hq.get(project)
+
     def _structured_dependency_status(self, task_meta: Dict[str, Any]) -> Dict[str, Any]:
+        slice_name = str(task_meta.get("task_slice") or "")
         handles = [str(h).strip() for h in (task_meta.get("candidate_handles") or []) if str(h).strip()]
+        target_handle = str(task_meta.get("target_handle") or "").strip()
+        if target_handle and target_handle not in handles:
+            handles.append(target_handle)
         resolved = []
         unresolved = []
         for h in handles:
@@ -2721,8 +2800,31 @@ class ToolLoopLLMAgent:
         projects = [proj for _h, proj in resolved]
         missing_profiles = [p for p in projects if p not in self._structured_project_years]
         selected_project = None
-        if projects and not missing_profiles:
-            selected_project = min(projects, key=lambda p: (int(self._structured_project_years.get(p, 99999)), p))
+        if slice_name == "dependency_necessary":
+            if projects and not missing_profiles:
+                selected_project = min(projects, key=lambda p: (int(self._structured_project_years.get(p, 99999)), p))
+        else:
+            target_project = str(task_meta.get("target_project") or "").strip()
+            if target_project:
+                selected_project = target_project
+            elif target_handle:
+                selected_project = self._structured_handle_to_project.get(target_handle.lower())
+            elif projects:
+                selected_project = projects[0]
+        selected_approval_city = self._structured_project_approval_city.get(selected_project) if selected_project else None
+        selected_exception_city = self._structured_project_exception_city.get(selected_project) if selected_project else None
+        selected_current_city = self._structured_expected_current_city(selected_project)
+        expected_exception_state = str(task_meta.get("target_exception_state") or task_meta.get("exception_state") or "none").strip().lower()
+
+        missing_support: List[str] = []
+        if selected_project:
+            if selected_project not in self._structured_project_approval_city:
+                missing_support.append("approval")
+            if expected_exception_state in {"active", "revoked"} and selected_project not in self._structured_project_exception_city:
+                missing_support.append("exception")
+            if expected_exception_state == "revoked" and selected_project not in self._structured_project_revoked:
+                missing_support.append("revocation")
+
         return {
             "handles": handles,
             "resolved": resolved,
@@ -2730,7 +2832,12 @@ class ToolLoopLLMAgent:
             "projects": projects,
             "missing_profiles": missing_profiles,
             "selected_project": selected_project,
-            "selected_approval_city": self._structured_project_approval_city.get(selected_project) if selected_project else None,
+            "selected_approval_city": selected_approval_city,
+            "selected_exception_city": selected_exception_city,
+            "selected_current_city": selected_current_city,
+            "selected_revoked": bool(selected_project and selected_project in self._structured_project_revoked),
+            "expected_exception_state": expected_exception_state,
+            "missing_support": missing_support,
         }
 
     def _maybe_override_structured_dependency_search(
@@ -2742,7 +2849,9 @@ class ToolLoopLLMAgent:
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         if not bool(getattr(self.cfg, "structured_dependency_planner", True)):
             return None
-        if str(task_meta.get("task_slice") or "") != "dependency_necessary":
+
+        slice_name = str(task_meta.get("task_slice") or "")
+        if slice_name not in {"dependency_necessary", "branch_resolution", "support_recovery"}:
             return None
 
         status = self._structured_dependency_status(task_meta)
@@ -2759,11 +2868,18 @@ class ToolLoopLLMAgent:
                 desired_q = f"{missing_profiles[0]} official profile"
                 reason = "structured_dependency_missing_profile"
             else:
-                selected = status.get("selected_project")
-                selected_city = status.get("selected_approval_city")
-                if selected and not selected_city:
-                    desired_q = f"{selected} operating city approval"
-                    reason = "structured_dependency_missing_approval"
+                selected = str(status.get("selected_project") or "").strip()
+                missing_support = list(status.get("missing_support") or [])
+                if selected and missing_support:
+                    if "approval" in missing_support:
+                        desired_q = f"{selected} operating city approval"
+                        reason = "structured_dependency_missing_approval"
+                    elif "exception" in missing_support:
+                        desired_q = f"{selected} legacy operating exception"
+                        reason = "structured_dependency_missing_exception"
+                    elif "revocation" in missing_support:
+                        desired_q = f"{selected} exception revocation"
+                        reason = "structured_dependency_missing_revocation"
 
         if not desired_q:
             return None
@@ -2775,8 +2891,9 @@ class ToolLoopLLMAgent:
         self._policy_record_constraint_once(
             key=f"structured_dep:{reason}:{self._normalize_query(desired_q)}",
             text=(
-                "[CONSTRAINT] Structured dependency task: first resolve all candidate handles, then compare OFFICIAL PROFILE start_year values, "
-                "then use OPERATING CITY APPROVAL (and a later revocation if present) for the selected earliest project. "
+                "[CONSTRAINT] Structured current-city task: resolve the handle to the canonical project, open the OFFICIAL PROFILE, "
+                "then recover the operating-city chain in order: approval -> exception -> revocation (when present). "
+                "Do not answer from headquarters or archived snapshots until that chain is complete. "
                 f"Focus next on: {desired_q}"
             ),
         )
@@ -3564,6 +3681,8 @@ class ToolLoopLLMAgent:
         self._structured_project_years = {}
         self._structured_project_hq = {}
         self._structured_project_approval_city = {}
+        self._structured_project_exception_city = {}
+        self._structured_project_exception_ticket = {}
         self._structured_project_revoked = set()
         self._structured_lookup_seen = Counter()
         self._finish_block_counts = Counter()
@@ -4594,7 +4713,7 @@ class ToolLoopLLMAgent:
                     # matches exactly, open it immediately as a policy optimization.
                     try:
                         auto_open_docid = None
-                        if str(task_meta.get("task_slice") or "") == "dependency_necessary":
+                        if bool(task_meta.get("supports_current_city_chain")) or str(task_meta.get("task_slice") or "") == "dependency_necessary":
                             auto_open_docid = self._find_exact_structured_result_docid(query, out)
                         if auto_open_docid and auto_open_docid not in self.opened_cache:
                             self.counters["policy_overrides"] += 1
@@ -5538,14 +5657,19 @@ class ToolLoopLLMAgent:
 
                         if (
                             bool(getattr(self.cfg, "structured_dependency_finish_guard", True))
-                            and str(task_meta.get("task_slice") or "") == "dependency_necessary"
+                            and (bool(task_meta.get("supports_current_city_chain")) or str(task_meta.get("task_slice") or "") == "dependency_necessary")
                         ):
                             dep_status = self._structured_dependency_status(task_meta)
                             unresolved = list(dep_status.get("unresolved_handles") or [])
                             missing_profiles = list(dep_status.get("missing_profiles") or [])
+                            missing_support = list(dep_status.get("missing_support") or [])
                             selected_proj = dep_status.get("selected_project")
-                            selected_city = dep_status.get("selected_approval_city")
-                            if unresolved or missing_profiles:
+                            selected_city = dep_status.get("selected_current_city")
+                            selected_exception_state = str(dep_status.get("expected_exception_state") or "none")
+                            pair_norm = normalize_project_city_pair(ans)
+                            pair_proj = pair_norm.split(" | ")[0] if pair_norm else None
+                            pair_city = pair_norm.split(" | ")[1] if pair_norm else None
+                            if str(task_meta.get("task_slice") or "") == "dependency_necessary" and (unresolved or missing_profiles):
                                 self.counters["premature_finish_blocked"] += 1
                                 self._last_finish_block_reason = "structured_dependency_incomplete"
                                 msg = "[SYSTEM] finish blocked: for this dependency task, resolve EVERY candidate handle and open EVERY candidate OFFICIAL PROFILE before answering."
@@ -5555,27 +5679,34 @@ class ToolLoopLLMAgent:
                                     msg += f" Missing OFFICIAL PROFILE evidence for: {', '.join(missing_profiles[:3])}."
                                 self.mem.record_msg(msg)
                                 continue
-                            pair_proj = normalize_project_city_pair(ans).split(" | ")[0] if normalize_project_city_pair(ans) else None
-                            pair_city = normalize_project_city_pair(ans).split(" | ")[1] if normalize_project_city_pair(ans) else None
                             if selected_proj and pair_proj and pair_proj != selected_proj:
                                 self.counters["premature_finish_blocked"] += 1
                                 self._last_finish_block_reason = "structured_dependency_wrong_project"
                                 self.mem.record_msg(
-                                    f"[SYSTEM] finish blocked: comparing parsed OFFICIAL PROFILE start_year values, the earliest candidate project is {selected_proj}. Re-check the comparison before answering."
+                                    f"[SYSTEM] finish blocked: comparing parsed OFFICIAL PROFILE start_year values, the supported project is {selected_proj}. Re-check the comparison before answering."
                                 )
                                 continue
-                            if selected_proj and not selected_city:
+                            if selected_proj and missing_support:
                                 self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "structured_dependency_missing_approval"
+                                self._last_finish_block_reason = "structured_dependency_missing_support"
+                                need_parts = []
+                                if "approval" in missing_support:
+                                    need_parts.append("OPERATING CITY APPROVAL")
+                                if "exception" in missing_support:
+                                    need_parts.append("LEGACY OPERATING EXCEPTION")
+                                if "revocation" in missing_support:
+                                    need_parts.append("EXCEPTION REVOCATION")
                                 self.mem.record_msg(
-                                    f"[SYSTEM] finish blocked: you still need the OPERATING CITY APPROVAL for {selected_proj}. Do not use headquarters as the final operating city."
+                                    f"[SYSTEM] finish blocked: you still need supporting current-city evidence for {selected_proj}: {', '.join(need_parts)}. "
+                                    f"For exception_state={selected_exception_state}, do not answer from headquarters, approval, or archived snapshots until that chain is opened."
                                 )
                                 continue
                             if selected_proj and selected_city and pair_city and pair_city != selected_city:
                                 self.counters["premature_finish_blocked"] += 1
                                 self._last_finish_block_reason = "structured_dependency_wrong_city"
                                 self.mem.record_msg(
-                                    f"[SYSTEM] finish blocked: the approved current operating city for {selected_proj} from opened evidence is {selected_city}. Do not answer with headquarters or a stale city."
+                                    f"[SYSTEM] finish blocked: the current operating city for {selected_proj} from opened evidence is {selected_city}. "
+                                    "Do not answer with headquarters, approval-only, or a stale archived city when the exception/revocation chain implies a different city."
                                 )
                                 continue
 
