@@ -50,10 +50,17 @@ class SyntheticBrowseComp(Benchmark):
             branch_merge_ratio=float(kwargs.get("branch_merge_ratio", 0.35)),
             branch_merge_group_min=int(kwargs.get("branch_merge_group_min", 2)),
             benchmark_profile=benchmark_profile,
-            hard_mode=bool(kwargs.get("hard_mode", benchmark_profile == "hard")),
+            hard_mode=bool(kwargs.get("hard_mode", benchmark_profile in {"hard", "hard_lite", "hard_extreme"})),
             hard_compare_ratio=float(kwargs.get("hard_compare_ratio", 0.35)),
             hard_late_binding_ratio=float(kwargs.get("hard_late_binding_ratio", 0.35)),
             hard_branch_merge_ratio=float(kwargs.get("hard_branch_merge_ratio", 0.30)),
+            hard_compare_candidates=(None if kwargs.get("hard_compare_candidates") is None else int(kwargs.get("hard_compare_candidates"))),
+            hard_late_candidates=(None if kwargs.get("hard_late_candidates") is None else int(kwargs.get("hard_late_candidates"))),
+            hard_branch_candidates=(None if kwargs.get("hard_branch_candidates") is None else int(kwargs.get("hard_branch_candidates"))),
+            structured_dependency_ratio=float(kwargs.get("structured_dependency_ratio", 0.35)),
+            structured_branch_ratio=float(kwargs.get("structured_branch_ratio", 0.35)),
+            structured_compare_candidates=(None if kwargs.get("structured_compare_candidates") is None else int(kwargs.get("structured_compare_candidates"))),
+            structured_dependency_candidates=(None if kwargs.get("structured_dependency_candidates") is None else int(kwargs.get("structured_dependency_candidates"))),
         )
         return {
             "corpus_path": str(corpus_path),

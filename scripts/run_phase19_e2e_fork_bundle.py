@@ -37,6 +37,23 @@ def _avg(xs: List[float]) -> float:
     return sum(xs) / max(1, len(xs))
 
 
+def _default_max_steps(profile: str) -> int:
+    name = str(profile or 'standard').strip().lower()
+    if name == 'hard_lite':
+        return 42
+    if name == 'hard':
+        return 48
+    if name == 'hard_extreme':
+        return 56
+    if name == 'structured_lite':
+        return 40
+    if name == 'structured':
+        return 44
+    if name == 'structured_extreme':
+        return 52
+    return 35
+
+
 def _summarize_jsonl(jsonl_path: Path) -> List[Dict[str, Any]]:
     rows = [json.loads(line) for line in jsonl_path.read_text(encoding='utf-8').splitlines() if line.strip()]
     by_method: Dict[str, List[Dict[str, Any]]] = {}
@@ -67,6 +84,7 @@ def main() -> None:
     ap.add_argument('--model', type=str, default='gpt-4.1-mini')
     ap.add_argument('--dotenv', type=str, default='.env')
     ap.add_argument('--task_limit', type=int, default=24)
+    ap.add_argument('--max_steps', type=int, default=None)
     ap.add_argument('--parallel_tasks', type=int, default=1)
     ap.add_argument('--budget_active', type=int, default=1200)
     ap.add_argument('--budget_unfold', type=int, default=650)
@@ -116,10 +134,17 @@ def main() -> None:
     ap.add_argument('--n_tasks', type=int, default=48)
     ap.add_argument('--noise_docs', type=int, default=180)
     ap.add_argument('--distractors_per_entity', type=int, default=3)
-    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard'])
+    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard_lite', 'hard', 'hard_extreme', 'structured_lite', 'structured', 'structured_extreme'])
+    ap.add_argument('--hard_compare_candidates', type=int, default=None)
+    ap.add_argument('--hard_late_candidates', type=int, default=None)
+    ap.add_argument('--hard_branch_candidates', type=int, default=None)
     ap.add_argument('--hard_compare_ratio', type=float, default=0.35)
     ap.add_argument('--hard_late_binding_ratio', type=float, default=0.35)
     ap.add_argument('--hard_branch_merge_ratio', type=float, default=0.30)
+    ap.add_argument('--structured_dependency_ratio', type=float, default=0.35)
+    ap.add_argument('--structured_branch_ratio', type=float, default=0.35)
+    ap.add_argument('--structured_compare_candidates', type=int, default=None)
+    ap.add_argument('--structured_dependency_candidates', type=int, default=None)
     ap.add_argument('--smoke', action='store_true')
     args = ap.parse_args()
 
@@ -143,6 +168,8 @@ def main() -> None:
         n_entities = min(n_entities, 40)
         noise_docs = min(noise_docs, 80)
 
+    max_steps = int(args.max_steps) if args.max_steps is not None else _default_max_steps(str(args.benchmark_profile))
+
     methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
     seeds = [int(s.strip()) for s in str(args.seeds).split(',') if s.strip()]
     bench = SyntheticBrowseComp()
@@ -154,6 +181,7 @@ def main() -> None:
         'benchmark_profile': str(args.benchmark_profile),
         'model': args.model,
         'task_limit': task_limit,
+        'max_steps': max_steps,
         'methods': methods,
         'seeds': seeds,
         'fork_runtime_kwargs': {
@@ -209,10 +237,17 @@ def main() -> None:
             'branch_merge_ratio': 0.35,
             'branch_merge_group_min': 2,
             'benchmark_profile': str(args.benchmark_profile),
-            'hard_mode': bool(str(args.benchmark_profile) == 'hard'),
+            'hard_mode': bool(str(args.benchmark_profile) in {'hard', 'hard_lite', 'hard_extreme'}),
             'hard_compare_ratio': float(args.hard_compare_ratio),
             'hard_late_binding_ratio': float(args.hard_late_binding_ratio),
             'hard_branch_merge_ratio': float(args.hard_branch_merge_ratio),
+            'hard_compare_candidates': (None if args.hard_compare_candidates is None else int(args.hard_compare_candidates)),
+            'hard_late_candidates': (None if args.hard_late_candidates is None else int(args.hard_late_candidates)),
+            'hard_branch_candidates': (None if args.hard_branch_candidates is None else int(args.hard_branch_candidates)),
+            'structured_dependency_ratio': float(args.structured_dependency_ratio),
+            'structured_branch_ratio': float(args.structured_branch_ratio),
+            'structured_compare_candidates': (None if args.structured_compare_candidates is None else int(args.structured_compare_candidates)),
+            'structured_dependency_candidates': (None if args.structured_dependency_candidates is None else int(args.structured_dependency_candidates)),
         },
         'runs': [],
     }
@@ -242,10 +277,17 @@ def main() -> None:
             branch_merge_ratio=0.35,
             branch_merge_group_min=2,
             benchmark_profile=str(args.benchmark_profile),
-            hard_mode=bool(str(args.benchmark_profile) == 'hard'),
+            hard_mode=bool(str(args.benchmark_profile) in {'hard', 'hard_lite', 'hard_extreme'}),
             hard_compare_ratio=float(args.hard_compare_ratio),
             hard_late_binding_ratio=float(args.hard_late_binding_ratio),
             hard_branch_merge_ratio=float(args.hard_branch_merge_ratio),
+            hard_compare_candidates=(None if args.hard_compare_candidates is None else int(args.hard_compare_candidates)),
+            hard_late_candidates=(None if args.hard_late_candidates is None else int(args.hard_late_candidates)),
+            hard_branch_candidates=(None if args.hard_branch_candidates is None else int(args.hard_branch_candidates)),
+            structured_dependency_ratio=float(args.structured_dependency_ratio),
+            structured_branch_ratio=float(args.structured_branch_ratio),
+            structured_compare_candidates=(None if args.structured_compare_candidates is None else int(args.structured_compare_candidates)),
+            structured_dependency_candidates=(None if args.structured_dependency_candidates is None else int(args.structured_dependency_candidates)),
         )
         out_jsonl = seed_runs / 'phase19_results.jsonl'
         out_report = seed_runs / 'phase19_report.md'
@@ -257,7 +299,7 @@ def main() -> None:
             out_report_path=str(out_report),
             model=str(args.model),
             dotenv_path=str(args.dotenv),
-            max_steps=35,
+            max_steps=max_steps,
             max_json_retries=2,
             budget_active=int(args.budget_active),
             budget_unfold=int(args.budget_unfold),

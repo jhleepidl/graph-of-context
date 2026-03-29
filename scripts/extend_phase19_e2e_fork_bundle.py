@@ -24,6 +24,23 @@ def _avg(xs: List[float]) -> float:
     return sum(xs) / max(1, len(xs))
 
 
+def _default_max_steps(profile: str) -> int:
+    name = str(profile or 'standard').strip().lower()
+    if name == 'hard_lite':
+        return 42
+    if name == 'hard':
+        return 48
+    if name == 'hard_extreme':
+        return 56
+    if name == 'structured_lite':
+        return 40
+    if name == 'structured':
+        return 44
+    if name == 'structured_extreme':
+        return 52
+    return 35
+
+
 def _load_rows(jsonl_path: Path) -> List[Dict[str, Any]]:
     if not jsonl_path.exists():
         return []
@@ -146,6 +163,7 @@ def main() -> None:
     ap.add_argument('--model', type=str, default=None)
     ap.add_argument('--dotenv', type=str, default='.env')
     ap.add_argument('--task_limit', type=int, default=None)
+    ap.add_argument('--max_steps', type=int, default=None)
     ap.add_argument('--parallel_tasks', type=int, default=1)
     ap.add_argument('--budget_active', type=int, default=None)
     ap.add_argument('--budget_unfold', type=int, default=None)
@@ -214,6 +232,8 @@ def main() -> None:
 
     model = args.model or str(manifest.get('model') or 'gpt-4.1-mini')
     task_limit = int(args.task_limit if args.task_limit is not None else manifest.get('task_limit', 24))
+    benchmark_profile = str(manifest.get('benchmark_profile') or 'standard')
+    max_steps = int(args.max_steps if args.max_steps is not None else manifest.get('max_steps', _default_max_steps(benchmark_profile)))
     fork_cfg = dict(manifest.get('fork_runtime_kwargs') or {})
     ctrl_cfg = dict(manifest.get('context_controller_kwargs') or {})
 
