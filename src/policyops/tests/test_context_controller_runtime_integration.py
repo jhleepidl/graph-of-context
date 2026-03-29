@@ -214,8 +214,42 @@ def test_structured_lookup_rewrites_resolved_handle_query() -> None:
 
 
 def test_copy_goc_annotation_preserves_dict() -> None:
-    agent = _mk_agent()
+    agent = _make_agent()
     source = {"tool": "search", "args": {"query": "q"}, "goc": {"action": "unfold"}}
     target = {"tool": "open_page", "args": {"docid": "d1"}}
     out = agent._copy_goc_annotation(source, target)
     assert out.get("goc") == {"action": "unfold"}
+
+
+def test_structured_dependency_status_tracks_resolution() -> None:
+    agent = _make_agent()
+    agent._structured_handle_to_project = {
+        'alpha-001-01': 'Project_0001',
+        'beta-002-02': 'Project_0002',
+    }
+    agent._structured_project_years = {'Project_0001': 2011, 'Project_0002': 2014}
+    agent._structured_project_approval_city = {'Project_0001': 'City_07'}
+    status = agent._structured_dependency_status({'task_slice': 'dependency_necessary', 'candidate_handles': ['Alpha-001-01', 'Beta-002-02']})
+    assert status['selected_project'] == 'Project_0001'
+    assert status['selected_approval_city'] == 'City_07'
+    assert status['unresolved_handles'] == []
+    assert status['missing_profiles'] == []
+
+
+def test_structured_dependency_rewrites_toward_missing_approval() -> None:
+    agent = _make_agent()
+    agent._structured_handle_to_project = {
+        'alpha-001-01': 'Project_0001',
+        'beta-002-02': 'Project_0002',
+    }
+    agent._structured_project_years = {'Project_0001': 2011, 'Project_0002': 2014}
+    evt = agent._maybe_override_structured_dependency_search(
+        query='global search about current city',
+        topk=10,
+        task_meta={'task_slice': 'dependency_necessary', 'candidate_handles': ['Alpha-001-01', 'Beta-002-02']},
+    )
+    assert evt is not None
+    reason, new_call = evt
+    assert reason == 'structured_dependency_missing_approval'
+    assert new_call['tool'] == 'search'
+    assert new_call['args']['query'] == 'Project_0001 operating city approval'

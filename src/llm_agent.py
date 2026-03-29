@@ -123,6 +123,8 @@ class ToolLoopConfig:
     structured_lookup_auto_open: bool = True
     structured_lookup_repeat_threshold: int = 2
     structured_task_system_hint: bool = True
+    structured_dependency_planner: bool = True
+    structured_dependency_finish_guard: bool = True
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -2621,10 +2623,11 @@ class ToolLoopLLMAgent:
 
     def _record_structured_page_signals(self, *, docid: Optional[str], title: str, content: str) -> None:
         txt = str(content or "")
-        if not txt:
+        ttl = str(title or "")
+        if not txt and not ttl:
             return
         try:
-            if "FIELD NOTE" in txt:
+            if "FIELD NOTE" in txt or "Field Note" in ttl:
                 m_handle = re.search(r"(?im)^handle:\s*([A-Za-z]+-\d{3}-\d{2})\s*$", txt)
                 m_proj = re.search(r"(?im)^canonical_project:\s*(Project_\d{4})\s*$", txt)
                 if m_handle and m_proj:
@@ -2634,47 +2637,114 @@ class ToolLoopLLMAgent:
                         self.mem.record_msg(
                             f"[SYSTEM] Resolved handle {m_handle.group(1)} -> {m_proj.group(1)}. Stop re-searching that handle; open the canonical OFFICIAL PROFILE next."
                         )
-            proj_match = re.search(r"\b(Project_\d{4})\b", txt)
-            if proj_match and docid:
-                self._structured_project_docids.setdefault(proj_match.group(1), str(docid))
+
+            proj_match = re.search(r"(Project_\d{4})", txt) or re.search(r"(Project_\d{4})", ttl)
+            project = proj_match.group(1) if proj_match else None
+            if project and docid:
+                self._structured_project_docids.setdefault(project, str(docid))
+
+            if project and ("OFFICIAL PROFILE" in txt or "Official" in ttl):
+                y = re.search(r"(?im)^start_year:\s*(\d{4})\s*$", txt)
+                hq = re.search(r"(?im)^headquarters:\s*(City_\d+)\s*$", txt)
+                if y:
+                    self._structured_project_years[project] = int(y.group(1))
+                if hq:
+                    self._structured_project_hq[project] = hq.group(1)
+                if y:
+                    self.mem.record_msg(
+                        f"[SYSTEM] Parsed OFFICIAL PROFILE for {project}: start_year={y.group(1)}"
+                        + (f", headquarters={hq.group(1)}." if hq else ".")
+                    )
+
+            if project and ("OPERATING CITY APPROVAL" in txt or "Operating City Approval" in ttl):
+                city = re.search(r"(?im)^approved_operating_city:\s*(City_\d+)\s*$", txt)
+                if city:
+                    self._structured_project_approval_city[project] = city.group(1)
+                    self.mem.record_msg(
+                        f"[SYSTEM] Parsed current operating-city approval for {project}: {city.group(1)}."
+                    )
+
+            if project and ("EXCEPTION REVOCATION" in txt or "Exception Revocation" in ttl):
+                self._structured_project_revoked.add(project)
+                self.mem.record_msg(
+                    f"[SYSTEM] Parsed revocation notice for {project}. If an approval exists, it becomes current again."
+                )
         except Exception:
             return
 
-    def _maybe_override_structured_lookup_search(
+    def _structured_dependency_status(self, task_meta: Dict[str, Any]) -> Dict[str, Any]:
+        handles = [str(h).strip() for h in (task_meta.get("candidate_handles") or []) if str(h).strip()]
+        resolved = []
+        unresolved = []
+        for h in handles:
+            proj = self._structured_handle_to_project.get(h.lower())
+            if proj:
+                resolved.append((h, proj))
+            else:
+                unresolved.append(h)
+        projects = [proj for _h, proj in resolved]
+        missing_profiles = [p for p in projects if p not in self._structured_project_years]
+        selected_project = None
+        if projects and not missing_profiles:
+            selected_project = min(projects, key=lambda p: (int(self._structured_project_years.get(p, 99999)), p))
+        return {
+            "handles": handles,
+            "resolved": resolved,
+            "unresolved_handles": unresolved,
+            "projects": projects,
+            "missing_profiles": missing_profiles,
+            "selected_project": selected_project,
+            "selected_approval_city": self._structured_project_approval_city.get(selected_project) if selected_project else None,
+        }
+
+    def _maybe_override_structured_dependency_search(
         self,
         *,
         query: str,
-        qnorm: str,
-        step: int,
         topk: int,
-        task_id: str,
-        method: str,
-        run_tag: str,
+        task_meta: Dict[str, Any],
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        if not bool(getattr(self.cfg, "structured_lookup_auto_open", True)):
+        if not bool(getattr(self.cfg, "structured_dependency_planner", True)):
             return None
-        lookup = self._classify_structured_lookup_query(query)
-        if not lookup:
+        if str(task_meta.get("task_slice") or "") != "dependency_necessary":
             return None
 
-        handle = str(lookup.get("handle") or "").strip()
-        if lookup.get("kind") == "field_note" and handle:
-            known_proj = self._structured_handle_to_project.get(handle.lower())
-            if known_proj:
-                new_q = f"{known_proj} official profile"
-                self.counters["policy_overrides"] += 1
-                self.counters["structured_lookup_rewrites"] += 1
-                self._policy_record_constraint_once(
-                    key=f"structured_handle_resolved:{handle.lower()}",
-                    text=(
-                        f"[CONSTRAINT] Handle {handle} is already resolved. Do not keep searching its FIELD NOTE; "
-                        f"move to the canonical project evidence for {known_proj}."
-                    ),
-                )
-                new_call = {"tool": "search", "args": {"query": new_q, "topk": topk}}
-                return "structured_handle_resolved_rewrite", new_call
+        status = self._structured_dependency_status(task_meta)
+        desired_q: Optional[str] = None
+        reason: Optional[str] = None
 
-        return None
+        unresolved = list(status.get("unresolved_handles") or [])
+        if unresolved:
+            desired_q = f"{unresolved[0]} field note"
+            reason = "structured_dependency_resolve_handle"
+        else:
+            missing_profiles = list(status.get("missing_profiles") or [])
+            if missing_profiles:
+                desired_q = f"{missing_profiles[0]} official profile"
+                reason = "structured_dependency_missing_profile"
+            else:
+                selected = status.get("selected_project")
+                selected_city = status.get("selected_approval_city")
+                if selected and not selected_city:
+                    desired_q = f"{selected} operating city approval"
+                    reason = "structured_dependency_missing_approval"
+
+        if not desired_q:
+            return None
+        if self._normalize_query(query) == self._normalize_query(desired_q):
+            return None
+
+        self.counters["policy_overrides"] += 1
+        self.counters["structured_dependency_rewrites"] += 1
+        self._policy_record_constraint_once(
+            key=f"structured_dep:{reason}:{self._normalize_query(desired_q)}",
+            text=(
+                "[CONSTRAINT] Structured dependency task: first resolve all candidate handles, then compare OFFICIAL PROFILE start_year values, "
+                "then use OPERATING CITY APPROVAL (and a later revocation if present) for the selected earliest project. "
+                f"Focus next on: {desired_q}"
+            ),
+        )
+        return reason, {"tool": "search", "args": {"query": desired_q, "topk": topk}}
 
     def _extract_given_projects(self, question: str) -> List[str]:
         """Extract ordered unique Project_#### mentions from the question."""
@@ -3455,6 +3525,10 @@ class ToolLoopLLMAgent:
             self._structured_candidate_handles = []
         self._structured_handle_to_project = {}
         self._structured_project_docids = {}
+        self._structured_project_years = {}
+        self._structured_project_hq = {}
+        self._structured_project_approval_city = {}
+        self._structured_project_revoked = set()
         self._structured_lookup_seen = Counter()
         self._finish_block_counts = Counter()
         # reset failure-policy state
@@ -4277,6 +4351,12 @@ class ToolLoopLLMAgent:
                             method=method,
                             run_tag=run_tag,
                         )
+                        if override is None:
+                            override = self._maybe_override_structured_dependency_search(
+                                query=query,
+                                topk=int(args.get("topk", 10)),
+                                task_meta=task_meta,
+                            )
                     except Exception:
                         override = None
                     if override is not None:
@@ -5363,6 +5443,49 @@ class ToolLoopLLMAgent:
                                 "answer": ans,
                             })
                             continue
+
+                        if (
+                            bool(getattr(self.cfg, "structured_dependency_finish_guard", True))
+                            and str(task_meta.get("task_slice") or "") == "dependency_necessary"
+                        ):
+                            dep_status = self._structured_dependency_status(task_meta)
+                            unresolved = list(dep_status.get("unresolved_handles") or [])
+                            missing_profiles = list(dep_status.get("missing_profiles") or [])
+                            selected_proj = dep_status.get("selected_project")
+                            selected_city = dep_status.get("selected_approval_city")
+                            if unresolved or missing_profiles:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "structured_dependency_incomplete"
+                                msg = "[SYSTEM] finish blocked: for this dependency task, resolve EVERY candidate handle and open EVERY candidate OFFICIAL PROFILE before answering."
+                                if unresolved:
+                                    msg += f" Still unresolved: {', '.join(unresolved[:3])}."
+                                elif missing_profiles:
+                                    msg += f" Missing OFFICIAL PROFILE evidence for: {', '.join(missing_profiles[:3])}."
+                                self.mem.record_msg(msg)
+                                continue
+                            pair_proj = normalize_project_city_pair(ans).split(" | ")[0] if normalize_project_city_pair(ans) else None
+                            pair_city = normalize_project_city_pair(ans).split(" | ")[1] if normalize_project_city_pair(ans) else None
+                            if selected_proj and pair_proj and pair_proj != selected_proj:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "structured_dependency_wrong_project"
+                                self.mem.record_msg(
+                                    f"[SYSTEM] finish blocked: comparing parsed OFFICIAL PROFILE start_year values, the earliest candidate project is {selected_proj}. Re-check the comparison before answering."
+                                )
+                                continue
+                            if selected_proj and not selected_city:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "structured_dependency_missing_approval"
+                                self.mem.record_msg(
+                                    f"[SYSTEM] finish blocked: you still need the OPERATING CITY APPROVAL for {selected_proj}. Do not use headquarters as the final operating city."
+                                )
+                                continue
+                            if selected_proj and selected_city and pair_city and pair_city != selected_city:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "structured_dependency_wrong_city"
+                                self.mem.record_msg(
+                                    f"[SYSTEM] finish blocked: the approved current operating city for {selected_proj} from opened evidence is {selected_city}. Do not answer with headquarters or a stale city."
+                                )
+                                continue
 
                     # HotpotQA (and similar) contract: finish.args.answer must be a JSON object serialized as a string
                     # with keys {a1, supporting_titles}. Many failures in long-horizon settings come from the model
