@@ -6267,7 +6267,7 @@ class ToolLoopLLMAgent:
             }
             # Attempt best-effort auto-finish using ONLY opened evidence
             if self.cfg.force_finish_on_deadline and self.counters.get("open_page_calls", 0) >= 1:
-                ans, expl = self._try_autofinish(user_question)
+                ans, expl = self._try_autofinish(user_question, task_meta=task_meta)
                 if ans:
                     result["answer"] = ans
                     result["explanation"] = expl or result.get("explanation", "")
@@ -6291,7 +6291,7 @@ class ToolLoopLLMAgent:
             self._close_trace()
 
 
-    def _try_autofinish(self, user_question: str) -> Tuple[str, str]:
+    def _try_autofinish(self, user_question: str, task_meta: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
         """Best-effort auto-finish using ONLY opened evidence (no extra tool calls).
 
         Returns (answer, explanation). If cannot infer, returns ("","...").
@@ -6315,6 +6315,40 @@ class ToolLoopLLMAgent:
             ev = [primary_docid] + [d for d in self.evidence_docids if d != primary_docid]
             ev = [d for d in ev if d][:5]
             return "Evidence docids: " + ", ".join(ev) if ev else "Evidence docids: (none)"
+
+        # Pattern 0: structured current-city chain tasks used in Phase 20 support-recovery.
+        current_city_task = False
+        if task_meta:
+            try:
+                current_city_task = bool(task_meta.get("supports_current_city_chain")) or str(task_meta.get("task_slice") or "") == "dependency_necessary"
+            except Exception:
+                current_city_task = False
+        if current_city_task:
+            dep_status = self._structured_dependency_status(task_meta or {})
+            unresolved = list(dep_status.get("unresolved_handles") or [])
+            missing_profiles = list(dep_status.get("missing_profiles") or [])
+            missing_support = list(dep_status.get("missing_support") or [])
+            selected_project = str(dep_status.get("selected_project") or "").strip()
+            selected_city = str(dep_status.get("selected_current_city") or "").strip()
+            if (not unresolved) and (not missing_profiles) and (not missing_support) and selected_project and selected_city:
+                suffix = selected_project.split("_")[-1]
+                preferred_docids: List[str] = []
+                for did in [
+                    f"D_TRUTH_{suffix}",
+                    f"D_APPROVAL_{suffix}",
+                    f"D_EXCEPTION_{suffix}",
+                    f"D_REVOCATION_{suffix}",
+                ]:
+                    if did in self.opened_cache or did in self.evidence_docids:
+                        preferred_docids.append(did)
+                primary = preferred_docids[0] if preferred_docids else (next(iter(self.opened_cache.keys()), ""))
+                ev = preferred_docids + [d for d in self.evidence_docids if d not in preferred_docids]
+                ev = [d for d in ev if d][:6]
+                expl = (
+                    f"Auto-finish from opened structured support: selected {selected_project} with current operating city {selected_city}. "
+                    f"Evidence docids: {', '.join(ev) if ev else '(none)'}"
+                )
+                return f"{selected_project} | {selected_city}", expl
 
         # Pattern A: earliest start_year + headquarters
         if ("earliest" in ql) and ("start_year" in ql) and ("headquarters" in ql):
