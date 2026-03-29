@@ -131,6 +131,28 @@ def run_llm(
     fork_allow_kinds: Optional[List[str]] = None,
     fork_deny_kinds: Optional[List[str]] = None,
 
+    # Context controller (runtime operator policy)
+    enable_context_controller: bool = False,
+    context_controller_policy: str = "uncertainty_aware",
+    context_controller_trace: bool = True,
+    context_controller_support_gap_threshold: float = 0.20,
+    context_controller_budget_pressure_threshold: float = 0.80,
+    context_controller_fork_ambiguity_threshold: float = 0.45,
+    context_controller_model_path: Optional[str] = None,
+    context_controller_min_confidence: float = 0.0,
+    context_controller_fallback_action: str = "unfold",
+    context_controller_disable_none_action: bool = False,
+    context_controller_fork_gate_mode: str = "integrated",
+    context_controller_recheck_after_unfold: bool = True,
+    fork_controller_max_calls: int = 2,
+    fork_controller_cooldown_steps: int = 5,
+    fork_controller_min_open_pages: int = 2,
+    fork_controller_min_active_tokens: int = 350,
+    fork_controller_min_branch_score: float = 0.18,
+    fork_controller_min_ambiguity: float = 0.35,
+    fork_controller_min_pressure: float = 0.45,
+    fork_controller_allow_open_only: bool = True,
+
     # Optional: override LLM-assisted GoC annotation settings (prompt gating + schema)
     # If None, defaults are used (and per-method overrides like GoC-HybridDep apply).
     goc_annotation_mode: Optional[str] = None,
@@ -431,6 +453,26 @@ def run_llm(
                 unfold_trigger_always_on_required_keys=bool(
                     unfold_trigger_always_on_required_keys
                 ),
+                enable_context_controller=bool(enable_context_controller),
+                context_controller_policy=str(context_controller_policy),
+                context_controller_trace=bool(context_controller_trace),
+                context_controller_support_gap_threshold=float(context_controller_support_gap_threshold),
+                context_controller_budget_pressure_threshold=float(context_controller_budget_pressure_threshold),
+                context_controller_fork_ambiguity_threshold=float(context_controller_fork_ambiguity_threshold),
+                context_controller_model_path=str(context_controller_model_path) if context_controller_model_path else None,
+                context_controller_min_confidence=float(context_controller_min_confidence),
+                context_controller_fallback_action=str(context_controller_fallback_action),
+                context_controller_disable_none_action=bool(context_controller_disable_none_action),
+                context_controller_fork_gate_mode=str(context_controller_fork_gate_mode),
+                context_controller_recheck_after_unfold=bool(context_controller_recheck_after_unfold),
+                fork_controller_max_calls=int(fork_controller_max_calls),
+                fork_controller_cooldown_steps=int(fork_controller_cooldown_steps),
+                fork_controller_min_open_pages=int(fork_controller_min_open_pages),
+                fork_controller_min_active_tokens=int(fork_controller_min_active_tokens),
+                fork_controller_min_branch_score=float(fork_controller_min_branch_score),
+                fork_controller_min_ambiguity=float(fork_controller_min_ambiguity),
+                fork_controller_min_pressure=float(fork_controller_min_pressure),
+                fork_controller_allow_open_only=bool(fork_controller_allow_open_only),
             )
 
     # Shared bandit controller instance (read-only during evaluation).
