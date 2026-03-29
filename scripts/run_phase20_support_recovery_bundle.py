@@ -18,6 +18,7 @@ def main() -> None:
     ap.add_argument('--fork_trigger_mode', type=str, default='evidence_gated')
     ap.add_argument('--fork_merge_policy', type=str, default='weak')
     ap.add_argument('--max_steps', type=int, default=40)
+    ap.add_argument('--parallel_tasks', type=int, default=1)
     ap.add_argument('--run_hybrid_fork', action='store_true', default=False, help='Also include GoC-SimSeed-Fork-Dep.')
     args = ap.parse_args()
 
@@ -36,6 +37,7 @@ def main() -> None:
         '--fork_trigger_mode', args.fork_trigger_mode,
         '--fork_merge_policy', args.fork_merge_policy,
         '--max_steps', str(args.max_steps),
+        '--parallel_tasks', str(args.parallel_tasks),
     ]
     raise SystemExit(subprocess.call(cmd))
 

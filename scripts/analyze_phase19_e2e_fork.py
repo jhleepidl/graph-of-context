@@ -18,6 +18,29 @@ def _all_rows(bundle_root: Path) -> List[Dict]:
     return rows
 
 
+def _task_meta_by_id(bundle_root: Path) -> Dict[str, Dict]:
+    out: Dict[str, Dict] = {}
+    for p in bundle_root.rglob('tasks.json'):
+        try:
+            rows = json.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            tid = str(row.get('id') or '')
+            if not tid:
+                continue
+            out[tid] = {
+                'task_slice': row.get('task_slice'),
+                'task_type': row.get('task_type'),
+                'benchmark_profile': row.get('benchmark_profile'),
+            }
+    return out
+
+
 def _group(rows: List[Dict], key: str) -> Dict[str, List[Dict]]:
     out: Dict[str, List[Dict]] = defaultdict(list)
     for r in rows:
@@ -82,6 +105,15 @@ def main() -> None:
     analysis = root / 'analysis'
     analysis.mkdir(parents=True, exist_ok=True)
     rows = _all_rows(root)
+    task_meta = _task_meta_by_id(root)
+    for row in rows:
+        meta = task_meta.get(str(row.get('task_id') or '')) or {}
+        if not row.get('task_slice') and meta.get('task_slice'):
+            row['task_slice'] = meta.get('task_slice')
+        if not row.get('task_type') and meta.get('task_type'):
+            row['task_type'] = meta.get('task_type')
+        if not row.get('benchmark_profile') and meta.get('benchmark_profile'):
+            row['benchmark_profile'] = meta.get('benchmark_profile')
     by_method = _group(rows, 'method')
     summary = [_method_summary(method, rs) for method, rs in sorted(by_method.items())]
 
