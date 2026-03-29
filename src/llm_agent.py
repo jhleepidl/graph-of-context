@@ -1618,7 +1618,7 @@ class ToolLoopLLMAgent:
             if pat in f' {prompt_low} '
         )
         ambiguity_score = min(1.0, 0.12 * lexical_ambiguity_hits + title_bonus + (0.20 if should_unfold else 0.0))
-        has_conflict = bool(re.search(r'(conflict|contradict|however|unless|except|but)', prompt_low))
+        has_conflict = bool(re.search(r'\b(conflict|contradict|however|unless|except|but)\b', prompt_low))
 
         is_commit_like = ('/ commit' in prompt_low) or ('[follow-up 1' in prompt_low)
         is_final_like = ('/ final' in prompt_low) or ('[follow-up 2' in prompt_low)
@@ -2638,7 +2638,7 @@ class ToolLoopLLMAgent:
                             f"[SYSTEM] Resolved handle {m_handle.group(1)} -> {m_proj.group(1)}. Stop re-searching that handle; open the canonical OFFICIAL PROFILE next."
                         )
 
-            proj_match = re.search(r"(Project_\d{4})", txt) or re.search(r"(Project_\d{4})", ttl)
+            proj_match = re.search(r"\b(Project_\d{4})\b", txt) or re.search(r"\b(Project_\d{4})\b", ttl)
             project = proj_match.group(1) if proj_match else None
             if project and docid:
                 self._structured_project_docids.setdefault(project, str(docid))
