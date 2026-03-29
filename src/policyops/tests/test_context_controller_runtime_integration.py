@@ -211,3 +211,11 @@ def test_structured_lookup_rewrites_resolved_handle_query() -> None:
     assert reason == 'structured_handle_resolved_rewrite'
     assert new_call['tool'] == 'search'
     assert 'Project_0052 official profile' == new_call['args']['query']
+
+
+def test_copy_goc_annotation_preserves_dict() -> None:
+    agent = _mk_agent()
+    source = {"tool": "search", "args": {"query": "q"}, "goc": {"action": "unfold"}}
+    target = {"tool": "open_page", "args": {"docid": "d1"}}
+    out = agent._copy_goc_annotation(source, target)
+    assert out.get("goc") == {"action": "unfold"}

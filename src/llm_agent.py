@@ -2364,11 +2364,8 @@ class ToolLoopLLMAgent:
         args = (proposed_call.get("args") or {})
 
         # Preserve any LLM-declared GoC annotations across policy overrides.
-        goc0 = proposed_call.get("goc") if isinstance(proposed_call, dict) else None
         def _attach_goc(call_dict: Dict[str, Any]) -> Dict[str, Any]:
-            if isinstance(goc0, dict) and "goc" not in call_dict:
-                call_dict["goc"] = goc0
-            return call_dict
+            return self._copy_goc_annotation(proposed_call, call_dict)
 
         # Track executed-tool streak after policy (we update streak for the *proposed* tool to detect habits)
         # We do not enforce on "finish" here; finish gating handles that.
@@ -2582,6 +2579,16 @@ class ToolLoopLLMAgent:
                 seen.add(handle.lower())
                 out.append(handle)
         return out
+
+    def _copy_goc_annotation(self, source_call: Optional[Dict[str, Any]], target_call: Dict[str, Any]) -> Dict[str, Any]:
+        """Preserve any LLM-declared GoC annotation when policy rewrites a tool call."""
+        try:
+            goc = source_call.get("goc") if isinstance(source_call, dict) else None
+            if isinstance(goc, dict) and "goc" not in target_call:
+                target_call["goc"] = goc
+        except Exception:
+            pass
+        return target_call
 
     def _classify_structured_lookup_query(self, query: str) -> Optional[Dict[str, str]]:
         q = str(query or "").strip()
@@ -4274,7 +4281,7 @@ class ToolLoopLLMAgent:
                         override = None
                     if override is not None:
                         reason, new_call = override
-                        new_call = _attach_goc(new_call)
+                        new_call = self._copy_goc_annotation(call, new_call)
                         self._trace({
                             "type": "policy_override",
                             "task_id": task_id,
