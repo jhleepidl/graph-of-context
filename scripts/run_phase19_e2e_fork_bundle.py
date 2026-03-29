@@ -138,7 +138,7 @@ def main() -> None:
     ap.add_argument('--n_tasks', type=int, default=48)
     ap.add_argument('--noise_docs', type=int, default=180)
     ap.add_argument('--distractors_per_entity', type=int, default=3)
-    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard_lite', 'hard', 'hard_extreme', 'structured_lite', 'structured_support_pilot', 'phase20_support_recovery', 'structured', 'structured_extreme'])
+    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard_lite', 'hard', 'hard_extreme', 'structured_lite', 'structured_support_pilot', 'phase20_support_recovery', 'phase21_support_closure', 'structured', 'structured_extreme'])
     ap.add_argument('--hard_compare_candidates', type=int, default=None)
     ap.add_argument('--hard_late_candidates', type=int, default=None)
     ap.add_argument('--hard_branch_candidates', type=int, default=None)
