@@ -59,6 +59,7 @@ class SyntheticBrowseComp(Benchmark):
             hard_branch_candidates=(None if kwargs.get("hard_branch_candidates") is None else int(kwargs.get("hard_branch_candidates"))),
             structured_dependency_ratio=float(kwargs.get("structured_dependency_ratio", 0.35)),
             structured_branch_ratio=float(kwargs.get("structured_branch_ratio", 0.35)),
+            structured_support_recovery_ratio=float(kwargs.get("structured_support_recovery_ratio", 0.20)),
             structured_compare_candidates=(None if kwargs.get("structured_compare_candidates") is None else int(kwargs.get("structured_compare_candidates"))),
             structured_dependency_candidates=(None if kwargs.get("structured_dependency_candidates") is None else int(kwargs.get("structured_dependency_candidates"))),
         )

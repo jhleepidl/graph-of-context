@@ -13,6 +13,7 @@ from ..memory import (
     GoCMemory,
     SimpleRAGMemory,
     SimilarityOnlyMemory,
+    SimilaritySeedGoCMemory,
     MemoryManagerBase
 )
 
@@ -69,6 +70,18 @@ def run_deterministic(
                 unfold_k=unfold_k,
                 storage_retriever_kind=retriever_kind,
                 storage_faiss_dim=faiss_dim,
+            ),
+        ),
+        "GoC-SimSeed": MethodSpec(
+            "GoC-SimSeed",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
             ),
         ),
     }

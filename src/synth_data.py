@@ -317,13 +317,14 @@ def make_corpus_and_tasks(
     hard_branch_candidates: int | None = None,
     structured_dependency_ratio: float = 0.35,
     structured_branch_ratio: float = 0.35,
+    structured_support_recovery_ratio: float = 0.20,
     structured_compare_candidates: int | None = None,
     structured_dependency_candidates: int | None = None,
 ):
     rng = random.Random(seed)
     profile_name = str(benchmark_profile or "standard").strip().lower()
     hard_mode = bool(hard_mode or profile_name in {"hard", "hard_lite", "hard_extreme"})
-    structured_mode = bool(profile_name in {"structured_lite", "structured", "structured_extreme"})
+    structured_mode = bool(profile_name in {"structured_lite", "structured_support_pilot", "phase20_support_recovery", "structured", "structured_extreme"})
     if hard_mode:
         if profile_name == "hard_lite":
             default_compare_candidates = 4
@@ -342,6 +343,9 @@ def make_corpus_and_tasks(
         hard_branch_candidates = int(hard_branch_candidates or default_branch_candidates)
     if structured_mode:
         if profile_name == "structured_lite":
+            default_compare_candidates = 4
+            default_dependency_candidates = 2
+        elif profile_name in {"structured_support_pilot", "phase20_support_recovery"}:
             default_compare_candidates = 4
             default_dependency_candidates = 2
         elif profile_name == "structured_extreme":
@@ -599,6 +603,45 @@ def make_corpus_and_tasks(
             ),
         }
 
+    def _structured_support_recovery_task(task_id: str) -> Dict[str, Any]:
+        candidates = [e for e in entities if str(e.get("exception_state", "none")) in {"active", "revoked"}]
+        target = rng.choice(candidates or entities)
+        handle = target["alias_handle"]
+        final_city = _final_operating_city(target)
+        gold_docids = [_alias_docid_for(target["name"]), _docid_for(target["name"]), _approval_docid_for(target["name"])]
+        exc = _exception_docid_for(target["name"])
+        rev = _revocation_docid_for(target["name"])
+        if exc:
+            gold_docids.append(exc)
+        if rev:
+            gold_docids.append(rev)
+        q = (
+            "You must use evidence from opened pages.\n"
+            f"Resolve handle {handle} via its FIELD NOTE page, then determine the CURRENT operating city for the canonical project.\n"
+            "Use the OFFICIAL PROFILE and the Operating City Approval notice for that project. "
+            "If there is a Legacy Operating Exception notice, it overrides the approval while active; "
+            "if there is a later Exception Revocation notice, the approval becomes current again.\n"
+            "Answer exactly as '<ProjectName> | <City>'."
+        )
+        return {
+            "id": task_id,
+            "question": q,
+            "entities": [target["name"]],
+            "required": ["alias_handle", "approval_ticket", "exception_ticket"],
+            "answer": f"{target['name']} | {final_city}",
+            "gold_docids": list(dict.fromkeys(gold_docids)),
+            **_structured_meta(
+                task_type="structured_support_recovery",
+                task_slice="support_recovery",
+                extra={
+                    "target_handle": handle,
+                    "target_project": target["name"],
+                    "exception_state": target.get("exception_state", "none"),
+                    "required_support_count": len(list(dict.fromkeys(gold_docids))) - 1,
+                },
+            ),
+        }
+
     def _structured_branch_task(task_id: str) -> Dict[str, Any]:
         branch_candidates = [e for e in entities if str(e.get("exception_state")) in {"active", "revoked"}]
         target = rng.choice(branch_candidates or entities)
@@ -822,13 +865,22 @@ def make_corpus_and_tasks(
         task_id = f"TASK_{t:04d}"
         if structured_mode and long_horizon:
             r = rng.random()
-            retrieval_ratio = max(0.0, 1.0 - float(structured_dependency_ratio) - float(structured_branch_ratio))
-            if r < retrieval_ratio:
-                tasks.append(_structured_retrieval_task(task_id))
-            elif r < retrieval_ratio + float(structured_dependency_ratio):
-                tasks.append(_structured_dependency_task(task_id))
+            if profile_name == "structured_support_pilot":
+                retrieval_ratio = max(0.0, 1.0 - float(structured_support_recovery_ratio) - float(structured_branch_ratio))
+                if r < retrieval_ratio:
+                    tasks.append(_structured_retrieval_task(task_id))
+                elif r < retrieval_ratio + float(structured_support_recovery_ratio):
+                    tasks.append(_structured_support_recovery_task(task_id))
+                else:
+                    tasks.append(_structured_branch_task(task_id))
             else:
-                tasks.append(_structured_branch_task(task_id))
+                retrieval_ratio = max(0.0, 1.0 - float(structured_dependency_ratio) - float(structured_branch_ratio))
+                if r < retrieval_ratio:
+                    tasks.append(_structured_retrieval_task(task_id))
+                elif r < retrieval_ratio + float(structured_dependency_ratio):
+                    tasks.append(_structured_dependency_task(task_id))
+                else:
+                    tasks.append(_structured_branch_task(task_id))
             continue
         if hard_mode and long_horizon:
             r = rng.random()

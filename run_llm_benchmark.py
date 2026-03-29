@@ -62,29 +62,6 @@ def main():
     ap.add_argument("--fork_include_recent_active", action="store_true", default=True)
     ap.add_argument("--no_fork_include_recent_active", action="store_false", dest="fork_include_recent_active")
     ap.add_argument("--fork_recent_active_n", type=int, default=4)
-    ap.add_argument("--enable_context_controller", action="store_true", default=False)
-    ap.add_argument("--context_controller_policy", type=str, default="uncertainty_aware", help="stage_aware|budget_aware|uncertainty_aware|learned_tree|learned_logreg|learned")
-    ap.add_argument("--context_controller_trace", action="store_true", default=True)
-    ap.add_argument("--no_context_controller_trace", action="store_false", dest="context_controller_trace")
-    ap.add_argument("--context_controller_support_gap_threshold", type=float, default=0.20)
-    ap.add_argument("--context_controller_budget_pressure_threshold", type=float, default=0.80)
-    ap.add_argument("--context_controller_fork_ambiguity_threshold", type=float, default=0.45)
-    ap.add_argument("--context_controller_model_path", type=str, default=None)
-    ap.add_argument("--context_controller_min_confidence", type=float, default=0.0)
-    ap.add_argument("--context_controller_fallback_action", type=str, default="unfold")
-    ap.add_argument("--context_controller_disable_none_action", action="store_true", default=False)
-    ap.add_argument("--context_controller_fork_gate_mode", type=str, default="integrated", help="integrated|legacy")
-    ap.add_argument("--context_controller_recheck_after_unfold", action="store_true", default=True)
-    ap.add_argument("--no_context_controller_recheck_after_unfold", action="store_false", dest="context_controller_recheck_after_unfold")
-    ap.add_argument("--fork_controller_max_calls", type=int, default=2)
-    ap.add_argument("--fork_controller_cooldown_steps", type=int, default=5)
-    ap.add_argument("--fork_controller_min_open_pages", type=int, default=2)
-    ap.add_argument("--fork_controller_min_active_tokens", type=int, default=350)
-    ap.add_argument("--fork_controller_min_branch_score", type=float, default=0.18)
-    ap.add_argument("--fork_controller_min_ambiguity", type=float, default=0.35)
-    ap.add_argument("--fork_controller_min_pressure", type=float, default=0.45)
-    ap.add_argument("--fork_controller_allow_open_only", action="store_true", default=True)
-    ap.add_argument("--no_fork_controller_allow_open_only", action="store_false", dest="fork_controller_allow_open_only")
     ap.add_argument(
         "--no_unfold_trigger_always_on_required_keys",
         action="store_false",
@@ -154,26 +131,6 @@ def main():
         fork_k=int(args.fork_k),
         fork_include_recent_active=bool(args.fork_include_recent_active),
         fork_recent_active_n=int(args.fork_recent_active_n),
-        enable_context_controller=bool(args.enable_context_controller),
-        context_controller_policy=str(args.context_controller_policy),
-        context_controller_trace=bool(args.context_controller_trace),
-        context_controller_support_gap_threshold=float(args.context_controller_support_gap_threshold),
-        context_controller_budget_pressure_threshold=float(args.context_controller_budget_pressure_threshold),
-        context_controller_fork_ambiguity_threshold=float(args.context_controller_fork_ambiguity_threshold),
-        context_controller_model_path=str(args.context_controller_model_path) if args.context_controller_model_path else None,
-        context_controller_min_confidence=float(args.context_controller_min_confidence),
-        context_controller_fallback_action=str(args.context_controller_fallback_action),
-        context_controller_disable_none_action=bool(args.context_controller_disable_none_action),
-        context_controller_fork_gate_mode=str(args.context_controller_fork_gate_mode),
-        context_controller_recheck_after_unfold=bool(args.context_controller_recheck_after_unfold),
-        fork_controller_max_calls=int(args.fork_controller_max_calls),
-        fork_controller_cooldown_steps=int(args.fork_controller_cooldown_steps),
-        fork_controller_min_open_pages=int(args.fork_controller_min_open_pages),
-        fork_controller_min_active_tokens=int(args.fork_controller_min_active_tokens),
-        fork_controller_min_branch_score=float(args.fork_controller_min_branch_score),
-        fork_controller_min_ambiguity=float(args.fork_controller_min_ambiguity),
-        fork_controller_min_pressure=float(args.fork_controller_min_pressure),
-        fork_controller_allow_open_only=bool(args.fork_controller_allow_open_only),
     )
     print("Done:", res)
 

@@ -34,6 +34,8 @@ def _default_max_steps(profile: str) -> int:
         return 56
     if name == 'structured_lite':
         return 40
+    if name in {'structured_support_pilot', 'phase20_support_recovery'}:
+        return 40
     if name == 'structured':
         return 44
     if name == 'structured_extreme':

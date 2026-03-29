@@ -2988,3 +2988,74 @@ class SimilarityOnlyMemory(GoCMemory):
 
         self.active.sort(key=lambda x: self.nodes[x].step_idx)
         return activated
+
+
+class SimilaritySeedGoCMemory(GoCMemory):
+    """Hybrid best-practice memory: similarity retrieval chooses anchor seeds,
+    then GoC dependency/doc-ref closure restores only the support neighborhood.
+
+    This is intended as a practical front-end for Phase 19/20 pilots:
+    - Similarity handles fast anchor finding.
+    - GoC closure restores updates / exceptions / revocations around those anchors.
+    - Token use remains budgeted by the existing GoC activation path.
+    """
+
+    sim_seed_k: int = 3
+    sim_seed_topk: int = 18
+
+    def unfold(self, query: str, k: int = None):
+        if k is None:
+            k = self.unfold_k
+        if not self._storage_retriever or not self.storage:
+            return []
+
+        kk = max(1, int(k))
+        hits = self._storage_retriever.search(query, topk=max(int(getattr(self, 'sim_seed_topk', kk * 3) or kk * 3), kk * 3, 10))
+
+        chosen_seed_ids = []
+        chosen_nodes = set()
+        for nid, _score in hits:
+            if nid not in self.nodes:
+                continue
+            if nid in chosen_seed_ids:
+                continue
+            chosen_seed_ids.append(nid)
+            closure = self._dep_closure([nid], int(self.max_dep_depth), None)
+            closure = self._doc_ref_expand(closure, int(self.doc_ref_expand))
+            closure = self._apply_avoids_filter(closure, selected_nodes=set(closure) | set(chosen_nodes))
+            for x in closure:
+                if x in self.nodes:
+                    chosen_nodes.add(x)
+            if len(chosen_seed_ids) >= int(getattr(self, 'sim_seed_k', min(kk, 3)) or min(kk, 3)):
+                break
+
+        if not chosen_nodes and chosen_seed_ids:
+            chosen_nodes = set(chosen_seed_ids)
+
+        activated = []
+        used_tokens = 0
+        if chosen_nodes:
+            activated = self._activate_unfold_nodes(query, chosen_nodes)
+            try:
+                used_tokens = sum(int(self.nodes[nid].token_len) for nid in chosen_nodes if nid in self.nodes)
+            except Exception:
+                used_tokens = 0
+
+        try:
+            self._emit_event({
+                'type': 'unfold',
+                'mem': 'GoC-SimSeed',
+                'global_step': int(self._global_step),
+                'query': query,
+                'k': int(kk),
+                'budget_unfold': int(self.budget_unfold),
+                'candidate_count': int(len(hits)),
+                'chosen_seed_ids': chosen_seed_ids[:30],
+                'chosen_nodes_count': int(len(chosen_nodes)),
+                'used_tokens_est': int(used_tokens),
+                'activated': activated[:30],
+                'activated_count': int(len(activated)),
+            })
+        except Exception:
+            pass
+        return activated

@@ -47,6 +47,8 @@ def _default_max_steps(profile: str) -> int:
         return 56
     if name == 'structured_lite':
         return 40
+    if name in {'structured_support_pilot', 'phase20_support_recovery'}:
+        return 40
     if name == 'structured':
         return 44
     if name == 'structured_extreme':
@@ -134,7 +136,7 @@ def main() -> None:
     ap.add_argument('--n_tasks', type=int, default=48)
     ap.add_argument('--noise_docs', type=int, default=180)
     ap.add_argument('--distractors_per_entity', type=int, default=3)
-    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard_lite', 'hard', 'hard_extreme', 'structured_lite', 'structured', 'structured_extreme'])
+    ap.add_argument('--benchmark_profile', type=str, default='standard', choices=['standard', 'hard_lite', 'hard', 'hard_extreme', 'structured_lite', 'structured_support_pilot', 'phase20_support_recovery', 'structured', 'structured_extreme'])
     ap.add_argument('--hard_compare_candidates', type=int, default=None)
     ap.add_argument('--hard_late_candidates', type=int, default=None)
     ap.add_argument('--hard_branch_candidates', type=int, default=None)
@@ -143,6 +145,7 @@ def main() -> None:
     ap.add_argument('--hard_branch_merge_ratio', type=float, default=0.30)
     ap.add_argument('--structured_dependency_ratio', type=float, default=0.35)
     ap.add_argument('--structured_branch_ratio', type=float, default=0.35)
+    ap.add_argument('--structured_support_recovery_ratio', type=float, default=0.20)
     ap.add_argument('--structured_compare_candidates', type=int, default=None)
     ap.add_argument('--structured_dependency_candidates', type=int, default=None)
     ap.add_argument('--smoke', action='store_true')
@@ -286,6 +289,7 @@ def main() -> None:
             hard_branch_candidates=(None if args.hard_branch_candidates is None else int(args.hard_branch_candidates)),
             structured_dependency_ratio=float(args.structured_dependency_ratio),
             structured_branch_ratio=float(args.structured_branch_ratio),
+            structured_support_recovery_ratio=float(args.structured_support_recovery_ratio),
             structured_compare_candidates=(None if args.structured_compare_candidates is None else int(args.structured_compare_candidates)),
             structured_dependency_candidates=(None if args.structured_dependency_candidates is None else int(args.structured_dependency_candidates)),
         )
