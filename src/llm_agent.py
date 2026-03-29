@@ -16,6 +16,7 @@ from .utils import approx_token_count
 from .bandit_controller import BanditUnfoldController
 from .context_controller import ContextController, ControllerDecision
 from .unfold_trigger import UnfoldTrigger
+from .metrics import normalize_project_city_pair
 
 def _extract_first_json_object(text: str) -> Optional[str]:
     """Extract the first syntactically balanced JSON object from text.
@@ -116,6 +117,12 @@ class ToolLoopConfig:
     open_given_projects_on_repeat_search: bool = True
     validate_answer_in_given_projects: bool = True
     max_finish_blocks_per_reason: int = 1
+
+    # Structured benchmark helpers: exact handle/profile lookup queries often repeat.
+    # Lower the repeat threshold for those queries and encourage immediate page opening.
+    structured_lookup_auto_open: bool = True
+    structured_lookup_repeat_threshold: int = 2
+    structured_task_system_hint: bool = True
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -372,6 +379,10 @@ class ToolLoopLLMAgent:
         self.opened_view_cache: Dict[str, str] = {}
         self.given_projects: List[str] = []
         self._given_projects_open_idx: int = 0
+        self._structured_candidate_handles: List[str] = []
+        self._structured_handle_to_project: Dict[str, str] = {}
+        self._structured_project_docids: Dict[str, str] = {}
+        self._structured_lookup_seen: Counter = Counter()
         self._finish_block_counts: Counter = Counter()
         self._deadline_nudged: bool = False
         self._last_search_query: Optional[str] = None
@@ -2562,6 +2573,102 @@ class ToolLoopLLMAgent:
             )
 
 
+    def _extract_handle_tokens(self, text: str) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for mm in re.finditer(r"\b([A-Za-z]+-\d{3}-\d{2})\b", text or ""):
+            handle = str(mm.group(1) or "").strip()
+            if handle and handle.lower() not in seen:
+                seen.add(handle.lower())
+                out.append(handle)
+        return out
+
+    def _classify_structured_lookup_query(self, query: str) -> Optional[Dict[str, str]]:
+        q = str(query or "").strip()
+        if not q:
+            return None
+        ql = q.lower()
+        out: Dict[str, str] = {"query": q}
+        handles = self._extract_handle_tokens(q)
+        proj_m = re.search(r"\b(Project_\d{4})\b", q, flags=re.I)
+        if handles:
+            out["handle"] = handles[0]
+        if proj_m:
+            out["project"] = proj_m.group(1)
+        if "field note" in ql and handles:
+            out["kind"] = "field_note"
+            return out
+        if ("official profile" in ql or ql.endswith(" official") or " official " in ql) and proj_m:
+            out["kind"] = "official_profile"
+            return out
+        if "operating city approval" in ql and proj_m:
+            out["kind"] = "approval"
+            return out
+        if ("exception revocation" in ql or "revocation" in ql) and proj_m:
+            out["kind"] = "revocation"
+            return out
+        if ("legacy operating exception" in ql or "exception" in ql) and proj_m:
+            out["kind"] = "exception"
+            return out
+        return None
+
+    def _record_structured_page_signals(self, *, docid: Optional[str], title: str, content: str) -> None:
+        txt = str(content or "")
+        if not txt:
+            return
+        try:
+            if "FIELD NOTE" in txt:
+                m_handle = re.search(r"(?im)^handle:\s*([A-Za-z]+-\d{3}-\d{2})\s*$", txt)
+                m_proj = re.search(r"(?im)^canonical_project:\s*(Project_\d{4})\s*$", txt)
+                if m_handle and m_proj:
+                    key = m_handle.group(1).lower()
+                    if self._structured_handle_to_project.get(key) != m_proj.group(1):
+                        self._structured_handle_to_project[key] = m_proj.group(1)
+                        self.mem.record_msg(
+                            f"[SYSTEM] Resolved handle {m_handle.group(1)} -> {m_proj.group(1)}. Stop re-searching that handle; open the canonical OFFICIAL PROFILE next."
+                        )
+            proj_match = re.search(r"\b(Project_\d{4})\b", txt)
+            if proj_match and docid:
+                self._structured_project_docids.setdefault(proj_match.group(1), str(docid))
+        except Exception:
+            return
+
+    def _maybe_override_structured_lookup_search(
+        self,
+        *,
+        query: str,
+        qnorm: str,
+        step: int,
+        topk: int,
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not bool(getattr(self.cfg, "structured_lookup_auto_open", True)):
+            return None
+        lookup = self._classify_structured_lookup_query(query)
+        if not lookup:
+            return None
+
+        handle = str(lookup.get("handle") or "").strip()
+        if lookup.get("kind") == "field_note" and handle:
+            known_proj = self._structured_handle_to_project.get(handle.lower())
+            if known_proj:
+                new_q = f"{known_proj} official profile"
+                self.counters["policy_overrides"] += 1
+                self.counters["structured_lookup_rewrites"] += 1
+                self._policy_record_constraint_once(
+                    key=f"structured_handle_resolved:{handle.lower()}",
+                    text=(
+                        f"[CONSTRAINT] Handle {handle} is already resolved. Do not keep searching its FIELD NOTE; "
+                        f"move to the canonical project evidence for {known_proj}."
+                    ),
+                )
+                new_call = {"tool": "search", "args": {"query": new_q, "topk": topk}}
+                return "structured_handle_resolved_rewrite", new_call
+
+        return None
+
     def _extract_given_projects(self, question: str) -> List[str]:
         """Extract ordered unique Project_#### mentions from the question."""
         seen = set()
@@ -3331,6 +3438,17 @@ class ToolLoopLLMAgent:
 
         self.given_projects = self._extract_given_projects(current_user_prompt)
         self._given_projects_open_idx = 0
+        self._structured_candidate_handles = []
+        try:
+            raw_handles = task_meta.get("candidate_handles") or []
+            if isinstance(task_meta.get("target_handle"), str) and task_meta.get("target_handle"):
+                raw_handles = list(raw_handles) + [str(task_meta.get("target_handle"))]
+            self._structured_candidate_handles = [str(h).strip() for h in raw_handles if str(h).strip()]
+        except Exception:
+            self._structured_candidate_handles = []
+        self._structured_handle_to_project = {}
+        self._structured_project_docids = {}
+        self._structured_lookup_seen = Counter()
         self._finish_block_counts = Counter()
         # reset failure-policy state
         self._blocked_queries = {}
@@ -3342,6 +3460,11 @@ class ToolLoopLLMAgent:
         if self.given_projects:
             self.mem.record_msg(
                 "[SYSTEM] This task lists a specific set of projects. To avoid search loops, you can open each project's OFFICIAL PROFILE (typically docid D_TRUTH_####) and extract the required fields."
+            )
+            self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=0)
+        elif bool(getattr(self.cfg, "structured_task_system_hint", True)) and self._structured_candidate_handles:
+            self.mem.record_msg(
+                "[SYSTEM] Structured handle-resolution task: resolve each handle via its FIELD NOTE once, then move to the canonical OFFICIAL PROFILE and approval/revocation pages. Do not keep repeating the same handle search after it is resolved."
             )
             self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=0)
         self._deadline_nudged = False
@@ -4135,11 +4258,50 @@ class ToolLoopLLMAgent:
                         self._last_search_results = []
                         self._last_search_open_idx = 0
 
+                    # Structured exact-lookup tasks benefit from opening the located page quickly
+                    # instead of repeating the same handle/profile query many times.
+                    try:
+                        override = self._maybe_override_structured_lookup_search(
+                            query=query,
+                            qnorm=qnorm,
+                            step=step,
+                            topk=int(args.get("topk", 10)),
+                            task_id=task_id,
+                            method=method,
+                            run_tag=run_tag,
+                        )
+                    except Exception:
+                        override = None
+                    if override is not None:
+                        reason, new_call = override
+                        new_call = _attach_goc(new_call)
+                        self._trace({
+                            "type": "policy_override",
+                            "task_id": task_id,
+                            "method": method,
+                            "run_tag": run_tag,
+                            "step": step,
+                            "from_tool": "search",
+                            "to_tool": str(new_call.get("tool")),
+                            "reason": reason,
+                            "query": query,
+                        })
+                        call = new_call
+                        tool = str(call.get("tool"))
+                        args = call.get("args", {})
+                        if tool != "search":
+                            continue
+                        query = args.get("query") or query
+                        qnorm = self._normalize_query(query)
+
                     # If the model is repeating the exact same search, break loops by opening unseen evidence.
                     # v21: if the question provides an explicit project set, prefer opening those projects' truth docs.
+                    repeat_threshold = int(self.cfg.repeat_search_consecutive_threshold)
+                    if self._classify_structured_lookup_query(query):
+                        repeat_threshold = min(repeat_threshold, int(getattr(self.cfg, 'structured_lookup_repeat_threshold', 2) or 2))
                     if (
                         self.cfg.auto_open_on_repeat_search
-                        and self._last_search_repeat_streak >= self.cfg.repeat_search_consecutive_threshold
+                        and self._last_search_repeat_streak >= repeat_threshold
                     ):
                         docid_to_open: Optional[str] = None
 
@@ -4156,6 +4318,8 @@ class ToolLoopLLMAgent:
 
                         if docid_to_open:
                             self.counters["policy_overrides"] += 1
+                            if self._classify_structured_lookup_query(query):
+                                self.counters["structured_lookup_auto_open"] += 1
 
                             # Dedupe actual open calls
                             if self.cfg.open_page_dedupe and docid_to_open in self.opened_cache:
@@ -4201,6 +4365,7 @@ class ToolLoopLLMAgent:
                                 obs = self._compose_open_page_observation_view(content, view_content, prefix, tag)
                                 view_key = self._open_view_key(outp["docid"], None, {"section": "head"})
                                 self.opened_view_cache[view_key] = view_content
+                                self._record_structured_page_signals(docid=outp.get("docid"), title=str(outp.get("title") or ""), content=content)
                                 self._record_tool_step(
                                     step0=step,
                                     call=call,
@@ -4407,6 +4572,7 @@ class ToolLoopLLMAgent:
                         url = out.get("url") or url
                         if docid:
                             self.opened_cache[docid] = full_content
+                        self._record_structured_page_signals(docid=docid, title=title, content=full_content)
 
                     # Title for cached docs (if not populated above)
                     if cached_doc:
@@ -5159,6 +5325,37 @@ class ToolLoopLLMAgent:
                     # Normalize: ensure the final answer is always stored in args["answer"] for downstream evaluation.
                     if ans:
                         args["answer"] = ans
+
+                    # Structured BrowseComp contract: answers should be a canonical project/city pair.
+                    # We salvage light prose into '<Project_####> | <City_#>' and block finishes that still
+                    # do not contain a parseable pair.
+                    finish_fmt = str(task_meta.get("finish_answer_format", "") or "").lower()
+                    if finish_fmt == "project_city_pair":
+                        pair = normalize_project_city_pair(ans)
+                        if pair is None:
+                            pair = normalize_project_city_pair(expl0 or "")
+                        if pair is not None:
+                            if pair != ans:
+                                self.counters["finish_project_city_pair_salvaged"] += 1
+                            ans = pair
+                            args["answer"] = ans
+                        else:
+                            self.counters["premature_finish_blocked"] += 1
+                            self._last_finish_block_reason = "project_city_pair_format"
+                            self.mem.record_msg(
+                                "[SYSTEM] finish blocked: answer must contain a parseable '<Project_####> | <City_#>' pair. "
+                                "If your explanation already identifies the winner, put ONLY that pair into finish.args.answer."
+                            )
+                            self._trace({
+                                "type": "finish_blocked",
+                                "task_id": task_id,
+                                "method": method,
+                                "run_tag": run_tag,
+                                "step": step,
+                                "reason": "project_city_pair_format",
+                                "answer": ans,
+                            })
+                            continue
 
                     # HotpotQA (and similar) contract: finish.args.answer must be a JSON object serialized as a string
                     # with keys {a1, supporting_titles}. Many failures in long-horizon settings come from the model

@@ -507,6 +507,8 @@ def make_corpus_and_tasks(
             "task_slice": task_slice,
             "needs_alias_resolution": True,
             "supports_current_city_chain": True,
+            "finish_answer_format": "project_city_pair",
+            "finish_answer_pair_required": True,
         }
         if extra:
             meta.update(extra)

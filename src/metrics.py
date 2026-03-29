@@ -17,22 +17,48 @@ PAIR_RE = re.compile(
     r"(Project[ _]?0*(\d+))\s*\|\s*(City[ _]?0*(\d+))",
     flags=re.IGNORECASE,
 )
+PROJECT_RE = re.compile(r"\bProject[ _]?0*(\d+)\b", flags=re.IGNORECASE)
+CITY_RE = re.compile(r"\bCity[ _]?0*(\d+)\b", flags=re.IGNORECASE)
+PROSE_PAIR_PATTERNS = [
+    re.compile(
+        r"\b(Project[ _]?0*(\d+))\b.{0,140}?\b(?:current\s+operating\s+city|operating\s+city|approved_operating_city|headquarters)\b[^\n]{0,30}?\b(City[ _]?0*(\d+))\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\b(Project[ _]?0*(\d+))\b.{0,120}?\b(?:answer|therefore|thus|selected|winner|final)\b[^\n]{0,60}?\b(City[ _]?0*(\d+))\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+
+def _canonical_pair(project_num: int, city_num: int) -> str:
+    return f"Project_{int(project_num):04d} | City_{int(city_num)}"
 
 
 def normalize_project_city_pair(text: str) -> Optional[str]:
     """Extract and normalize 'Project_xxxx | City_y' from a string.
 
     Returns canonical string like 'Project_0047 | City_16', or None.
+    Robust to light prose such as
+    'Project_0047 ... current operating city is City_16'.
     """
     t = (text or "").strip()
     if not t:
         return None
     m = PAIR_RE.search(t)
-    if not m:
-        return None
-    proj_num = int(m.group(2))
-    city_num = int(m.group(4))
-    return f"Project_{proj_num:04d} | City_{city_num}"
+    if m:
+        return _canonical_pair(int(m.group(2)), int(m.group(4)))
+
+    for pat in PROSE_PAIR_PATTERNS:
+        m2 = pat.search(t)
+        if m2:
+            return _canonical_pair(int(m2.group(2)), int(m2.group(4)))
+
+    projects = PROJECT_RE.findall(t)
+    cities = CITY_RE.findall(t)
+    if len(projects) == 1 and len(cities) == 1:
+        return _canonical_pair(int(projects[0]), int(cities[0]))
+    return None
 
 
 def parsed_pair_match(pred: str, gold: str) -> Optional[bool]:

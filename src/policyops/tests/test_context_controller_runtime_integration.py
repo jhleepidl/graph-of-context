@@ -192,3 +192,22 @@ def test_unfold_then_fork_rechecks_after_unfold(monkeypatch) -> None:
     assert executed is True
     assert len(unfold_calls) == 1
     assert len(fork_calls) == 1
+
+
+def test_structured_lookup_rewrites_resolved_handle_query() -> None:
+    agent = _make_agent()
+    agent._structured_handle_to_project = {'juniper-052-61': 'Project_0052'}
+    evt = agent._maybe_override_structured_lookup_search(
+        query='Juniper-052-61 field note',
+        qnorm=agent._normalize_query('Juniper-052-61 field note'),
+        step=5,
+        topk=10,
+        task_id='t1',
+        method='GoC',
+        run_tag='r1',
+    )
+    assert evt is not None
+    reason, new_call = evt
+    assert reason == 'structured_handle_resolved_rewrite'
+    assert new_call['tool'] == 'search'
+    assert 'Project_0052 official profile' == new_call['args']['query']

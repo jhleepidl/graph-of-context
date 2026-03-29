@@ -37,6 +37,7 @@ def test_structured_profile_generates_three_slices_without_policy_tags(tmp_path:
 
     for task in tasks:
         assert task.get('benchmark_profile') == 'structured'
+        assert task.get('finish_answer_format') == 'project_city_pair'
         q = str(task.get('question') or '')
         assert 'policy tag' not in q.lower()
         turns = task.get('turns') or []
