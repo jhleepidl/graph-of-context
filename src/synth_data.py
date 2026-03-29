@@ -318,13 +318,15 @@ def make_corpus_and_tasks(
     structured_dependency_ratio: float = 0.35,
     structured_branch_ratio: float = 0.35,
     structured_support_recovery_ratio: float = 0.20,
+    structured_phase21_anchor_ratio: float = 0.20,
+    structured_phase21_closure_ratio: float = 0.55,
     structured_compare_candidates: int | None = None,
     structured_dependency_candidates: int | None = None,
 ):
     rng = random.Random(seed)
     profile_name = str(benchmark_profile or "standard").strip().lower()
     hard_mode = bool(hard_mode or profile_name in {"hard", "hard_lite", "hard_extreme"})
-    structured_mode = bool(profile_name in {"structured_lite", "structured_support_pilot", "phase20_support_recovery", "structured", "structured_extreme"})
+    structured_mode = bool(profile_name in {"structured_lite", "structured_support_pilot", "phase20_support_recovery", "phase21_support_closure", "structured", "structured_extreme"})
     if hard_mode:
         if profile_name == "hard_lite":
             default_compare_candidates = 4
@@ -347,6 +349,9 @@ def make_corpus_and_tasks(
             default_dependency_candidates = 2
         elif profile_name in {"structured_support_pilot", "phase20_support_recovery"}:
             default_compare_candidates = 4
+            default_dependency_candidates = 2
+        elif profile_name == "phase21_support_closure":
+            default_compare_candidates = 3
             default_dependency_candidates = 2
         elif profile_name == "structured_extreme":
             default_compare_candidates = 6
@@ -518,6 +523,31 @@ def make_corpus_and_tasks(
             meta.update(extra)
         return meta
 
+    def _with_proof_requirements(
+        *,
+        task_type: str,
+        task_slice: str,
+        proof_docids: List[str],
+        proof_group: str,
+        extra: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        unique_docids = [str(d) for d in dict.fromkeys([d for d in proof_docids if d])]
+        meta = _structured_meta(
+            task_type=task_type,
+            task_slice=task_slice,
+            extra={
+                "decision_requires_support_closure": True,
+                "proof_required_docids": unique_docids,
+                "proof_required_count": len(unique_docids),
+                "proof_complete_threshold": 1.0,
+                "proof_metric": "docid_coverage",
+                "proof_group": proof_group,
+            },
+        )
+        if extra:
+            meta.update(extra)
+        return meta
+
     def _structured_retrieval_task(task_id: str) -> Dict[str, Any]:
         k = max(4, int(structured_compare_candidates or 4))
         es = _pick_entities(k)
@@ -670,6 +700,135 @@ def make_corpus_and_tasks(
                     "target_project": target["name"],
                     "exception_state": target.get("exception_state", "none"),
                     "required_support_count": len(_structured_support_docids(target["name"])),
+                },
+            ),
+        }
+
+    def _phase21_anchor_control_task(task_id: str) -> Dict[str, Any]:
+        k = max(3, int(structured_compare_candidates or 3))
+        es = _pick_entities(k)
+        earliest = min(es, key=lambda x: x["start_year"])
+        names = [e["name"] for e in es]
+        proof_docids = [_docid_for(n) for n in names]
+        q = (
+            "You must use evidence from opened pages.\n"
+            f"Canonical projects ({len(names)} total): {', '.join(names)}. "
+            "Open every OFFICIAL PROFILE page, compare start_year values, and identify the project with the earliest start_year. "
+            "Do not answer until you have opened all candidate OFFICIAL PROFILE pages and have a proof-complete comparison. "
+            "Answer exactly as '<ProjectName> | <Headquarters>'."
+        )
+        return {
+            "id": task_id,
+            "question": q,
+            "entities": names,
+            "required": ["start_year", "headquarters"],
+            "answer": f"{earliest['name']} | {earliest['headquarters']}",
+            "gold_docids": list(dict.fromkeys(proof_docids)),
+            **_with_proof_requirements(
+                task_type="phase21_anchor_control",
+                task_slice="anchor_control",
+                proof_docids=proof_docids,
+                proof_group="candidate_profiles",
+                extra={
+                    "n_candidates": len(names),
+                    "required_support_count": len(proof_docids),
+                    "supports_current_city_chain": False,
+                },
+            ),
+        }
+
+    def _phase21_support_closure_task(task_id: str) -> Dict[str, Any]:
+        es = _pick_structured_dependency_entities(k=max(2, int(structured_dependency_candidates or 2)), allow_active=True)
+        target = min(es, key=lambda x: x["start_year"])
+        handles = [e["alias_handle"] for e in es]
+        projects = [e["name"] for e in es]
+        final_city = _final_operating_city(target)
+        proof_docids = [_alias_docid_for(e["name"]) for e in es] + [_docid_for(e["name"]) for e in es]
+        proof_docids += [_approval_docid_for(target["name"])]
+        exc = _exception_docid_for(target["name"])
+        rev = _revocation_docid_for(target["name"])
+        expected_types = ["field_note", "official_profile", "approval"]
+        if exc:
+            proof_docids.append(exc)
+            expected_types.append("exception")
+        if rev:
+            proof_docids.append(rev)
+            expected_types.append("revocation")
+        q = (
+            "You must use evidence from opened pages.\n"
+            f"Candidate handles ({len(handles)} total): {', '.join(handles)}.\n"
+            "Resolve every handle via its FIELD NOTE page, then open every matching OFFICIAL PROFILE page and identify the project with the earliest start_year. "
+            "For that selected project, determine the CURRENT operating city using the OFFICIAL PROFILE plus any Operating City Approval, Legacy Operating Exception, and Exception Revocation notices for the same project. "
+            "Do not answer until you have opened the complete support chain needed to justify BOTH the selected project and its current operating city. "
+            "Answer exactly as '<ProjectName> | <City>'."
+        )
+        gold_docids = list(dict.fromkeys(proof_docids))
+        return {
+            "id": task_id,
+            "question": q,
+            "entities": projects,
+            "required": ["alias_handle", "start_year", "approval_ticket", "exception_ticket"],
+            "answer": f"{target['name']} | {final_city}",
+            "gold_docids": gold_docids,
+            **_with_proof_requirements(
+                task_type="phase21_support_closure",
+                task_slice="support_closure",
+                proof_docids=proof_docids,
+                proof_group="earliest_plus_current_city",
+                extra={
+                    "candidate_handles": handles,
+                    "target_project": target["name"],
+                    "target_exception_state": str(target.get("exception_state", "none")),
+                    "n_candidates": len(projects),
+                    "required_support_count": len(gold_docids),
+                    "support_variant": "phase21_full_closure",
+                    "proof_expected_types": expected_types,
+                },
+            ),
+        }
+
+    def _phase21_provenance_task(task_id: str) -> Dict[str, Any]:
+        branch_candidates = [e for e in entities if str(e.get("exception_state")) in {"active", "revoked"}]
+        target = rng.choice(branch_candidates or entities)
+        handle = target["alias_handle"]
+        final_city = _final_operating_city(target)
+        proof_docids = [_alias_docid_for(target["name"]), _docid_for(target["name"]), _approval_docid_for(target["name"])]
+        exc = _exception_docid_for(target["name"])
+        rev = _revocation_docid_for(target["name"])
+        expected_types = ["field_note", "official_profile", "approval"]
+        if exc:
+            proof_docids.append(exc)
+            expected_types.append("exception")
+        if rev:
+            proof_docids.append(rev)
+            expected_types.append("revocation")
+        gold_docids = list(dict.fromkeys(proof_docids + [_archived_docid_for(target["name"])]))
+        q = (
+            "You must use evidence from opened pages.\n"
+            f"Resolve handle {handle} via its FIELD NOTE page, then determine the CURRENT operating city for the canonical project.\n"
+            "Use the OFFICIAL PROFILE, the Operating City Approval notice, and any Legacy Operating Exception / Exception Revocation notices for that same project. "
+            "Archived status boards are stale provenance and should never be treated as current authority. "
+            "Do not answer until you have opened the full current-support chain for the project. "
+            "Answer exactly as '<ProjectName> | <City>'."
+        )
+        return {
+            "id": task_id,
+            "question": q,
+            "entities": [target["name"]],
+            "required": ["alias_handle", "approval_ticket", "exception_ticket"],
+            "answer": f"{target['name']} | {final_city}",
+            "gold_docids": gold_docids,
+            **_with_proof_requirements(
+                task_type="phase21_provenance_required",
+                task_slice="provenance_required",
+                proof_docids=proof_docids,
+                proof_group="current_authority_chain",
+                extra={
+                    "target_handle": handle,
+                    "target_project": target["name"],
+                    "target_exception_state": str(target.get("exception_state", "none")),
+                    "required_support_count": len(proof_docids),
+                    "proof_expected_types": expected_types,
                 },
             ),
         }
@@ -873,6 +1032,15 @@ def make_corpus_and_tasks(
                     tasks.append(_structured_support_recovery_task(task_id))
                 else:
                     tasks.append(_structured_branch_task(task_id))
+            elif profile_name == "phase21_support_closure":
+                anchor_ratio = max(0.0, float(structured_phase21_anchor_ratio))
+                closure_ratio = max(0.0, float(structured_phase21_closure_ratio))
+                if r < anchor_ratio:
+                    tasks.append(_phase21_anchor_control_task(task_id))
+                elif r < anchor_ratio + closure_ratio:
+                    tasks.append(_phase21_support_closure_task(task_id))
+                else:
+                    tasks.append(_phase21_provenance_task(task_id))
             else:
                 retrieval_ratio = max(0.0, 1.0 - float(structured_dependency_ratio) - float(structured_branch_ratio))
                 if r < retrieval_ratio:

@@ -60,6 +60,8 @@ class SyntheticBrowseComp(Benchmark):
             structured_dependency_ratio=float(kwargs.get("structured_dependency_ratio", 0.35)),
             structured_branch_ratio=float(kwargs.get("structured_branch_ratio", 0.35)),
             structured_support_recovery_ratio=float(kwargs.get("structured_support_recovery_ratio", 0.20)),
+            structured_phase21_anchor_ratio=float(kwargs.get("structured_phase21_anchor_ratio", 0.20)),
+            structured_phase21_closure_ratio=float(kwargs.get("structured_phase21_closure_ratio", 0.55)),
             structured_compare_candidates=(None if kwargs.get("structured_compare_candidates") is None else int(kwargs.get("structured_compare_candidates"))),
             structured_dependency_candidates=(None if kwargs.get("structured_dependency_candidates") is None else int(kwargs.get("structured_dependency_candidates"))),
         )
@@ -109,10 +111,23 @@ class SyntheticBrowseComp(Benchmark):
         correct_strict = exact_match(pred_answer, task.answer)
         correct = robust_match(pred_answer, task.answer)
         cov = docid_coverage(pred_expl, task.gold_docids or [])
-        return {
+        out = {
             "correct": bool(correct),
             "correct_strict": bool(correct_strict),
             "pred_norm": normalize_project_city_pair(pred_answer),
             "gold_norm": normalize_project_city_pair(task.answer),
             "docid_cov": cov,
         }
+        meta = getattr(task, 'meta', None) or {}
+        proof_docids = list(meta.get('proof_required_docids') or []) if isinstance(meta, dict) else []
+        if proof_docids:
+            proof_cov = docid_coverage(pred_expl, proof_docids)
+            proof_threshold = float(meta.get('proof_complete_threshold', 1.0) or 1.0)
+            out.update({
+                "proof_docid_cov": float(proof_cov),
+                "proof_complete": bool(float(proof_cov) >= proof_threshold),
+                "proof_complete_correct": bool(correct and float(proof_cov) >= proof_threshold),
+                "proof_required_count": int(meta.get('proof_required_count') or len(proof_docids)),
+                "proof_group": str(meta.get('proof_group') or ''),
+            })
+        return out

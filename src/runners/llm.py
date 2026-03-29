@@ -374,6 +374,40 @@ def run_llm(
                 trace_unfold_candidates=True,
             ),
         ),
+        "SimilarityOnly-Prove": MethodSpec(
+            "SimilarityOnly-Prove",
+            lambda: SimilarityOnlyMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+            ),
+        ),
+        "GoC-SimSeed-Closure": MethodSpec(
+            "GoC-SimSeed-Closure",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-SimSeed-Fork-Verify": MethodSpec(
+            "GoC-SimSeed-Fork-Verify",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
     }
 
     selected: List[MethodSpec] = []
@@ -515,10 +549,19 @@ def run_llm(
             cfg = replace(cfg, goc_annotation_mode="hybrid_depends")
         elif str(ms_name) == "GoC-TraceFirst":
             cfg = replace(cfg, goc_annotation_mode="tracefirst")
+        if str(ms_name) in {"SimilarityOnly-Prove", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify"}:
+            cfg = replace(
+                cfg,
+                proof_closure_guard=True,
+                proof_closure_search_planner=True,
+                proof_closure_auto_open=True,
+                proof_closure_autofinish=True,
+                proof_closure_system_hint=True,
+            )
 
         fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
         fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
-        if str(ms_name) in {"GoC-Fork-Dep", "GoC-SimSeed-Fork-Dep"}:
+        if str(ms_name) in {"GoC-Fork-Dep", "GoC-SimSeed-Fork-Dep", "GoC-SimSeed-Fork-Verify"}:
             cfg = replace(
                 cfg,
                 enable_scoped_fork=True,
@@ -647,8 +690,12 @@ def run_llm(
             )
             pred = (out.get("answer") or "").strip()
             expl = out.get("explanation") or ""
-            ev = benchmark.evaluate(pred, expl, t)
-            return {
+            evidence_docids = [str(d) for d in (out.get("evidence_docids") or []) if str(d)]
+            eval_expl = expl
+            if evidence_docids:
+                eval_expl = (eval_expl + "\nEvidence docids: " + ", ".join(evidence_docids)).strip()
+            ev = benchmark.evaluate(pred, eval_expl, t)
+            rec = {
                 "benchmark": benchmark.name,
                 "method": ms_name,
                 "task_id": t.id,
@@ -665,10 +712,15 @@ def run_llm(
                 "elapsed_sec": out.get("elapsed_sec"),
                 "confidence": out.get("confidence", ""),
                 "explanation": expl,
+                "evidence_docids": evidence_docids,
                 "run_tag": run_tag,
                 "retriever_kind": retriever_kind,
                 "goc_internal_graph_jsonl_path": internal_graph_path,
             }
+            for k, v in ev.items():
+                if k not in rec:
+                    rec[k] = v
+            return rec
         except Exception as e:
             return {
                 "benchmark": benchmark.name,

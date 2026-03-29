@@ -125,6 +125,11 @@ class ToolLoopConfig:
     structured_task_system_hint: bool = True
     structured_dependency_planner: bool = True
     structured_dependency_finish_guard: bool = True
+    proof_closure_guard: bool = False
+    proof_closure_search_planner: bool = False
+    proof_closure_auto_open: bool = False
+    proof_closure_autofinish: bool = True
+    proof_closure_system_hint: bool = True
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -383,13 +388,16 @@ class ToolLoopLLMAgent:
         self._given_projects_open_idx: int = 0
         self._structured_candidate_handles: List[str] = []
         self._structured_handle_to_project: Dict[str, str] = {}
+        self._structured_handle_docids: Dict[str, str] = {}
         self._structured_project_docids: Dict[str, str] = {}
         self._structured_project_years: Dict[str, int] = {}
         self._structured_project_hq: Dict[str, str] = {}
         self._structured_project_approval_city: Dict[str, str] = {}
+        self._structured_project_approval_docids: Dict[str, str] = {}
+        self._structured_project_exception_docids: Dict[str, str] = {}
+        self._structured_project_revocation_docids: Dict[str, str] = {}
         self._structured_project_exception_city: Dict[str, str] = {}
-        self._structured_project_exception_ticket: Dict[str, str] = {}
-        self._structured_project_revoked: set[str] = set()
+        self._structured_project_revoked: set = set()
         self._structured_lookup_seen: Counter = Counter()
         self._finish_block_counts: Counter = Counter()
         self._deadline_nudged: bool = False
@@ -2598,54 +2606,6 @@ class ToolLoopLLMAgent:
             pass
         return target_call
 
-    def _maybe_override_structured_lookup_search(
-        self,
-        *,
-        query: str,
-        qnorm: str,
-        step: int,
-        topk: int,
-        task_id: str,
-        method: str,
-        run_tag: str,
-    ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        qinfo = self._classify_structured_lookup_query(query)
-        if not qinfo:
-            return None
-
-        kind = str(qinfo.get("kind") or "")
-        handle = str(qinfo.get("handle") or "").strip()
-        project = str(qinfo.get("project") or "").strip()
-
-        desired_q: Optional[str] = None
-        reason: Optional[str] = None
-
-        if kind == "field_note" and handle:
-            resolved_project = self._structured_handle_to_project.get(handle.lower())
-            if resolved_project:
-                desired_q = f"{resolved_project} official profile"
-                reason = "structured_handle_resolved_rewrite"
-        elif kind == "official_profile" and project and bool(getattr(self.cfg, "structured_dependency_planner", True)):
-            # If the profile is already parsed for a current-city chain task, move to the next required support.
-            current_city_task = bool(getattr(self, "_structured_candidate_handles", None))
-            if current_city_task and project in self._structured_project_years and project not in self._structured_project_approval_city:
-                desired_q = f"{project} operating city approval"
-                reason = "structured_profile_to_approval"
-
-        if not desired_q or self._normalize_query(desired_q) == qnorm:
-            return None
-
-        self.counters["policy_overrides"] += 1
-        self.counters["structured_lookup_rewrites"] += 1
-        self._policy_record_constraint_once(
-            key=f"structured_lookup:{reason}:{self._normalize_query(desired_q)}",
-            text=(
-                "[CONSTRAINT] Structured lookup task: stop repeating already-resolved handle lookups. "
-                f"Focus next on: {desired_q}"
-            ),
-        )
-        return reason, {"tool": "search", "args": {"query": desired_q, "topk": topk}}
-
     def _classify_structured_lookup_query(self, query: str) -> Optional[Dict[str, str]]:
         q = str(query or "").strip()
         if not q:
@@ -2711,6 +2671,42 @@ class ToolLoopLLMAgent:
                 best_docid = did
         return best_docid
 
+    def _maybe_override_structured_lookup_search(
+        self,
+        *,
+        query: str,
+        qnorm: str,
+        step: int,
+        topk: int,
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        _ = (step, task_id, method, run_tag)
+        if not bool(getattr(self.cfg, "structured_lookup_auto_open", True)):
+            return None
+        qinfo = self._classify_structured_lookup_query(query)
+        if not qinfo:
+            return None
+        kind = str(qinfo.get("kind") or "")
+        handle = str(qinfo.get("handle") or "")
+        project = str(qinfo.get("project") or "")
+        desired_q: Optional[str] = None
+        reason: Optional[str] = None
+        if kind == "field_note" and handle:
+            resolved = self._structured_handle_to_project.get(handle.lower())
+            if resolved:
+                desired_q = f"{resolved} official profile"
+                reason = "structured_handle_resolved_rewrite"
+        elif kind == "official_profile" and project and project in self._structured_project_years:
+            desired_q = f"{project} operating city approval"
+            reason = "structured_profile_resolved_rewrite"
+        if not desired_q or self._normalize_query(desired_q) == qnorm:
+            return None
+        self.counters["policy_overrides"] += 1
+        self.counters["structured_lookup_rewrites"] += 1
+        return reason, {"tool": "search", "args": {"query": desired_q, "topk": topk}}
+
     def _record_structured_page_signals(self, *, docid: Optional[str], title: str, content: str) -> None:
         txt = str(content or "")
         ttl = str(title or "")
@@ -2722,6 +2718,8 @@ class ToolLoopLLMAgent:
                 m_proj = re.search(r"(?im)^canonical_project:\s*(Project_\d{4})\s*$", txt)
                 if m_handle and m_proj:
                     key = m_handle.group(1).lower()
+                    if docid:
+                        self._structured_handle_docids[key] = str(docid)
                     if self._structured_handle_to_project.get(key) != m_proj.group(1):
                         self._structured_handle_to_project[key] = m_proj.group(1)
                         self.mem.record_msg(
@@ -2750,45 +2748,34 @@ class ToolLoopLLMAgent:
                 city = re.search(r"(?im)^approved_operating_city:\s*(City_\d+)\s*$", txt)
                 if city:
                     self._structured_project_approval_city[project] = city.group(1)
+                    if docid:
+                        self._structured_project_approval_docids[project] = str(docid)
                     self.mem.record_msg(
                         f"[SYSTEM] Parsed current operating-city approval for {project}: {city.group(1)}."
                     )
 
             if project and ("LEGACY OPERATING EXCEPTION" in txt or "Legacy Operating Exception" in ttl):
                 city = re.search(r"(?im)^override_city:\s*(City_\d+)\s*$", txt)
-                ticket = re.search(r"(?im)^exception_ticket:\s*([A-Z]{3}-\d{4}-[A-Z]{3})\s*$", txt)
                 if city:
                     self._structured_project_exception_city[project] = city.group(1)
-                if ticket:
-                    self._structured_project_exception_ticket[project] = ticket.group(1)
-                if city:
+                    if docid:
+                        self._structured_project_exception_docids[project] = str(docid)
                     self.mem.record_msg(
-                        f"[SYSTEM] Parsed active legacy exception for {project}: override_city={city.group(1)} until a later revocation is opened."
+                        f"[SYSTEM] Parsed active exception candidate for {project}: override_city={city.group(1)} until revoked."
                     )
 
             if project and ("EXCEPTION REVOCATION" in txt or "Exception Revocation" in ttl):
                 self._structured_project_revoked.add(project)
+                if docid:
+                    self._structured_project_revocation_docids[project] = str(docid)
                 self.mem.record_msg(
                     f"[SYSTEM] Parsed revocation notice for {project}. If an approval exists, it becomes current again."
                 )
         except Exception:
             return
 
-    def _structured_expected_current_city(self, project: Optional[str]) -> Optional[str]:
-        if not project:
-            return None
-        if project in self._structured_project_revoked:
-            return self._structured_project_approval_city.get(project) or self._structured_project_hq.get(project)
-        if project in self._structured_project_exception_city:
-            return self._structured_project_exception_city.get(project)
-        return self._structured_project_approval_city.get(project) or self._structured_project_hq.get(project)
-
     def _structured_dependency_status(self, task_meta: Dict[str, Any]) -> Dict[str, Any]:
-        slice_name = str(task_meta.get("task_slice") or "")
         handles = [str(h).strip() for h in (task_meta.get("candidate_handles") or []) if str(h).strip()]
-        target_handle = str(task_meta.get("target_handle") or "").strip()
-        if target_handle and target_handle not in handles:
-            handles.append(target_handle)
         resolved = []
         unresolved = []
         for h in handles:
@@ -2800,30 +2787,75 @@ class ToolLoopLLMAgent:
         projects = [proj for _h, proj in resolved]
         missing_profiles = [p for p in projects if p not in self._structured_project_years]
         selected_project = None
-        if slice_name == "dependency_necessary":
-            if projects and not missing_profiles:
-                selected_project = min(projects, key=lambda p: (int(self._structured_project_years.get(p, 99999)), p))
-        else:
-            target_project = str(task_meta.get("target_project") or "").strip()
-            if target_project:
-                selected_project = target_project
-            elif target_handle:
-                selected_project = self._structured_handle_to_project.get(target_handle.lower())
-            elif projects:
-                selected_project = projects[0]
-        selected_approval_city = self._structured_project_approval_city.get(selected_project) if selected_project else None
-        selected_exception_city = self._structured_project_exception_city.get(selected_project) if selected_project else None
-        selected_current_city = self._structured_expected_current_city(selected_project)
-        expected_exception_state = str(task_meta.get("target_exception_state") or task_meta.get("exception_state") or "none").strip().lower()
+        if projects and not missing_profiles:
+            selected_project = min(projects, key=lambda p: (int(self._structured_project_years.get(p, 99999)), p))
+        return {
+            "handles": handles,
+            "resolved": resolved,
+            "unresolved_handles": unresolved,
+            "projects": projects,
+            "missing_profiles": missing_profiles,
+            "selected_project": selected_project,
+            "selected_approval_city": self._structured_project_approval_city.get(selected_project) if selected_project else None,
+        }
 
-        missing_support: List[str] = []
+    def _is_support_closure_task(self, task_meta: Dict[str, Any]) -> bool:
+        return bool(task_meta.get("decision_requires_support_closure")) or str(task_meta.get("task_slice") or "") in {"support_closure", "provenance_required", "anchor_control"}
+
+    def _structured_current_city(self, project: Optional[str]) -> Optional[str]:
+        if not project:
+            return None
+        approval = self._structured_project_approval_city.get(project)
+        exception = self._structured_project_exception_city.get(project)
+        revoked = project in self._structured_project_revoked
+        if exception and not revoked:
+            return exception
+        return approval or self._structured_project_hq.get(project)
+
+    def _structured_support_closure_status(self, task_meta: Dict[str, Any]) -> Dict[str, Any]:
+        handles = [str(h).strip() for h in (task_meta.get("candidate_handles") or []) if str(h).strip()]
+        target_handle = str(task_meta.get("target_handle") or "").strip()
+        if target_handle and all(target_handle.lower() != h.lower() for h in handles):
+            handles.append(target_handle)
+
+        resolved = []
+        unresolved = []
+        for h in handles:
+            proj = self._structured_handle_to_project.get(h.lower())
+            if proj:
+                resolved.append((h, proj))
+            else:
+                unresolved.append(h)
+
+        projects = [proj for _h, proj in resolved]
+        target_project = str(task_meta.get("target_project") or "").strip() or None
+        if target_project and target_project not in projects:
+            projects = projects + [target_project]
+        # ordered unique
+        projects = list(dict.fromkeys([p for p in projects if p]))
+        missing_profiles = [p for p in projects if p not in self._structured_project_years]
+
+        selected_project: Optional[str] = None
+        if target_project:
+            selected_project = target_project
+        elif projects and not missing_profiles:
+            selected_project = min(projects, key=lambda p: (int(self._structured_project_years.get(p, 99999)), p))
+
+        expected_state = str(task_meta.get("target_exception_state") or task_meta.get("exception_state") or "none")
+        proof_expected_types = [str(x) for x in (task_meta.get("proof_expected_types") or []) if str(x)]
+        missing_support_types: List[str] = []
         if selected_project:
-            if selected_project not in self._structured_project_approval_city:
-                missing_support.append("approval")
-            if expected_exception_state in {"active", "revoked"} and selected_project not in self._structured_project_exception_city:
-                missing_support.append("exception")
-            if expected_exception_state == "revoked" and selected_project not in self._structured_project_revoked:
-                missing_support.append("revocation")
+            if "approval" in proof_expected_types and selected_project not in self._structured_project_approval_docids:
+                missing_support_types.append("approval")
+            if "exception" in proof_expected_types and selected_project not in self._structured_project_exception_docids:
+                missing_support_types.append("exception")
+            if "revocation" in proof_expected_types and selected_project not in self._structured_project_revocation_docids:
+                missing_support_types.append("revocation")
+
+        proof_docids = [str(d) for d in (task_meta.get("proof_required_docids") or []) if str(d)]
+        opened = set([str(d) for d in self.evidence_docids if d]) | set([str(d) for d in self.opened_cache.keys() if d])
+        missing_proof_docids = [d for d in proof_docids if d not in opened]
+        proof_cov = 1.0 if not proof_docids else float(len([d for d in proof_docids if d in opened])) / float(len(proof_docids))
 
         return {
             "handles": handles,
@@ -2832,13 +2864,100 @@ class ToolLoopLLMAgent:
             "projects": projects,
             "missing_profiles": missing_profiles,
             "selected_project": selected_project,
-            "selected_approval_city": selected_approval_city,
-            "selected_exception_city": selected_exception_city,
-            "selected_current_city": selected_current_city,
+            "selected_city": self._structured_current_city(selected_project),
+            "selected_approval_city": self._structured_project_approval_city.get(selected_project) if selected_project else None,
+            "selected_exception_city": self._structured_project_exception_city.get(selected_project) if selected_project else None,
             "selected_revoked": bool(selected_project and selected_project in self._structured_project_revoked),
-            "expected_exception_state": expected_exception_state,
-            "missing_support": missing_support,
+            "expected_state": expected_state,
+            "proof_expected_types": proof_expected_types,
+            "missing_support_types": missing_support_types,
+            "proof_docids": proof_docids,
+            "missing_proof_docids": missing_proof_docids,
+            "proof_docid_cov": proof_cov,
         }
+
+    def _next_support_closure_query(self, task_meta: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        status = self._structured_support_closure_status(task_meta)
+        unresolved = list(status.get("unresolved_handles") or [])
+        if unresolved:
+            return f"{unresolved[0]} field note", "support_closure_resolve_handle"
+        missing_profiles = list(status.get("missing_profiles") or [])
+        if missing_profiles:
+            return f"{missing_profiles[0]} official profile", "support_closure_missing_profile"
+        selected = status.get("selected_project")
+        if selected:
+            missing_types = list(status.get("missing_support_types") or [])
+            if "approval" in missing_types:
+                return f"{selected} operating city approval", "support_closure_missing_approval"
+            if "exception" in missing_types:
+                return f"{selected} legacy operating exception", "support_closure_missing_exception"
+            if "revocation" in missing_types:
+                return f"{selected} exception revocation", "support_closure_missing_revocation"
+        return None, None
+
+    def _maybe_override_support_closure_search(
+        self,
+        *,
+        query: str,
+        topk: int,
+        task_meta: Dict[str, Any],
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not bool(getattr(self.cfg, "proof_closure_search_planner", False)):
+            return None
+        if not self._is_support_closure_task(task_meta):
+            return None
+        desired_q, reason = self._next_support_closure_query(task_meta)
+        if not desired_q or self._normalize_query(query) == self._normalize_query(desired_q):
+            return None
+        self.counters["policy_overrides"] += 1
+        self.counters["proof_closure_search_rewrites"] += 1
+        self._policy_record_constraint_once(
+            key=f"proof_closure:{reason}:{self._normalize_query(desired_q)}",
+            text=(
+                "[CONSTRAINT] Proof-closure task: do not stop after the first anchor. Resolve handles, open the candidate profiles, and then open the current-support pages "
+                f"needed for the selected project. Focus next on: {desired_q}"
+            ),
+        )
+        return reason, {"tool": "search", "args": {"query": desired_q, "topk": topk}}
+
+    def _find_needed_structured_result_docid(
+        self,
+        *,
+        query: str,
+        results: List[Dict[str, Any]],
+        task_meta: Dict[str, Any],
+    ) -> Optional[str]:
+        if not bool(getattr(self.cfg, "proof_closure_auto_open", False)):
+            return None
+        if not self._is_support_closure_task(task_meta):
+            return None
+
+        expected_titles: List[str] = []
+        status = self._structured_support_closure_status(task_meta)
+        unresolved = list(status.get("unresolved_handles") or [])
+        expected_titles.extend([f"{h} Field Note" for h in unresolved[:1]])
+        expected_titles.extend([f"{p} Official" for p in list(status.get("missing_profiles") or [])[:1]])
+        selected = status.get("selected_project")
+        if selected:
+            missing_types = list(status.get("missing_support_types") or [])
+            if "approval" in missing_types:
+                expected_titles.append(f"Operating City Approval - {selected}")
+            if "exception" in missing_types:
+                expected_titles.append(f"Legacy Operating Exception - {selected}")
+            if "revocation" in missing_types:
+                expected_titles.append(f"Exception Revocation - {selected}")
+
+        norms = {self._normalize_query(t): t for t in expected_titles if t}
+        if not norms:
+            return None
+        for r in results or []:
+            did = str(r.get("docid") or "").strip()
+            ttl = str(r.get("title") or "").strip()
+            if not did or not ttl or did in self.opened_cache:
+                continue
+            if self._normalize_query(ttl) in norms:
+                return did
+        return None
 
     def _maybe_override_structured_dependency_search(
         self,
@@ -2849,9 +2968,7 @@ class ToolLoopLLMAgent:
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         if not bool(getattr(self.cfg, "structured_dependency_planner", True)):
             return None
-
-        slice_name = str(task_meta.get("task_slice") or "")
-        if slice_name not in {"dependency_necessary", "branch_resolution", "support_recovery"}:
+        if str(task_meta.get("task_slice") or "") != "dependency_necessary":
             return None
 
         status = self._structured_dependency_status(task_meta)
@@ -2868,18 +2985,11 @@ class ToolLoopLLMAgent:
                 desired_q = f"{missing_profiles[0]} official profile"
                 reason = "structured_dependency_missing_profile"
             else:
-                selected = str(status.get("selected_project") or "").strip()
-                missing_support = list(status.get("missing_support") or [])
-                if selected and missing_support:
-                    if "approval" in missing_support:
-                        desired_q = f"{selected} operating city approval"
-                        reason = "structured_dependency_missing_approval"
-                    elif "exception" in missing_support:
-                        desired_q = f"{selected} legacy operating exception"
-                        reason = "structured_dependency_missing_exception"
-                    elif "revocation" in missing_support:
-                        desired_q = f"{selected} exception revocation"
-                        reason = "structured_dependency_missing_revocation"
+                selected = status.get("selected_project")
+                selected_city = status.get("selected_approval_city")
+                if selected and not selected_city:
+                    desired_q = f"{selected} operating city approval"
+                    reason = "structured_dependency_missing_approval"
 
         if not desired_q:
             return None
@@ -2891,9 +3001,8 @@ class ToolLoopLLMAgent:
         self._policy_record_constraint_once(
             key=f"structured_dep:{reason}:{self._normalize_query(desired_q)}",
             text=(
-                "[CONSTRAINT] Structured current-city task: resolve the handle to the canonical project, open the OFFICIAL PROFILE, "
-                "then recover the operating-city chain in order: approval -> exception -> revocation (when present). "
-                "Do not answer from headquarters or archived snapshots until that chain is complete. "
+                "[CONSTRAINT] Structured dependency task: first resolve all candidate handles, then compare OFFICIAL PROFILE start_year values, "
+                "then use OPERATING CITY APPROVAL (and a later revocation if present) for the selected earliest project. "
                 f"Focus next on: {desired_q}"
             ),
         )
@@ -3677,12 +3786,15 @@ class ToolLoopLLMAgent:
         except Exception:
             self._structured_candidate_handles = []
         self._structured_handle_to_project = {}
+        self._structured_handle_docids = {}
         self._structured_project_docids = {}
         self._structured_project_years = {}
         self._structured_project_hq = {}
         self._structured_project_approval_city = {}
+        self._structured_project_approval_docids = {}
+        self._structured_project_exception_docids = {}
+        self._structured_project_revocation_docids = {}
         self._structured_project_exception_city = {}
-        self._structured_project_exception_ticket = {}
         self._structured_project_revoked = set()
         self._structured_lookup_seen = Counter()
         self._finish_block_counts = Counter()
@@ -3701,6 +3813,11 @@ class ToolLoopLLMAgent:
         elif bool(getattr(self.cfg, "structured_task_system_hint", True)) and self._structured_candidate_handles:
             self.mem.record_msg(
                 "[SYSTEM] Structured handle-resolution task: resolve each handle via its FIELD NOTE once, then move to the canonical OFFICIAL PROFILE and approval/revocation pages. Do not keep repeating the same handle search after it is resolved."
+            )
+            self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=0)
+        if bool(getattr(self.cfg, "proof_closure_system_hint", True)) and bool(task_meta.get("decision_requires_support_closure")):
+            self.mem.record_msg(
+                "[SYSTEM] Proof-closure task: do not finish after finding only the first relevant page. You must open the complete support chain needed to justify the selected project and the current-validity decision."
             )
             self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=0)
         self._deadline_nudged = False
@@ -4512,6 +4629,12 @@ class ToolLoopLLMAgent:
                                 topk=int(args.get("topk", 10)),
                                 task_meta=task_meta,
                             )
+                        if override is None:
+                            override = self._maybe_override_support_closure_search(
+                                query=query,
+                                topk=int(args.get("topk", 10)),
+                                task_meta=task_meta,
+                            )
                     except Exception:
                         override = None
                     if override is not None:
@@ -4713,11 +4836,20 @@ class ToolLoopLLMAgent:
                     # matches exactly, open it immediately as a policy optimization.
                     try:
                         auto_open_docid = None
-                        if bool(task_meta.get("supports_current_city_chain")) or str(task_meta.get("task_slice") or "") == "dependency_necessary":
+                        if str(task_meta.get("task_slice") or "") == "dependency_necessary":
                             auto_open_docid = self._find_exact_structured_result_docid(query, out)
+                        if auto_open_docid is None:
+                            auto_open_docid = self._find_needed_structured_result_docid(
+                                query=query,
+                                results=out,
+                                task_meta=task_meta,
+                            )
                         if auto_open_docid and auto_open_docid not in self.opened_cache:
                             self.counters["policy_overrides"] += 1
-                            self.counters["structured_lookup_exact_auto_open"] += 1
+                            if str(task_meta.get("task_slice") or "") == "dependency_necessary":
+                                self.counters["structured_lookup_exact_auto_open"] += 1
+                            else:
+                                self.counters["proof_closure_auto_open"] += 1
                             outp = self.tools.open_page(docid=auto_open_docid)
                             self.counters["open_page_calls"] += 1
                             content = (outp.get("content") or "")
@@ -4754,7 +4886,7 @@ class ToolLoopLLMAgent:
                                 "step": step,
                                 "from_tool": "search",
                                 "to_tool": "open_page",
-                                "reason": "structured_exact_auto_open",
+                                "reason": ("structured_exact_auto_open" if str(task_meta.get("task_slice") or "") == "dependency_necessary" else "proof_closure_auto_open"),
                                 "query": query,
                                 "opened_docid": auto_open_docid,
                             })
@@ -5657,19 +5789,14 @@ class ToolLoopLLMAgent:
 
                         if (
                             bool(getattr(self.cfg, "structured_dependency_finish_guard", True))
-                            and (bool(task_meta.get("supports_current_city_chain")) or str(task_meta.get("task_slice") or "") == "dependency_necessary")
+                            and str(task_meta.get("task_slice") or "") == "dependency_necessary"
                         ):
                             dep_status = self._structured_dependency_status(task_meta)
                             unresolved = list(dep_status.get("unresolved_handles") or [])
                             missing_profiles = list(dep_status.get("missing_profiles") or [])
-                            missing_support = list(dep_status.get("missing_support") or [])
                             selected_proj = dep_status.get("selected_project")
-                            selected_city = dep_status.get("selected_current_city")
-                            selected_exception_state = str(dep_status.get("expected_exception_state") or "none")
-                            pair_norm = normalize_project_city_pair(ans)
-                            pair_proj = pair_norm.split(" | ")[0] if pair_norm else None
-                            pair_city = pair_norm.split(" | ")[1] if pair_norm else None
-                            if str(task_meta.get("task_slice") or "") == "dependency_necessary" and (unresolved or missing_profiles):
+                            selected_city = dep_status.get("selected_approval_city")
+                            if unresolved or missing_profiles:
                                 self.counters["premature_finish_blocked"] += 1
                                 self._last_finish_block_reason = "structured_dependency_incomplete"
                                 msg = "[SYSTEM] finish blocked: for this dependency task, resolve EVERY candidate handle and open EVERY candidate OFFICIAL PROFILE before answering."
@@ -5679,34 +5806,76 @@ class ToolLoopLLMAgent:
                                     msg += f" Missing OFFICIAL PROFILE evidence for: {', '.join(missing_profiles[:3])}."
                                 self.mem.record_msg(msg)
                                 continue
+                            pair_proj = normalize_project_city_pair(ans).split(" | ")[0] if normalize_project_city_pair(ans) else None
+                            pair_city = normalize_project_city_pair(ans).split(" | ")[1] if normalize_project_city_pair(ans) else None
                             if selected_proj and pair_proj and pair_proj != selected_proj:
                                 self.counters["premature_finish_blocked"] += 1
                                 self._last_finish_block_reason = "structured_dependency_wrong_project"
                                 self.mem.record_msg(
-                                    f"[SYSTEM] finish blocked: comparing parsed OFFICIAL PROFILE start_year values, the supported project is {selected_proj}. Re-check the comparison before answering."
+                                    f"[SYSTEM] finish blocked: comparing parsed OFFICIAL PROFILE start_year values, the earliest candidate project is {selected_proj}. Re-check the comparison before answering."
                                 )
                                 continue
-                            if selected_proj and missing_support:
+                            if selected_proj and not selected_city:
                                 self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "structured_dependency_missing_support"
-                                need_parts = []
-                                if "approval" in missing_support:
-                                    need_parts.append("OPERATING CITY APPROVAL")
-                                if "exception" in missing_support:
-                                    need_parts.append("LEGACY OPERATING EXCEPTION")
-                                if "revocation" in missing_support:
-                                    need_parts.append("EXCEPTION REVOCATION")
+                                self._last_finish_block_reason = "structured_dependency_missing_approval"
                                 self.mem.record_msg(
-                                    f"[SYSTEM] finish blocked: you still need supporting current-city evidence for {selected_proj}: {', '.join(need_parts)}. "
-                                    f"For exception_state={selected_exception_state}, do not answer from headquarters, approval, or archived snapshots until that chain is opened."
+                                    f"[SYSTEM] finish blocked: you still need the OPERATING CITY APPROVAL for {selected_proj}. Do not use headquarters as the final operating city."
                                 )
                                 continue
                             if selected_proj and selected_city and pair_city and pair_city != selected_city:
                                 self.counters["premature_finish_blocked"] += 1
                                 self._last_finish_block_reason = "structured_dependency_wrong_city"
                                 self.mem.record_msg(
-                                    f"[SYSTEM] finish blocked: the current operating city for {selected_proj} from opened evidence is {selected_city}. "
-                                    "Do not answer with headquarters, approval-only, or a stale archived city when the exception/revocation chain implies a different city."
+                                    f"[SYSTEM] finish blocked: the approved current operating city for {selected_proj} from opened evidence is {selected_city}. Do not answer with headquarters or a stale city."
+                                )
+                                continue
+
+                        if (
+                            bool(getattr(self.cfg, "proof_closure_guard", False))
+                            and self._is_support_closure_task(task_meta)
+                        ):
+                            proof_status = self._structured_support_closure_status(task_meta)
+                            unresolved = list(proof_status.get("unresolved_handles") or [])
+                            missing_profiles = list(proof_status.get("missing_profiles") or [])
+                            missing_support_types = list(proof_status.get("missing_support_types") or [])
+                            missing_proof_docids = list(proof_status.get("missing_proof_docids") or [])
+                            selected_proj = proof_status.get("selected_project")
+                            selected_city = proof_status.get("selected_city")
+                            pair_norm = normalize_project_city_pair(ans)
+                            pair_proj = pair_norm.split(" | ")[0] if pair_norm else None
+                            pair_city = pair_norm.split(" | ")[1] if pair_norm else None
+                            if unresolved or missing_profiles:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "proof_closure_incomplete_candidates"
+                                msg = "[SYSTEM] finish blocked: this proof-closure task requires resolving the candidate set before answering."
+                                if unresolved:
+                                    msg += f" Still unresolved: {', '.join(unresolved[:3])}."
+                                elif missing_profiles:
+                                    msg += f" Missing OFFICIAL PROFILE evidence for: {', '.join(missing_profiles[:3])}."
+                                self.mem.record_msg(msg)
+                                continue
+                            if missing_support_types or missing_proof_docids:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "proof_closure_missing_support"
+                                msg = "[SYSTEM] finish blocked: you have not opened the full support chain needed for a proof-complete answer."
+                                if missing_support_types:
+                                    msg += f" Still missing support types for {selected_proj}: {', '.join(missing_support_types[:3])}."
+                                elif missing_proof_docids:
+                                    msg += f" Missing required evidence docids: {', '.join(missing_proof_docids[:3])}."
+                                self.mem.record_msg(msg)
+                                continue
+                            if selected_proj and pair_proj and pair_proj != selected_proj:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "proof_closure_wrong_project"
+                                self.mem.record_msg(
+                                    f"[SYSTEM] finish blocked: from the opened candidate profiles, the selected project should be {selected_proj}. Re-check the comparison before answering."
+                                )
+                                continue
+                            if selected_proj and selected_city and pair_city and pair_city != selected_city:
+                                self.counters["premature_finish_blocked"] += 1
+                                self._last_finish_block_reason = "proof_closure_wrong_city"
+                                self.mem.record_msg(
+                                    f"[SYSTEM] finish blocked: the current-support chain for {selected_proj} yields {selected_city}. Do not answer with a stale or unsupported city."
                                 )
                                 continue
 
@@ -6082,6 +6251,7 @@ class ToolLoopLLMAgent:
                         "answer": args.get("answer", ""),
                         "explanation": args.get("explanation", ""),
                         "confidence": args.get("confidence", ""),
+                        "evidence_docids": list(self.evidence_docids),
                         "active_context": self.mem.get_active_text(),
                         "usage": dict(self.usage_accum),
                         "prompt_est_accum": {
@@ -6201,6 +6371,7 @@ class ToolLoopLLMAgent:
                 "answer": "",
                 "explanation": "max_steps reached (no finish)",
                 "confidence": "0%",
+                "evidence_docids": list(self.evidence_docids),
                 "active_context": self.mem.get_active_text(),
                 "usage": dict(self.usage_accum),
                         "prompt_est_accum": {
@@ -6316,39 +6487,24 @@ class ToolLoopLLMAgent:
             ev = [d for d in ev if d][:5]
             return "Evidence docids: " + ", ".join(ev) if ev else "Evidence docids: (none)"
 
-        # Pattern 0: structured current-city chain tasks used in Phase 20 support-recovery.
-        current_city_task = False
-        if task_meta:
-            try:
-                current_city_task = bool(task_meta.get("supports_current_city_chain")) or str(task_meta.get("task_slice") or "") == "dependency_necessary"
-            except Exception:
-                current_city_task = False
-        if current_city_task:
-            dep_status = self._structured_dependency_status(task_meta or {})
-            unresolved = list(dep_status.get("unresolved_handles") or [])
-            missing_profiles = list(dep_status.get("missing_profiles") or [])
-            missing_support = list(dep_status.get("missing_support") or [])
-            selected_project = str(dep_status.get("selected_project") or "").strip()
-            selected_city = str(dep_status.get("selected_current_city") or "").strip()
-            if (not unresolved) and (not missing_profiles) and (not missing_support) and selected_project and selected_city:
-                suffix = selected_project.split("_")[-1]
-                preferred_docids: List[str] = []
-                for did in [
-                    f"D_TRUTH_{suffix}",
-                    f"D_APPROVAL_{suffix}",
-                    f"D_EXCEPTION_{suffix}",
-                    f"D_REVOCATION_{suffix}",
-                ]:
-                    if did in self.opened_cache or did in self.evidence_docids:
-                        preferred_docids.append(did)
-                primary = preferred_docids[0] if preferred_docids else (next(iter(self.opened_cache.keys()), ""))
-                ev = preferred_docids + [d for d in self.evidence_docids if d not in preferred_docids]
-                ev = [d for d in ev if d][:6]
-                expl = (
-                    f"Auto-finish from opened structured support: selected {selected_project} with current operating city {selected_city}. "
-                    f"Evidence docids: {', '.join(ev) if ev else '(none)'}"
-                )
-                return f"{selected_project} | {selected_city}", expl
+        if bool(getattr(self.cfg, "proof_closure_autofinish", True)) and isinstance(task_meta, dict) and self._is_support_closure_task(task_meta):
+            status = self._structured_support_closure_status(task_meta)
+            if not status.get("unresolved_handles") and not status.get("missing_profiles") and not status.get("missing_support_types") and not status.get("missing_proof_docids"):
+                selected = status.get("selected_project")
+                city = status.get("selected_city")
+                if selected and city:
+                    primary = None
+                    for key in (
+                        self._structured_project_revocation_docids.get(selected),
+                        self._structured_project_exception_docids.get(selected),
+                        self._structured_project_approval_docids.get(selected),
+                        self._structured_project_docids.get(selected),
+                    ):
+                        if key:
+                            primary = str(key)
+                            break
+                    primary = primary or next(iter(status.get("proof_docids") or []), None) or next(iter(self.evidence_docids or []), None) or ""
+                    return f"{selected} | {city}", build_expl(str(primary))
 
         # Pattern A: earliest start_year + headquarters
         if ("earliest" in ql) and ("start_year" in ql) and ("headquarters" in ql):

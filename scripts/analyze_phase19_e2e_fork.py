@@ -18,29 +18,6 @@ def _all_rows(bundle_root: Path) -> List[Dict]:
     return rows
 
 
-def _task_meta_by_id(bundle_root: Path) -> Dict[str, Dict]:
-    out: Dict[str, Dict] = {}
-    for p in bundle_root.rglob('tasks.json'):
-        try:
-            rows = json.loads(p.read_text(encoding='utf-8'))
-        except Exception:
-            continue
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            tid = str(row.get('id') or '')
-            if not tid:
-                continue
-            out[tid] = {
-                'task_slice': row.get('task_slice'),
-                'task_type': row.get('task_type'),
-                'benchmark_profile': row.get('benchmark_profile'),
-            }
-    return out
-
-
 def _group(rows: List[Dict], key: str) -> Dict[str, List[Dict]]:
     out: Dict[str, List[Dict]] = defaultdict(list)
     for r in rows:
@@ -74,6 +51,9 @@ def _method_summary(method: str, rs: List[Dict]) -> Dict:
         'p95_total_tokens': p95,
         'avg_steps': _avg([float(r.get('steps') or 0.0) for r in rs]),
         'avg_docid_cov': _avg([float(r.get('docid_cov') or 0.0) for r in rs]),
+        'avg_proof_docid_cov': _avg([float(r.get('proof_docid_cov') or 0.0) for r in rs]),
+        'proof_complete_rate': _avg([1.0 if bool(r.get('proof_complete')) else 0.0 for r in rs if 'proof_complete' in r]),
+        'proof_complete_correct_rate': _avg([1.0 if bool(r.get('proof_complete_correct')) else 0.0 for r in rs if 'proof_complete_correct' in r]),
         'avg_fork_calls': _avg([float((r.get('tool_stats', {}) or {}).get('fork_calls') or 0.0) for r in rs]),
         'avg_fork_tokens': _avg([float((r.get('tool_stats', {}) or {}).get('fork_tokens') or 0.0) for r in rs]),
     }
@@ -93,6 +73,10 @@ def _recommendation(summary_rows: List[Dict], slice_rows: List[Dict]) -> List[st
     if depish:
         best_dep = max(depish, key=lambda r: (float(r['accuracy']), -float(r['avg_total_tokens'])))
         lines.append(f"Best support-recovery-like slice result: {best_dep['task_slice']} / {best_dep['method']} (acc={best_dep['accuracy']:.3f}).")
+    proof_rows = [r for r in summary_rows if float(r.get('proof_complete_correct_rate') or 0.0) > 0.0]
+    if proof_rows:
+        best_proof = max(proof_rows, key=lambda r: (float(r['proof_complete_correct_rate']), float(r['accuracy']), -float(r['avg_total_tokens'])))
+        lines.append(f"Best proof-complete method: {best_proof['method']} (proof_complete_correct={best_proof['proof_complete_correct_rate']:.3f}, acc={best_proof['accuracy']:.3f}).")
     lines.append('Recommended paper framing: phase18 as the main evidence; phase19 as a low-claim pilot with SimilarityOnly retained as the strongest practical baseline.')
     return lines
 
@@ -105,15 +89,6 @@ def main() -> None:
     analysis = root / 'analysis'
     analysis.mkdir(parents=True, exist_ok=True)
     rows = _all_rows(root)
-    task_meta = _task_meta_by_id(root)
-    for row in rows:
-        meta = task_meta.get(str(row.get('task_id') or '')) or {}
-        if not row.get('task_slice') and meta.get('task_slice'):
-            row['task_slice'] = meta.get('task_slice')
-        if not row.get('task_type') and meta.get('task_type'):
-            row['task_type'] = meta.get('task_type')
-        if not row.get('benchmark_profile') and meta.get('benchmark_profile'):
-            row['benchmark_profile'] = meta.get('benchmark_profile')
     by_method = _group(rows, 'method')
     summary = [_method_summary(method, rs) for method, rs in sorted(by_method.items())]
 
@@ -125,10 +100,10 @@ def main() -> None:
             slice_summary.append(rec)
 
     with open(analysis / 'phase19_e2e_summary.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=['method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_fork_calls','avg_fork_tokens'])
+        w = csv.DictWriter(f, fieldnames=['method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_proof_docid_cov','proof_complete_rate','proof_complete_correct_rate','avg_fork_calls','avg_fork_tokens'])
         w.writeheader(); [w.writerow(r) for r in summary]
     with open(analysis / 'phase19_slice_summary.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=['task_slice','method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_fork_calls','avg_fork_tokens'])
+        w = csv.DictWriter(f, fieldnames=['task_slice','method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_proof_docid_cov','proof_complete_rate','proof_complete_correct_rate','avg_fork_calls','avg_fork_tokens'])
         w.writeheader(); [w.writerow(r) for r in slice_summary]
 
     plt.figure(figsize=(6.2, 4.3))
@@ -154,17 +129,17 @@ def main() -> None:
 
     with open(analysis / 'phase19_e2e_summary.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 End-to-End Fork Summary\n\n')
-        f.write('| method | n_seeds | acc | acc_strict | avg_tokens | p95_tokens | avg_steps | docid_cov | avg_fork_calls | avg_fork_tokens |\n')
-        f.write('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
+        f.write('| method | n_seeds | acc | acc_strict | avg_tokens | p95_tokens | avg_steps | docid_cov | proof_docid_cov | proof_complete | proof_complete_correct | avg_fork_calls | avg_fork_tokens |\n')
+        f.write('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
         for r in summary:
-            f.write(f"| {r['method']} | {r['n_seeds']} | {r['accuracy']:.3f} | {r['accuracy_strict']:.3f} | {r['avg_total_tokens']:.1f} | {r['p95_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_fork_calls']:.2f} | {r['avg_fork_tokens']:.1f} |\n")
+            f.write(f"| {r['method']} | {r['n_seeds']} | {r['accuracy']:.3f} | {r['accuracy_strict']:.3f} | {r['avg_total_tokens']:.1f} | {r['p95_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_proof_docid_cov']:.3f} | {r['proof_complete_rate']:.3f} | {r['proof_complete_correct_rate']:.3f} | {r['avg_fork_calls']:.2f} | {r['avg_fork_tokens']:.1f} |\n")
 
     with open(analysis / 'phase19_slice_summary.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 Slice Summary\n\n')
-        f.write('| task_slice | method | n | acc | avg_tokens | avg_steps | docid_cov | avg_fork_calls |\n')
-        f.write('|---|---|---:|---:|---:|---:|---:|---:|\n')
+        f.write('| task_slice | method | n | acc | avg_tokens | avg_steps | docid_cov | proof_docid_cov | proof_complete_correct | avg_fork_calls |\n')
+        f.write('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n')
         for r in slice_summary:
-            f.write(f"| {r['task_slice']} | {r['method']} | {r['n']} | {r['accuracy']:.3f} | {r['avg_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_fork_calls']:.2f} |\n")
+            f.write(f"| {r['task_slice']} | {r['method']} | {r['n']} | {r['accuracy']:.3f} | {r['avg_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_proof_docid_cov']:.3f} | {r['proof_complete_correct_rate']:.3f} | {r['avg_fork_calls']:.2f} |\n")
 
     with open(analysis / 'phase19_recommendation.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 Recommendation\n\n')
