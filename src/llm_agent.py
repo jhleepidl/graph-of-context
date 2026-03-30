@@ -1998,26 +1998,30 @@ class ToolLoopLLMAgent:
 
         status = ''
         conf = 0.0
+        min_conf = float(getattr(self.cfg, 'fork_merge_min_confidence', 0.67) or 0.67)
+        bypass_inner_gate = (
+            (
+                mode == 'gate_probe'
+                and bool(getattr(self.cfg, 'fork_gate_probe_run_on_ready', False))
+            )
+            or (
+                str(reason or '').startswith('context_controller:')
+                and str(getattr(self.cfg, 'context_controller_fork_gate_mode', 'integrated') or 'integrated').lower() == 'integrated'
+            )
+            or fork_reason == 'proof_closure_fork_verify'
+        )
         if isinstance(parsed, dict):
             status = str(parsed.get('status', '') or '').strip().lower()
             try:
                 conf = float(parsed.get('confidence', 0.0) or 0.0)
             except Exception:
                 conf = 0.0
-            min_conf = float(getattr(self.cfg, 'fork_merge_min_confidence', 0.67) or 0.67)
             # In gate_probe+run_on_ready, the outer evidence gate has already decided this step is ready.
             # Do not silently suppress the fork a second time on specialist status/confidence, or probe runs
             # will look like successful gates with zero actual fork calls.
-            bypass_inner_gate = (
-                (
-                    mode == 'gate_probe'
-                    and bool(getattr(self.cfg, 'fork_gate_probe_run_on_ready', False))
-                )
-                or (
-                    str(reason or '').startswith('context_controller:')
-                    and str(getattr(self.cfg, 'context_controller_fork_gate_mode', 'integrated') or 'integrated').lower() == 'integrated'
-                )
-            )
+            # Proof-closure fork-verify is different as well: its value is often precisely to say
+            # "need_more_evidence" and recommend the next pages to open. Treat that as a valid weak-merge
+            # verifier result instead of silently discarding it.
             if not bypass_inner_gate and mode not in {'debug_once', 'debug_once_no_merge'}:
                 if status and status != 'ready':
                     self.counters['fork_deferred'] += 1
@@ -2048,6 +2052,18 @@ class ToolLoopLLMAgent:
                         'fork_confidence_min': min_conf,
                     })
                     return None
+        elif not bypass_inner_gate and mode not in {'debug_once', 'debug_once_no_merge'}:
+            self.counters['fork_deferred'] += 1
+            self._trace({
+                'type': 'fork_deferred',
+                'task_id': task_id,
+                'method': method,
+                'run_tag': run_tag,
+                'step': step,
+                'reason': reason,
+                'defer_reason': 'unparsed_fork_output',
+            })
+            return None
 
         result_node: Optional[str] = None
         merge_payload = raw_text
@@ -3010,6 +3026,7 @@ class ToolLoopLLMAgent:
         )
         if not (late or blocked or planner_stall or proactive_hard_slice):
             return False
+        self.counters['proof_closure_fork_verify_attempts'] += 1
         query = self._build_support_closure_fork_query(task_meta, current_user_prompt)
         node = self._run_scoped_fork(
             query=query,
@@ -3035,6 +3052,19 @@ class ToolLoopLLMAgent:
                 'result_node': node,
             })
             return True
+        self.counters['proof_closure_fork_verify_no_result'] += 1
+        self._trace({
+            'type': 'proof_closure_fork_verify_no_result',
+            'task_id': task_id,
+            'method': method,
+            'run_tag': run_tag,
+            'step': int(step),
+            'selected_project': status.get('selected_project'),
+            'missing_support_types': list(status.get('missing_support_types') or []),
+            'missing_profiles': list(status.get('missing_profiles') or []),
+            'unresolved_handles': list(status.get('unresolved_handles') or []),
+            'query': query,
+        })
         return False
 
     def _maybe_override_support_closure_search(
@@ -6499,6 +6529,11 @@ class ToolLoopLLMAgent:
                                 for k, v in self.counters.items()
                                 if str(k).startswith("fork_gate_reason__")
                             },
+                            "fork_deferred": int(self.counters.get("fork_deferred", 0)),
+                            "proof_closure_fork_verify_attempts": int(self.counters.get("proof_closure_fork_verify_attempts", 0)),
+                            "proof_closure_fork_verify_calls": int(self.counters.get("proof_closure_fork_verify_calls", 0)),
+                            "proof_closure_fork_verify_no_result": int(self.counters.get("proof_closure_fork_verify_no_result", 0)),
+                            "proof_closure_fork_verify_errors": int(self.counters.get("proof_closure_fork_verify_errors", 0)),
 
                         }
                     }

@@ -3,8 +3,17 @@ from __future__ import annotations
 from src.llm_agent import ToolLoopConfig, ToolLoopLLMAgent
 
 
+class _DummyResp:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
 class _DummyLLM:
-    pass
+    def __init__(self, text: str = '{"status": "need_more_evidence", "support_summary": "Need approval", "recommended_queries": ["Operating City Approval - Project_0001"], "confidence": 0.31}') -> None:
+        self._text = text
+
+    def generate(self, messages, tools=None):
+        return _DummyResp(self._text)
 
 
 class _DummyTools:
@@ -47,7 +56,7 @@ class _DummyMem:
         return 'fork_node_1'
 
 
-def _make_agent(**cfg_overrides) -> ToolLoopLLMAgent:
+def _make_agent(llm=None, **cfg_overrides) -> ToolLoopLLMAgent:
     cfg = ToolLoopConfig(
         proof_closure_guard=True,
         proof_closure_search_planner=True,
@@ -60,7 +69,7 @@ def _make_agent(**cfg_overrides) -> ToolLoopLLMAgent:
         max_steps=40,
         **cfg_overrides,
     )
-    return ToolLoopLLMAgent(_DummyLLM(), _DummyTools(), _DummyMem(), cfg=cfg)
+    return ToolLoopLLMAgent(llm or _DummyLLM(), _DummyTools(), _DummyMem(), cfg=cfg)
 
 
 def test_support_closure_fork_verify_triggers_proactively_on_hard_slice(monkeypatch) -> None:
@@ -127,3 +136,60 @@ def test_support_closure_fork_verify_respects_max_calls(monkeypatch) -> None:
         run_tag='r1',
     )
     assert ok is False
+
+
+def test_run_scoped_fork_keeps_need_more_evidence_for_proof_verify() -> None:
+    agent = _make_agent()
+    class _Fork:
+        fork_id = 'FK1'
+        query = 'q'
+        seed_ids = []
+        node_ids = ['n1']
+        scoped_text = 'scoped support text'
+        token_count = 42
+
+    recorded = {}
+    agent.mem.build_fork_view = lambda **kwargs: _Fork()  # type: ignore[attr-defined]
+    def _record(fork, text, kind='summary'):
+        recorded['text'] = text
+        recorded['kind'] = kind
+        return 'fork_node_1'
+    agent.mem.record_fork_result = _record  # type: ignore[attr-defined]
+
+    node = agent._run_scoped_fork(
+        query='Need approval and exception chain.',
+        reason='proof_closure_fork_verify',
+        step=14,
+        task_id='t1',
+        method='SimilarityOnly-Prove-Fork-Verify',
+        run_tag='r1',
+    )
+    assert node == 'fork_node_1'
+    assert agent.counters['fork_calls'] == 1
+    assert 'recommended_queries' in recorded['text']
+
+
+def test_run_scoped_fork_non_proof_verify_still_defers_need_more_evidence() -> None:
+    agent = _make_agent()
+    class _Fork:
+        fork_id = 'FK1'
+        query = 'q'
+        seed_ids = []
+        node_ids = ['n1']
+        scoped_text = 'scoped support text'
+        token_count = 42
+
+    agent.mem.build_fork_view = lambda **kwargs: _Fork()  # type: ignore[attr-defined]
+    agent.mem.record_fork_result = lambda *args, **kwargs: 'fork_node_1'  # type: ignore[attr-defined]
+
+    node = agent._run_scoped_fork(
+        query='Need approval and exception chain.',
+        reason='always_step',
+        step=14,
+        task_id='t1',
+        method='GoC-SimSeed-Fork-Dep',
+        run_tag='r1',
+    )
+    assert node is None
+    assert agent.counters['fork_calls'] == 0
+    assert agent.counters['fork_deferred'] == 1
