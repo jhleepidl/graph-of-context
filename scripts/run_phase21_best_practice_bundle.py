@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_METHODS = 'SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Selective,GoC-SimSeed-Closure'
 
 
 def main() -> None:
@@ -17,6 +18,8 @@ def main() -> None:
     ap.add_argument('--parallel_tasks', type=int, default=12)
     ap.add_argument('--task_slices', type=str, default='', help='Optional hard-slice filter, e.g. support_closure,provenance_required')
     ap.add_argument('--max_steps', type=int, default=44)
+    ap.add_argument('--methods', type=str, default=DEFAULT_METHODS,
+                    help=f'Comma-separated method list. Default: {DEFAULT_METHODS}')
     args = ap.parse_args()
 
     cmd = [
@@ -28,7 +31,7 @@ def main() -> None:
         '--parallel_tasks', str(args.parallel_tasks),
         '--max_steps', str(args.max_steps),
         '--task_slices', args.task_slices,
-        '--methods', 'SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Selective,GoC-SimSeed-Closure',
+        '--methods', args.methods,
     ]
     raise SystemExit(subprocess.call(cmd))
 
