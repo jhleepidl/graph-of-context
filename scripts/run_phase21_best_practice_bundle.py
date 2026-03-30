@@ -28,7 +28,7 @@ def main() -> None:
         '--parallel_tasks', str(args.parallel_tasks),
         '--max_steps', str(args.max_steps),
         '--task_slices', args.task_slices,
-        '--methods', 'SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Verify,GoC-SimSeed-Closure',
+        '--methods', 'SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Selective,GoC-SimSeed-Closure',
     ]
     raise SystemExit(subprocess.call(cmd))
 

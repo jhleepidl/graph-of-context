@@ -134,6 +134,8 @@ class ToolLoopConfig:
     proof_closure_fork_min_step: int = 12
     proof_closure_fork_late_window: int = 8
     proof_closure_fork_max_calls: int = 1
+    proof_closure_fork_allowed_slices: Tuple[str, ...] = ("support_closure",)
+    proof_closure_fork_min_missing_docids: int = 2
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -2994,9 +2996,28 @@ class ToolLoopLLMAgent:
             return False
         if int(getattr(self, '_last_fork_step', -9999) or -9999) == int(step):
             return False
+        slice_name = str(task_meta.get('task_slice') or '').strip().lower()
+        allowed_slices = tuple(str(x).strip().lower() for x in (getattr(self.cfg, 'proof_closure_fork_allowed_slices', ('support_closure',)) or ()))
+        if allowed_slices and slice_name not in set(allowed_slices):
+            self.counters['proof_closure_fork_verify_skipped_slice'] += 1
+            return False
         status = self._structured_support_closure_status(task_meta)
-        gap_open = bool(status.get("unresolved_handles") or status.get("missing_profiles") or status.get("missing_support_types") or status.get("missing_proof_docids"))
+        unresolved_handles = list(status.get("unresolved_handles") or [])
+        missing_profiles = list(status.get("missing_profiles") or [])
+        missing_support_types = list(status.get("missing_support_types") or [])
+        missing_proof_docids = list(status.get("missing_proof_docids") or [])
+        gap_open = bool(unresolved_handles or missing_profiles or missing_support_types or missing_proof_docids)
         if not gap_open:
+            return False
+        min_missing_docids = int(getattr(self.cfg, 'proof_closure_fork_min_missing_docids', 2) or 0)
+        severe_gap = (
+            len(unresolved_handles) > 0
+            or len(missing_profiles) > 0
+            or len(missing_support_types) > 0
+            or len(missing_proof_docids) >= max(0, min_missing_docids)
+        )
+        if not severe_gap:
+            self.counters['proof_closure_fork_verify_skipped_low_severity'] += 1
             return False
         late_window = int(getattr(self.cfg, "proof_closure_fork_late_window", 8) or 8)
         max_steps = int(getattr(self.cfg, 'max_steps', 40) or 40)
@@ -3006,25 +3027,23 @@ class ToolLoopLLMAgent:
         open_page_calls = int(self.counters.get('open_page_calls', 0) or 0)
         rewrite_calls = int(self.counters.get('proof_closure_search_rewrites', 0) or 0)
         blocked_finishes = int(self.counters.get('premature_finish_blocked', 0) or 0)
+        repeated_searches = int(self.counters.get('repeated_search_count', 0) or 0)
         planner_stall = (
             rewrite_calls >= 2
             and search_calls >= 2
             and open_page_calls >= 2
         )
-        slice_name = str(task_meta.get('task_slice') or '').strip().lower()
-        hard_slice = slice_name in {'support_closure', 'provenance_required'}
-        # The hard proof slices are where the verifier is supposed to matter.  In practice,
-        # waiting until the very end proved too conservative: the gap often remained open, but
-        # the verifier never fired.  Escalate once after the agent has already gathered some
-        # evidence and either hit finish guards or simply spent several steps without closing
-        # the proof chain.
+        # Best-practice gating: use verifier only on the truly hard closure slice and only
+        # after the agent has shown signs of getting stuck. Provenance-required tasks were already
+        # strong with proof-first similarity; for those, verifier mostly added cost without gains.
         proactive_hard_slice = (
-            hard_slice
-            and int(step) >= max(min_step, 8)
-            and (search_calls >= 1 or open_page_calls >= 2 or rewrite_calls >= 1)
-            and (blocked_finishes >= 1 or int(step) >= max(min_step + 4, max_steps // 3))
+            slice_name == 'support_closure'
+            and int(step) >= max(min_step, max_steps - 12)
+            and (search_calls >= 2 or open_page_calls >= 6 or rewrite_calls >= 1)
+            and (blocked_finishes >= 1 or repeated_searches >= 2 or late or planner_stall)
         )
         if not (late or blocked or planner_stall or proactive_hard_slice):
+            self.counters['proof_closure_fork_verify_skipped_not_stuck'] += 1
             return False
         self.counters['proof_closure_fork_verify_attempts'] += 1
         query = self._build_support_closure_fork_query(task_meta, current_user_prompt)
@@ -6534,6 +6553,9 @@ class ToolLoopLLMAgent:
                             "proof_closure_fork_verify_calls": int(self.counters.get("proof_closure_fork_verify_calls", 0)),
                             "proof_closure_fork_verify_no_result": int(self.counters.get("proof_closure_fork_verify_no_result", 0)),
                             "proof_closure_fork_verify_errors": int(self.counters.get("proof_closure_fork_verify_errors", 0)),
+                            "proof_closure_fork_verify_skipped_slice": int(self.counters.get("proof_closure_fork_verify_skipped_slice", 0)),
+                            "proof_closure_fork_verify_skipped_low_severity": int(self.counters.get("proof_closure_fork_verify_skipped_low_severity", 0)),
+                            "proof_closure_fork_verify_skipped_not_stuck": int(self.counters.get("proof_closure_fork_verify_skipped_not_stuck", 0)),
 
                         }
                     }

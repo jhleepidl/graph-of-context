@@ -14,7 +14,7 @@ def main() -> None:
     ap.add_argument('--dotenv', type=str, default='.env')
     ap.add_argument('--task_limit', type=int, default=24)
     ap.add_argument('--seeds', type=str, default='7,13,23')
-    ap.add_argument('--methods', type=str, default='SimilarityOnly,SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Verify,GoC-SimSeed,GoC-SimSeed-Closure')
+    ap.add_argument('--methods', type=str, default='SimilarityOnly,SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Selective,GoC-SimSeed,GoC-SimSeed-Closure')
     ap.add_argument('--max_steps', type=int, default=44)
     ap.add_argument('--parallel_tasks', type=int, default=12)
     ap.add_argument('--task_slices', type=str, default='', help='Optional comma-separated task_slice filter, e.g. support_closure,provenance_required')
