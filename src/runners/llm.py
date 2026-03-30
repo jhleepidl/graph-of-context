@@ -394,6 +394,16 @@ def run_llm(
                 storage_faiss_dim=faiss_dim,
             ),
         ),
+        "SimilarityOnly-Prove-Fork-Selective": MethodSpec(
+            "SimilarityOnly-Prove-Fork-Selective",
+            lambda: SimilarityOnlyMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+            ),
+        ),
         "GoC-SimSeed-Closure": MethodSpec(
             "GoC-SimSeed-Closure",
             lambda: SimilaritySeedGoCMemory(
