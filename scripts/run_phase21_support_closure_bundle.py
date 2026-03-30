@@ -21,11 +21,14 @@ def main() -> None:
     ap.add_argument('--fork_trigger_mode', type=str, default='evidence_gated')
     ap.add_argument('--fork_merge_policy', type=str, default='weak')
     ap.add_argument('--run_fork_verify', action='store_true', default=False, help='Also include GoC-SimSeed-Fork-Verify.')
+    ap.add_argument('--context_controller_model_path', type=str, default=None, help='Optional learned controller model path for learned-controller methods.')
     args = ap.parse_args()
 
     methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
     if args.run_fork_verify and 'GoC-SimSeed-Fork-Verify' not in methods:
         methods.append('GoC-SimSeed-Fork-Verify')
+    if 'GoC-Mixed-Learned' in methods and not args.context_controller_model_path:
+        raise SystemExit('GoC-Mixed-Learned requires --context_controller_model_path')
 
     cmd = [
         sys.executable, str(ROOT / 'scripts' / 'run_phase19_e2e_fork_bundle.py'),
@@ -41,6 +44,8 @@ def main() -> None:
         '--fork_trigger_mode', args.fork_trigger_mode,
         '--fork_merge_policy', args.fork_merge_policy,
     ]
+    if args.context_controller_model_path:
+        cmd.extend(['--context_controller_model_path', args.context_controller_model_path])
     raise SystemExit(subprocess.call(cmd))
 
 

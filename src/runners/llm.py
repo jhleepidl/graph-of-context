@@ -239,6 +239,10 @@ def run_llm(
 
     all_method_specs: Dict[str, MethodSpec] = {
         "FullHistory": MethodSpec("FullHistory", lambda: FullHistoryMemory(budget_active=budget_active, budget_unfold=budget_unfold)),
+        "FullHistory-Prove": MethodSpec(
+            "FullHistory-Prove",
+            lambda: FullHistoryMemory(budget_active=budget_active, budget_unfold=budget_unfold),
+        ),
         "ContextFolding-Discard": MethodSpec("ContextFolding-Discard", lambda: ContextFoldingDiscardMemory(budget_active=budget_active, budget_unfold=budget_unfold)),
         "LinearSummary": MethodSpec("LinearSummary", lambda: LinearSummaryMemory(budget_active=budget_active, budget_unfold=budget_unfold, summary_every=linear_summary_every)),
         "SimpleRAG": MethodSpec(
@@ -253,6 +257,10 @@ def run_llm(
             ),
         ),
         "AgentFold-Range": MethodSpec("AgentFold-Range", lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk)),
+        "ProxySummary-Prove": MethodSpec(
+            "ProxySummary-Prove",
+            lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk),
+        ),
         "GoC": MethodSpec(
             "GoC",
             lambda: GoCMemory(
@@ -364,6 +372,54 @@ def run_llm(
         ),
         "GoC-SimSeed-Fork-Dep": MethodSpec(
             "GoC-SimSeed-Fork-Dep",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Closure-Only": MethodSpec(
+            "GoC-Closure-Only",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-ForkOnly": MethodSpec(
+            "GoC-ForkOnly",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Mixed-Heuristic": MethodSpec(
+            "GoC-Mixed-Heuristic",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Mixed-Learned": MethodSpec(
+            "GoC-Mixed-Learned",
             lambda: SimilaritySeedGoCMemory(
                 budget_active=budget_active,
                 budget_unfold=budget_unfold,
@@ -579,7 +635,7 @@ def run_llm(
             cfg = replace(cfg, goc_annotation_mode="hybrid_depends")
         elif str(ms_name) == "GoC-TraceFirst":
             cfg = replace(cfg, goc_annotation_mode="tracefirst")
-        if str(ms_name) in {"SimilarityOnly-Prove", "SimilarityOnly-Prove-Repair", "SimilarityOnly-Prove-Fork-Verify", "SimilarityOnly-Prove-Fork-Selective", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify"}:
+        if str(ms_name) in {"FullHistory-Prove", "ProxySummary-Prove", "SimilarityOnly-Prove", "SimilarityOnly-Prove-Repair", "SimilarityOnly-Prove-Fork-Verify", "SimilarityOnly-Prove-Fork-Selective", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify", "GoC-Closure-Only", "GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned"}:
             cfg = replace(
                 cfg,
                 proof_closure_guard=True,
@@ -591,6 +647,56 @@ def run_llm(
 
         fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
         fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
+        if str(ms_name) == "GoC-ForkOnly":
+            cfg = replace(cfg, adaptive_unfold=False)
+        if str(ms_name) in {"GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned"}:
+            cfg = replace(
+                cfg,
+                enable_scoped_fork=True,
+                fork_scope_mode="dep_scoped",
+                fork_trigger_mode=str(fork_trigger_mode),
+                fork_min_step=int(fork_min_step),
+                fork_every_k_steps=int(fork_every_k_steps),
+                fork_min_search_calls=int(eff_fork_min_search_calls),
+                fork_min_open_pages=int(eff_fork_min_open_pages),
+                fork_min_active_tokens=int(eff_fork_min_active_tokens),
+                fork_merge_min_confidence=float(eff_fork_merge_min_confidence),
+                fork_merge_policy=str(fork_merge_policy),
+                fork_weak_merge_max_chars=int(fork_weak_merge_max_chars),
+                fork_debug_force_step=int(fork_debug_force_step),
+                fork_debug_force_max_calls=int(fork_debug_force_max_calls),
+                fork_gate_trace=bool(fork_gate_trace),
+                fork_gate_probe_run_on_ready=bool(fork_gate_probe_run_on_ready),
+                fork_max_tokens=int(fork_max_tokens),
+                fork_k=int(fork_k),
+                fork_include_recent_active=bool(fork_include_recent_active),
+                fork_recent_active_n=int(fork_recent_active_n),
+                fork_allow_kinds=fork_allow_tuple,
+                fork_deny_kinds=fork_deny_tuple,
+            )
+        if str(ms_name) == "GoC-Mixed-Heuristic":
+            cfg = replace(
+                cfg,
+                enable_context_controller=True,
+                context_controller_policy="uncertainty_aware",
+                context_controller_trace=bool(context_controller_trace),
+                context_controller_fork_gate_mode="integrated",
+                context_controller_disable_none_action=True,
+                context_controller_fallback_action="unfold",
+            )
+        if str(ms_name) == "GoC-Mixed-Learned":
+            cfg = replace(
+                cfg,
+                enable_context_controller=True,
+                context_controller_policy="phase18_tree",
+                context_controller_trace=bool(context_controller_trace),
+                context_controller_fork_gate_mode="integrated",
+                context_controller_disable_none_action=True,
+                context_controller_fallback_action="unfold",
+                context_controller_model_path=str(context_controller_model_path) if context_controller_model_path else None,
+            )
+            if not context_controller_model_path:
+                raise ValueError("GoC-Mixed-Learned requires --context_controller_model_path")
         if str(ms_name) == "SimilarityOnly-Prove-Repair":
             cfg = replace(
                 cfg,
