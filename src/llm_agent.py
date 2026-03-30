@@ -136,6 +136,10 @@ class ToolLoopConfig:
     proof_closure_fork_max_calls: int = 1
     proof_closure_fork_allowed_slices: Tuple[str, ...] = ("support_closure",)
     proof_closure_fork_min_missing_docids: int = 2
+    proof_closure_repair: bool = False
+    proof_closure_repair_min_step: int = 12
+    proof_closure_repair_max_calls: int = 2
+    proof_closure_repair_allowed_slices: Tuple[str, ...] = ("support_closure", "provenance_required")
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -2940,6 +2944,153 @@ class ToolLoopLLMAgent:
                 return f"{selected} exception revocation", "support_closure_missing_revocation"
         return None, None
 
+    def _maybe_run_support_closure_repair(
+        self,
+        *,
+        step: int,
+        current_user_prompt: str,
+        task_meta: Dict[str, Any],
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> bool:
+        if not bool(getattr(self.cfg, "proof_closure_repair", False)):
+            return False
+        if not self._is_support_closure_task(task_meta):
+            return False
+        max_calls = int(getattr(self.cfg, "proof_closure_repair_max_calls", 2) or 2)
+        if int(self.counters.get("proof_closure_repair_calls", 0) or 0) >= max_calls:
+            return False
+        min_step = int(getattr(self.cfg, "proof_closure_repair_min_step", 12) or 12)
+        if int(step) < min_step:
+            return False
+        allowed_slices = tuple(str(x).strip().lower() for x in (getattr(self.cfg, 'proof_closure_repair_allowed_slices', ('support_closure', 'provenance_required')) or ()))
+        slice_name = str(task_meta.get('task_slice') or '').strip().lower()
+        if allowed_slices and slice_name not in set(allowed_slices):
+            self.counters['proof_closure_repair_skipped_slice'] += 1
+            return False
+        status = self._structured_support_closure_status(task_meta)
+        gap_open = bool(status.get('unresolved_handles') or status.get('missing_profiles') or status.get('missing_support_types') or status.get('missing_proof_docids'))
+        if not gap_open:
+            return False
+        blocked = str(getattr(self, '_last_finish_block_reason', '') or '').startswith('proof_closure_')
+        late = int(step) >= max(1, int(getattr(self.cfg, 'max_steps', 40) or 40) - 8)
+        search_calls = int(self.counters.get('search_calls', 0) or 0)
+        open_page_calls = int(self.counters.get('open_page_calls', 0) or 0)
+        repeated_searches = int(self.counters.get('repeated_search_count', 0) or 0)
+        if not (blocked or late or repeated_searches >= 1 or search_calls >= 2 or open_page_calls >= 8):
+            self.counters['proof_closure_repair_skipped_not_ready'] += 1
+            return False
+        desired_q, reason = self._next_support_closure_query(task_meta)
+        if not desired_q:
+            self.counters['proof_closure_repair_no_query'] += 1
+            return False
+        topk = 10
+        try:
+            out = self.tools.search(query=desired_q, topk=topk)
+        except Exception:
+            self.counters['proof_closure_repair_errors'] += 1
+            return False
+        try:
+            docids = [x.get("docid") for x in out if isinstance(x, dict) and x.get("docid")]
+        except Exception:
+            docids = []
+        self._record_search_query(desired_q)
+        self._policy_post_search(desired_q, docids, step=step)
+        self.counters['search_calls'] += 1
+        self.counters['policy_overrides'] += 1
+        self.counters['proof_closure_repair_calls'] += 1
+        self.counters['proof_closure_repair_searches'] += 1
+        try:
+            lines: List[str] = []
+            for r in out[: min(20, len(out))]:
+                did = r.get('docid')
+                title = (r.get('title') or '').strip()
+                score = r.get('score')
+                snippet = (r.get('snippet') or '').strip().replace('\n', ' ')
+                if len(snippet) > 220:
+                    snippet = snippet[:220] + '…'
+                score_s = f"{float(score):.3f}" if isinstance(score, (int, float)) else ""
+                lines.append(f"docid={did} | title={title} | score={score_s} | {snippet}".rstrip())
+            observation = "\n".join(lines) if lines else "[]"
+
+        except Exception:
+            observation = str(docids)
+        self._record_tool_step(
+            step0=step,
+            call={'tool': 'search', 'args': {'query': desired_q, 'topk': topk}},
+            tool_name='search',
+            args={'query': desired_q, 'topk': topk},
+            observation=observation,
+            docids=[self._sig_search_docid(desired_q)] + [d for d in docids if isinstance(d, str)],
+            task_id=task_id,
+            method=method,
+            run_tag=run_tag,
+        )
+        self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
+        auto_open_docid = self._find_needed_structured_result_docid(query=desired_q, results=out, task_meta=task_meta)
+        if auto_open_docid is None:
+            auto_open_docid = self._find_exact_structured_result_docid(desired_q, out)
+        if auto_open_docid and auto_open_docid not in self.opened_cache:
+            try:
+                outp = self.tools.open_page(docid=auto_open_docid)
+                self.counters['open_page_calls'] += 1
+                self.counters['proof_closure_repair_opens'] += 1
+                content = (outp.get('content') or '')
+                self.opened_cache[outp['docid']] = content
+                if outp['docid'] not in self.evidence_docids:
+                    self.evidence_docids.append(outp['docid'])
+                prefix = self._authority_prefix(content) if content else ''
+                view = self._select_open_page_view(content, {'section': 'head'})
+                view_content = view.get('view') or ''
+                tag = '[POLICY OVERRIDE] ' + (view.get('tag') or '')
+                obs = self._compose_open_page_observation_view(content, view_content, prefix, tag)
+                view_key = self._open_view_key(outp['docid'], None, {'section': 'head'})
+                self.opened_view_cache[view_key] = view_content
+                self._record_structured_page_signals(docid=outp.get('docid'), title=str(outp.get('title') or ''), content=content)
+                self._record_tool_step(
+                    step0=step,
+                    call={'tool': 'open_page', 'args': {'docid': auto_open_docid, 'section': 'head'}},
+                    tool_name='open_page',
+                    args={'docid': auto_open_docid, 'section': 'head'},
+                    observation=obs,
+                    docids=[outp['docid'], self._sig_open_docid(outp['docid'])],
+                    storage_text=content,
+                    task_id=task_id,
+                    method=method,
+                    run_tag=run_tag,
+                )
+                self._drain_mem_events(task_id=task_id, method=method, run_tag=run_tag, step=step)
+                self._last_progress_step = step
+                self._trace({
+                    'type': 'proof_closure_repair',
+                    'task_id': task_id,
+                    'method': method,
+                    'run_tag': run_tag,
+                    'step': int(step),
+                    'reason': reason,
+                    'query': desired_q,
+                    'opened_docid': auto_open_docid,
+                })
+                return True
+            except Exception:
+                self.counters['proof_closure_repair_errors'] += 1
+                return False
+        self.counters['proof_closure_repair_no_progress'] += 1
+        self._trace({
+            'type': 'proof_closure_repair_no_progress',
+            'task_id': task_id,
+            'method': method,
+            'run_tag': run_tag,
+            'step': int(step),
+            'reason': reason,
+            'query': desired_q,
+            'missing_support_types': list(status.get('missing_support_types') or []),
+            'missing_profiles': list(status.get('missing_profiles') or []),
+            'unresolved_handles': list(status.get('unresolved_handles') or []),
+        })
+        return False
+
     def _build_support_closure_fork_query(self, task_meta: Dict[str, Any], current_user_prompt: str) -> str:
         status = self._structured_support_closure_status(task_meta)
         parts: List[str] = []
@@ -4366,6 +4517,26 @@ class ToolLoopLLMAgent:
                             ctx = self.mem.get_active_text()
                 except Exception:
                     self.counters['context_controller_errors'] += 1
+
+                # Deterministic proof-repair pass: cheaper than a verifier fork and tailored to the
+                # structured support-closure benchmark. When the trajectory is late or repeatedly blocked,
+                # issue the exact next support query and auto-open the matching page.
+                try:
+                    if (
+                        (not fork_ran_this_step)
+                        and isinstance(task_meta, dict)
+                        and self._maybe_run_support_closure_repair(
+                            step=step,
+                            current_user_prompt=current_user_prompt,
+                            task_meta=task_meta,
+                            task_id=task_id,
+                            method=method,
+                            run_tag=run_tag,
+                        )
+                    ):
+                        ctx = self.mem.get_active_text()
+                except Exception:
+                    self.counters['proof_closure_repair_errors'] += 1
 
                 # Adaptive best-practice fork verifier: start from the proof-aware baseline,
                 # and only escalate to a scoped fork when a support-closure task is still missing
@@ -6556,6 +6727,13 @@ class ToolLoopLLMAgent:
                             "proof_closure_fork_verify_skipped_slice": int(self.counters.get("proof_closure_fork_verify_skipped_slice", 0)),
                             "proof_closure_fork_verify_skipped_low_severity": int(self.counters.get("proof_closure_fork_verify_skipped_low_severity", 0)),
                             "proof_closure_fork_verify_skipped_not_stuck": int(self.counters.get("proof_closure_fork_verify_skipped_not_stuck", 0)),
+                            "proof_closure_repair_calls": int(self.counters.get("proof_closure_repair_calls", 0)),
+                            "proof_closure_repair_searches": int(self.counters.get("proof_closure_repair_searches", 0)),
+                            "proof_closure_repair_opens": int(self.counters.get("proof_closure_repair_opens", 0)),
+                            "proof_closure_repair_no_progress": int(self.counters.get("proof_closure_repair_no_progress", 0)),
+                            "proof_closure_repair_skipped_slice": int(self.counters.get("proof_closure_repair_skipped_slice", 0)),
+                            "proof_closure_repair_skipped_not_ready": int(self.counters.get("proof_closure_repair_skipped_not_ready", 0)),
+                            "proof_closure_repair_no_query": int(self.counters.get("proof_closure_repair_no_query", 0)),
 
                         }
                     }
