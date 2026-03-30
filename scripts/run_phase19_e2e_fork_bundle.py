@@ -306,6 +306,9 @@ def main() -> None:
             methods=methods,
             out_results_path=str(out_jsonl),
             out_report_path=str(out_report),
+            bench_kwargs={
+                'task_slices': task_slices,
+            },
             model=str(args.model),
             dotenv_path=str(args.dotenv),
             max_steps=max_steps,
@@ -315,7 +318,6 @@ def main() -> None:
             unfold_k=int(args.unfold_k),
             task_limit=task_limit,
             retriever_kind='bm25',
-            task_slices=task_slices,
             parallel_tasks=int(args.parallel_tasks),
             prompt_context_chars=0,
             log_context_chars=2500,
