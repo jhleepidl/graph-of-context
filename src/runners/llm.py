@@ -384,6 +384,16 @@ def run_llm(
                 storage_faiss_dim=faiss_dim,
             ),
         ),
+        "SimilarityOnly-Prove-Fork-Verify": MethodSpec(
+            "SimilarityOnly-Prove-Fork-Verify",
+            lambda: SimilarityOnlyMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+            ),
+        ),
         "GoC-SimSeed-Closure": MethodSpec(
             "GoC-SimSeed-Closure",
             lambda: SimilaritySeedGoCMemory(
@@ -549,7 +559,7 @@ def run_llm(
             cfg = replace(cfg, goc_annotation_mode="hybrid_depends")
         elif str(ms_name) == "GoC-TraceFirst":
             cfg = replace(cfg, goc_annotation_mode="tracefirst")
-        if str(ms_name) in {"SimilarityOnly-Prove", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify"}:
+        if str(ms_name) in {"SimilarityOnly-Prove", "SimilarityOnly-Prove-Fork-Verify", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify"}:
             cfg = replace(
                 cfg,
                 proof_closure_guard=True,
@@ -561,7 +571,7 @@ def run_llm(
 
         fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
         fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
-        if str(ms_name) in {"GoC-Fork-Dep", "GoC-SimSeed-Fork-Dep", "GoC-SimSeed-Fork-Verify"}:
+        if str(ms_name) in {"GoC-Fork-Dep", "GoC-SimSeed-Fork-Dep", "GoC-SimSeed-Fork-Verify", "SimilarityOnly-Prove-Fork-Verify"}:
             cfg = replace(
                 cfg,
                 enable_scoped_fork=True,
@@ -586,6 +596,14 @@ def run_llm(
                 fork_allow_kinds=fork_allow_tuple,
                 fork_deny_kinds=fork_deny_tuple,
             )
+            if str(ms_name) == "SimilarityOnly-Prove-Fork-Verify":
+                cfg = replace(
+                    cfg,
+                    proof_closure_fork_verify=True,
+                    proof_closure_fork_min_step=max(10, int(fork_min_step)),
+                    proof_closure_fork_late_window=8,
+                    proof_closure_fork_max_calls=1,
+                )
         elif str(ms_name) == "GoC-Fork-Sim":
             cfg = replace(
                 cfg,

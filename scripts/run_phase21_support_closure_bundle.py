@@ -14,9 +14,10 @@ def main() -> None:
     ap.add_argument('--dotenv', type=str, default='.env')
     ap.add_argument('--task_limit', type=int, default=24)
     ap.add_argument('--seeds', type=str, default='7,13,23')
-    ap.add_argument('--methods', type=str, default='SimilarityOnly,SimilarityOnly-Prove,GoC-SimSeed,GoC-SimSeed-Closure')
+    ap.add_argument('--methods', type=str, default='SimilarityOnly,SimilarityOnly-Prove,SimilarityOnly-Prove-Fork-Verify,GoC-SimSeed,GoC-SimSeed-Closure')
     ap.add_argument('--max_steps', type=int, default=44)
     ap.add_argument('--parallel_tasks', type=int, default=12)
+    ap.add_argument('--task_slices', type=str, default='', help='Optional comma-separated task_slice filter, e.g. support_closure,provenance_required')
     ap.add_argument('--fork_trigger_mode', type=str, default='evidence_gated')
     ap.add_argument('--fork_merge_policy', type=str, default='weak')
     ap.add_argument('--run_fork_verify', action='store_true', default=False, help='Also include GoC-SimSeed-Fork-Verify.')
@@ -36,6 +37,7 @@ def main() -> None:
         '--methods', ','.join(methods),
         '--max_steps', str(args.max_steps),
         '--parallel_tasks', str(args.parallel_tasks),
+        '--task_slices', args.task_slices,
         '--fork_trigger_mode', args.fork_trigger_mode,
         '--fork_merge_policy', args.fork_merge_policy,
     ]

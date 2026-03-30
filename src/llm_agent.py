@@ -130,6 +130,10 @@ class ToolLoopConfig:
     proof_closure_auto_open: bool = False
     proof_closure_autofinish: bool = True
     proof_closure_system_hint: bool = True
+    proof_closure_fork_verify: bool = False
+    proof_closure_fork_min_step: int = 12
+    proof_closure_fork_late_window: int = 8
+    proof_closure_fork_max_calls: int = 1
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -1880,8 +1884,6 @@ class ToolLoopLLMAgent:
         method: str,
         run_tag: str,
     ) -> Optional[str]:
-        if not str(method or '').lower().startswith('goc'):
-            return None
         if not hasattr(self.mem, 'build_fork_view') or not hasattr(self.mem, 'record_fork_result'):
             return None
 
@@ -1927,26 +1929,47 @@ class ToolLoopLLMAgent:
         if not str(getattr(fork, 'scoped_text', '') or '').strip():
             self.counters['fork_empty_view'] += 1
             return None
-
-        specialist_messages = [
-            {
-                'role': 'system',
-                'content': (
-                    'You are a specialist reviewer. Use only the provided scoped context. '
-                    'Do not assume access to hidden context. Return a concise support-focused note '
-                    'for the current pivot decision as JSON.'
-                ),
-            },
-            {
-                'role': 'user',
-                'content': (
-                    f'[Scoped Fork Context]\n{fork.scoped_text}\n\n'
-                    f'[Current Objective]\n{query}\n\n'
-                    'Return JSON with keys: status, support_summary, decision_hint, critical_items, confidence. Use status=ready only when the available scoped context is sufficient; otherwise use status=need_more_evidence. Keep support_summary concise and evidence-grounded.'
-                ),
-            },
-        ]
-
+        fork_reason = str(reason or '').strip().lower()
+        if fork_reason == 'proof_closure_fork_verify':
+            specialist_messages = [
+                {
+                    'role': 'system',
+                    'content': (
+                        'You are a proof-closure verifier. Use only the provided scoped context. '
+                        'Identify the exact missing support chain for the current decision and suggest the next evidence pages to open. '
+                        'Do not assume access to hidden context. Return JSON only.'
+                    ),
+                },
+                {
+                    'role': 'user',
+                    'content': (
+                        f'[Scoped Fork Context]\n{fork.scoped_text}\n\n'
+                        f'[Current Objective]\n{query}\n\n'
+                        'Return JSON with keys: status, support_summary, decision_hint, critical_items, recommended_queries, confidence. '
+                        'Use status=ready only when the scoped context closes the proof gap; otherwise use status=need_more_evidence. '
+                        'recommended_queries should be a short list of exact next pages or search strings.'
+                    ),
+                },
+            ]
+        else:
+            specialist_messages = [
+                {
+                    'role': 'system',
+                    'content': (
+                        'You are a specialist reviewer. Use only the provided scoped context. '
+                        'Do not assume access to hidden context. Return a concise support-focused note '
+                        'for the current pivot decision as JSON.'
+                    ),
+                },
+                {
+                    'role': 'user',
+                    'content': (
+                        f'[Scoped Fork Context]\n{fork.scoped_text}\n\n'
+                        f'[Current Objective]\n{query}\n\n'
+                        'Return JSON with keys: status, support_summary, decision_hint, critical_items, confidence. Use status=ready only when the available scoped context is sufficient; otherwise use status=need_more_evidence. Keep support_summary concise and evidence-grounded.'
+                    ),
+                },
+            ]
         try:
             resp = self.llm.generate(messages=specialist_messages, tools=None)
             raw_text = str(getattr(resp, 'text', '') or '').strip()
@@ -2034,10 +2057,14 @@ class ToolLoopLLMAgent:
             critical_items = parsed.get('critical_items', [])
             if not isinstance(critical_items, list):
                 critical_items = []
+            recommended_queries = parsed.get('recommended_queries', [])
+            if not isinstance(recommended_queries, list):
+                recommended_queries = []
             merge_obj = {
                 'status': status or 'ready',
                 'support_summary': support_summary,
                 'critical_items': [str(x)[:80] for x in critical_items[:3]],
+                'recommended_queries': [str(x)[:120] for x in recommended_queries[:3]],
                 'confidence': conf,
                 'merge_policy': 'weak',
             }
@@ -2894,6 +2921,104 @@ class ToolLoopLLMAgent:
             if "revocation" in missing_types:
                 return f"{selected} exception revocation", "support_closure_missing_revocation"
         return None, None
+
+    def _build_support_closure_fork_query(self, task_meta: Dict[str, Any], current_user_prompt: str) -> str:
+        status = self._structured_support_closure_status(task_meta)
+        parts: List[str] = []
+        slice_name = str(task_meta.get("task_slice") or "").strip()
+        unresolved = [str(x) for x in (status.get("unresolved_handles") or []) if str(x)]
+        if unresolved:
+            parts.append(f"Resolve remaining handles via field notes: {', '.join(unresolved[:3])}.")
+        missing_profiles = [str(x) for x in (status.get("missing_profiles") or []) if str(x)]
+        if missing_profiles:
+            parts.append(f"Open the OFFICIAL PROFILE pages needed for candidate comparison: {', '.join(missing_profiles[:3])}.")
+        selected = str(status.get("selected_project") or "").strip()
+        if selected:
+            parts.append(f"Working selected project: {selected}.")
+            missing_types = [str(x) for x in (status.get("missing_support_types") or []) if str(x)]
+            if missing_types:
+                pretty = {"approval": "Operating City Approval", "exception": "Legacy Operating Exception", "revocation": "Exception Revocation"}
+                labels = [pretty.get(x, x) for x in missing_types]
+                parts.append(f"Still missing support pages for {selected}: {', '.join(labels[:3])}.")
+        if slice_name == "provenance_required":
+            parts.append("Ignore archived or stale policy/status pages and prefer the current/active approval-exception-revocation chain.")
+        elif slice_name == "support_closure":
+            parts.append("Return only the support-complete evidence chain needed to justify BOTH the selected project and its current operating city.")
+        else:
+            parts.append("Return only the support-complete evidence needed for the current proof task.")
+        cur = str(current_user_prompt or "").strip()
+        if cur:
+            parts.append(cur)
+        parts.append("List the exact next pages or support items that should be opened before answering.")
+        return " | ".join([p for p in parts if p])
+
+    def _maybe_run_support_closure_fork_verify(
+        self,
+        *,
+        step: int,
+        current_user_prompt: str,
+        task_meta: Dict[str, Any],
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> bool:
+        if not bool(getattr(self.cfg, "proof_closure_fork_verify", False)):
+            return False
+        if not bool(getattr(self.cfg, "enable_scoped_fork", False)):
+            return False
+        if not self._is_support_closure_task(task_meta):
+            return False
+        if not hasattr(self.mem, 'build_fork_view') or not hasattr(self.mem, 'record_fork_result'):
+            return False
+        max_calls = int(getattr(self.cfg, "proof_closure_fork_max_calls", 1) or 1)
+        if int(self.counters.get("fork_calls", 0) or 0) >= max_calls:
+            return False
+        min_step = int(getattr(self.cfg, "proof_closure_fork_min_step", 12) or 12)
+        if int(step) < min_step:
+            return False
+        if int(getattr(self, '_last_fork_step', -9999) or -9999) == int(step):
+            return False
+        status = self._structured_support_closure_status(task_meta)
+        gap_open = bool(status.get("unresolved_handles") or status.get("missing_profiles") or status.get("missing_support_types") or status.get("missing_proof_docids"))
+        if not gap_open:
+            return False
+        late_window = int(getattr(self.cfg, "proof_closure_fork_late_window", 8) or 8)
+        max_steps = int(getattr(self.cfg, 'max_steps', 40) or 40)
+        late = int(step) >= max(1, max_steps - late_window)
+        blocked = str(getattr(self, '_last_finish_block_reason', '') or '').startswith('proof_closure_')
+        planner_stall = (
+            int(self.counters.get('proof_closure_search_rewrites', 0) or 0) >= 2
+            and int(self.counters.get('search_calls', 0) or 0) >= 2
+            and int(self.counters.get('open_page_calls', 0) or 0) >= 2
+        )
+        if not (late or blocked or planner_stall):
+            return False
+        query = self._build_support_closure_fork_query(task_meta, current_user_prompt)
+        node = self._run_scoped_fork(
+            query=query,
+            reason='proof_closure_fork_verify',
+            step=step,
+            task_id=task_id,
+            method=method,
+            run_tag=run_tag,
+        )
+        if node is not None:
+            self.counters['proof_closure_fork_verify_calls'] += 1
+            self._trace({
+                'type': 'proof_closure_fork_verify',
+                'task_id': task_id,
+                'method': method,
+                'run_tag': run_tag,
+                'step': int(step),
+                'selected_project': status.get('selected_project'),
+                'missing_support_types': list(status.get('missing_support_types') or []),
+                'missing_profiles': list(status.get('missing_profiles') or []),
+                'unresolved_handles': list(status.get('unresolved_handles') or []),
+                'query': query,
+                'result_node': node,
+            })
+            return True
+        return False
 
     def _maybe_override_support_closure_search(
         self,
@@ -4175,6 +4300,27 @@ class ToolLoopLLMAgent:
                             ctx = self.mem.get_active_text()
                 except Exception:
                     self.counters['context_controller_errors'] += 1
+
+                # Adaptive best-practice fork verifier: start from the proof-aware baseline,
+                # and only escalate to a scoped fork when a support-closure task is still missing
+                # critical evidence late in the trajectory.
+                try:
+                    if (
+                        (not fork_ran_this_step)
+                        and isinstance(task_meta, dict)
+                        and self._maybe_run_support_closure_fork_verify(
+                            step=step,
+                            current_user_prompt=current_user_prompt,
+                            task_meta=task_meta,
+                            task_id=task_id,
+                            method=method,
+                            run_tag=run_tag,
+                        )
+                    ):
+                        fork_ran_this_step = True
+                        ctx = self.mem.get_active_text()
+                except Exception:
+                    self.counters['proof_closure_fork_verify_errors'] += 1
 
                 # Generic scoped-fork trigger for single-stage benchmarks (e.g., BrowseComp-like tasks)
                 # that do not expose explicit /COMMIT or /FINAL prompts. When fork_trigger_mode is "always",

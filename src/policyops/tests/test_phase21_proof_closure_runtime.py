@@ -43,12 +43,13 @@ class _DummyMem:
         return [], [], 0
 
 
-def _make_agent() -> ToolLoopLLMAgent:
+def _make_agent(**cfg_overrides) -> ToolLoopLLMAgent:
     cfg = ToolLoopConfig(
         proof_closure_guard=True,
         proof_closure_search_planner=True,
         proof_closure_auto_open=True,
         proof_closure_autofinish=True,
+        **cfg_overrides,
     )
     agent = ToolLoopLLMAgent(_DummyLLM(), _DummyTools(), _DummyMem(), cfg=cfg)
     return agent
@@ -106,3 +107,59 @@ def test_needed_structured_result_docid_prefers_missing_support_page() -> None:
     ]
     chosen = agent._find_needed_structured_result_docid(query='broad search', results=results, task_meta=task_meta)
     assert chosen == 'D_EXCEPTION_0001'
+
+
+def test_support_closure_fork_query_mentions_missing_support() -> None:
+    agent = _make_agent()
+    agent._structured_handle_to_project = {'alpha-001-01': 'Project_0001'}
+    agent._structured_project_years = {'Project_0001': 2011}
+    task_meta = {
+        'task_slice': 'provenance_required',
+        'decision_requires_support_closure': True,
+        'target_project': 'Project_0001',
+        'proof_expected_types': ['field_note', 'official_profile', 'approval', 'exception', 'revocation'],
+    }
+    q = agent._build_support_closure_fork_query(task_meta, 'Find the current operating city.')
+    assert 'Project_0001' in q
+    assert 'Exception Revocation' in q
+    assert 'archived or stale' in q
+
+
+def test_support_closure_fork_verify_triggers_on_late_gap(monkeypatch) -> None:
+    agent = _make_agent(
+        enable_scoped_fork=True,
+        proof_closure_fork_verify=True,
+        proof_closure_fork_min_step=10,
+        proof_closure_fork_late_window=8,
+        max_steps=20,
+    )
+    agent._structured_handle_to_project = {'alpha-001-01': 'Project_0001'}
+    agent._structured_project_years = {'Project_0001': 2011}
+    agent._structured_project_docids = {'Project_0001': 'D_TRUTH_0001'}
+    task_meta = {
+        'task_slice': 'support_closure',
+        'decision_requires_support_closure': True,
+        'target_project': 'Project_0001',
+        'proof_expected_types': ['field_note', 'official_profile', 'approval'],
+        'proof_required_docids': ['D_ALIAS_0001', 'D_TRUTH_0001', 'D_APPROVAL_0001'],
+    }
+    called = {}
+    def _fake_run_scoped_fork(**kwargs):
+        called.update(kwargs)
+        return 'fork_node_1'
+    monkeypatch.setattr(agent, '_run_scoped_fork', _fake_run_scoped_fork)
+    agent.mem.build_fork_view = lambda **kwargs: None  # type: ignore[attr-defined]
+    agent.mem.record_fork_result = lambda *args, **kwargs: 'fork_node_1'  # type: ignore[attr-defined]
+    agent.counters['search_calls'] = 3
+    agent.counters['open_page_calls'] = 3
+    ok = agent._maybe_run_support_closure_fork_verify(
+        step=15,
+        current_user_prompt='Determine the current operating city.',
+        task_meta=task_meta,
+        task_id='t1',
+        method='SimilarityOnly-Prove-Fork-Verify',
+        run_tag='r1',
+    )
+    assert ok is True
+    assert called['reason'] == 'proof_closure_fork_verify'
+    assert 'Operating City Approval' in called['query']

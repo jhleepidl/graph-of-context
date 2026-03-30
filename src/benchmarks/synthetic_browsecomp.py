@@ -79,6 +79,10 @@ class SyntheticBrowseComp(Benchmark):
     def load_tasks(self, data_dir: str, limit: Optional[int] = None, **kwargs) -> List[Task]:
         tasks_path = Path(data_dir) / "tasks.json"
         raw = json.load(open(tasks_path, "r", encoding="utf-8"))
+        task_slices = kwargs.get('task_slices')
+        if task_slices:
+            allowed = {str(x).strip() for x in task_slices if str(x).strip()}
+            raw = [r for r in raw if str(r.get('task_slice') or '').strip() in allowed]
         if limit is not None:
             raw = raw[:limit]
         out: List[Task] = []

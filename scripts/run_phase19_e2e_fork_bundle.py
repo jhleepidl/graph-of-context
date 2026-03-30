@@ -150,6 +150,7 @@ def main() -> None:
     ap.add_argument('--structured_support_recovery_ratio', type=float, default=0.20)
     ap.add_argument('--structured_compare_candidates', type=int, default=None)
     ap.add_argument('--structured_dependency_candidates', type=int, default=None)
+    ap.add_argument('--task_slices', type=str, default='', help='Optional comma-separated task_slice filter applied after task generation/load.')
     ap.add_argument('--smoke', action='store_true')
     args = ap.parse_args()
 
@@ -177,6 +178,7 @@ def main() -> None:
 
     methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
     seeds = [int(s.strip()) for s in str(args.seeds).split(',') if s.strip()]
+    task_slices = [s.strip() for s in str(args.task_slices).split(',') if s.strip()]
     bench = SyntheticBrowseComp()
 
     manifest: Dict[str, Any] = {
@@ -189,6 +191,7 @@ def main() -> None:
         'max_steps': max_steps,
         'methods': methods,
         'seeds': seeds,
+        'task_slices': [s.strip() for s in str(args.task_slices).split(',') if s.strip()],
         'fork_runtime_kwargs': {
             'fork_trigger_mode': str(args.fork_trigger_mode),
             'fork_gate_trace': bool(args.fork_gate_trace),
@@ -312,6 +315,7 @@ def main() -> None:
             unfold_k=int(args.unfold_k),
             task_limit=task_limit,
             retriever_kind='bm25',
+            task_slices=task_slices,
             parallel_tasks=int(args.parallel_tasks),
             prompt_context_chars=0,
             log_context_chars=2500,

@@ -67,3 +67,20 @@ def test_phase21_evaluate_reports_proof_complete_metrics(tmp_path: Path) -> None
     assert ev_partial['proof_complete'] is False
     assert ev_partial['proof_complete_correct'] is False
     assert float(ev_partial['proof_docid_cov']) < 1.0
+
+
+def test_phase21_load_tasks_can_filter_slices(tmp_path: Path) -> None:
+    bench = SyntheticBrowseComp()
+    bench.prepare(
+        data_dir=str(tmp_path),
+        n_entities=24,
+        n_tasks=18,
+        distractors_per_entity=1,
+        noise_docs=12,
+        seed=37,
+        long_horizon=True,
+        benchmark_profile='phase21_support_closure',
+    )
+    tasks = bench.load_tasks(str(tmp_path), task_slices=['support_closure', 'provenance_required'])
+    assert tasks
+    assert {str(t.meta.get('task_slice')) for t in tasks} <= {'support_closure', 'provenance_required'}
