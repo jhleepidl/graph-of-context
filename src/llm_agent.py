@@ -2986,12 +2986,29 @@ class ToolLoopLLMAgent:
         max_steps = int(getattr(self.cfg, 'max_steps', 40) or 40)
         late = int(step) >= max(1, max_steps - late_window)
         blocked = str(getattr(self, '_last_finish_block_reason', '') or '').startswith('proof_closure_')
+        search_calls = int(self.counters.get('search_calls', 0) or 0)
+        open_page_calls = int(self.counters.get('open_page_calls', 0) or 0)
+        rewrite_calls = int(self.counters.get('proof_closure_search_rewrites', 0) or 0)
+        blocked_finishes = int(self.counters.get('premature_finish_blocked', 0) or 0)
         planner_stall = (
-            int(self.counters.get('proof_closure_search_rewrites', 0) or 0) >= 2
-            and int(self.counters.get('search_calls', 0) or 0) >= 2
-            and int(self.counters.get('open_page_calls', 0) or 0) >= 2
+            rewrite_calls >= 2
+            and search_calls >= 2
+            and open_page_calls >= 2
         )
-        if not (late or blocked or planner_stall):
+        slice_name = str(task_meta.get('task_slice') or '').strip().lower()
+        hard_slice = slice_name in {'support_closure', 'provenance_required'}
+        # The hard proof slices are where the verifier is supposed to matter.  In practice,
+        # waiting until the very end proved too conservative: the gap often remained open, but
+        # the verifier never fired.  Escalate once after the agent has already gathered some
+        # evidence and either hit finish guards or simply spent several steps without closing
+        # the proof chain.
+        proactive_hard_slice = (
+            hard_slice
+            and int(step) >= max(min_step, 8)
+            and (search_calls >= 1 or open_page_calls >= 2 or rewrite_calls >= 1)
+            and (blocked_finishes >= 1 or int(step) >= max(min_step + 4, max_steps // 3))
+        )
+        if not (late or blocked or planner_stall or proactive_hard_slice):
             return False
         query = self._build_support_closure_fork_query(task_meta, current_user_prompt)
         node = self._run_scoped_fork(
