@@ -1811,6 +1811,9 @@ class ToolLoopLLMAgent:
 
         executed = False
         action = str(getattr(decision, 'action', 'none') or 'none').lower()
+        self.counters['context_controller_calls'] += 1
+        if action in {'none', 'unfold', 'fork', 'unfold_then_fork'}:
+            self.counters[f'context_controller_{action}'] += 1
         post_features = features
         post_fork_ready = fork_ready
         post_fork_gate_reason = fork_gate_reason
@@ -1867,6 +1870,7 @@ class ToolLoopLLMAgent:
                 )
                 executed = (node is not None) or executed
             else:
+                self.counters['context_controller_fork_blocked'] += 1
                 self._trace({
                     'type': 'context_controller_fork_blocked',
                     'task_id': task_id,
@@ -1878,6 +1882,8 @@ class ToolLoopLLMAgent:
                     'post_unfold_recheck': bool(action == 'unfold_then_fork' and bool(getattr(self.cfg, 'context_controller_recheck_after_unfold', True))),
                 })
 
+        if executed:
+            self.counters['context_controller_executed'] += 1
         return decision, executed
 
     def _run_scoped_fork(

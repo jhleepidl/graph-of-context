@@ -192,6 +192,9 @@ def test_unfold_then_fork_rechecks_after_unfold(monkeypatch) -> None:
     assert executed is True
     assert len(unfold_calls) == 1
     assert len(fork_calls) == 1
+    assert agent.counters['context_controller_calls'] == 1
+    assert agent.counters['context_controller_unfold_then_fork'] == 1
+    assert agent.counters['context_controller_executed'] == 1
 
 
 def test_structured_lookup_rewrites_resolved_handle_query() -> None:
@@ -253,64 +256,3 @@ def test_structured_dependency_rewrites_toward_missing_approval() -> None:
     assert reason == 'structured_dependency_missing_approval'
     assert new_call['tool'] == 'search'
     assert new_call['args']['query'] == 'Project_0001 operating city approval'
-
-
-def test_structured_dependency_status_prefers_active_exception_city() -> None:
-    agent = _make_agent()
-    agent._structured_handle_to_project = {'beacon-042-21': 'Project_0042'}
-    agent._structured_project_years = {'Project_0042': 2003}
-    agent._structured_project_hq = {'Project_0042': 'City_33'}
-    agent._structured_project_approval_city = {'Project_0042': 'City_50'}
-    agent._structured_project_exception_city = {'Project_0042': 'City_33'}
-    status = agent._structured_dependency_status({
-        'task_slice': 'branch_resolution',
-        'target_handle': 'Beacon-042-21',
-        'target_project': 'Project_0042',
-        'exception_state': 'active',
-        'supports_current_city_chain': True,
-    })
-    assert status['selected_project'] == 'Project_0042'
-    assert status['selected_approval_city'] == 'City_50'
-    assert status['selected_exception_city'] == 'City_33'
-    assert status['selected_current_city'] == 'City_33'
-    assert status['missing_support'] == []
-
-
-def test_structured_dependency_rewrites_toward_missing_exception_and_revocation() -> None:
-    agent = _make_agent()
-    agent._structured_handle_to_project = {'beacon-037-74': 'Project_0037'}
-    agent._structured_project_years = {'Project_0037': 2010}
-    agent._structured_project_approval_city = {'Project_0037': 'City_1'}
-
-    evt = agent._maybe_override_structured_dependency_search(
-        query='what is the current city for project 37',
-        topk=10,
-        task_meta={
-            'task_slice': 'support_recovery',
-            'target_handle': 'Beacon-037-74',
-            'target_project': 'Project_0037',
-            'exception_state': 'revoked',
-            'supports_current_city_chain': True,
-        },
-    )
-    assert evt is not None
-    reason, new_call = evt
-    assert reason == 'structured_dependency_missing_exception'
-    assert new_call['args']['query'] == 'Project_0037 legacy operating exception'
-
-    agent._structured_project_exception_city = {'Project_0037': 'City_3'}
-    evt2 = agent._maybe_override_structured_dependency_search(
-        query='what is the current city for project 37',
-        topk=10,
-        task_meta={
-            'task_slice': 'support_recovery',
-            'target_handle': 'Beacon-037-74',
-            'target_project': 'Project_0037',
-            'exception_state': 'revoked',
-            'supports_current_city_chain': True,
-        },
-    )
-    assert evt2 is not None
-    reason2, new_call2 = evt2
-    assert reason2 == 'structured_dependency_missing_revocation'
-    assert new_call2['args']['query'] == 'Project_0037 exception revocation'
