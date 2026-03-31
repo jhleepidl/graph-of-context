@@ -711,7 +711,7 @@ def run_llm(
                 fork_allow_kinds=fork_allow_tuple,
                 fork_deny_kinds=fork_deny_tuple,
             )
-        if str(ms_name) in {"GoC-Mixed-Heuristic", "GoC-Mixed-Heuristic-PaperFair"}:
+        if str(ms_name) == "GoC-Mixed-Heuristic":
             cfg = replace(
                 cfg,
                 enable_context_controller=True,
@@ -734,7 +734,7 @@ def run_llm(
                 proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_min_missing_docids=1,
             )
-        if str(ms_name) in {"GoC-Mixed-Learned", "GoC-Mixed-Learned-PaperFair"}:
+        if str(ms_name) == "GoC-Mixed-Learned":
             cfg = replace(
                 cfg,
                 enable_context_controller=True,
