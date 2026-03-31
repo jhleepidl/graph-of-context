@@ -94,6 +94,11 @@ def _summarize_jsonl(jsonl_path: Path) -> List[Dict[str, Any]]:
             'avg_docid_cov': _avg([float(r.get('docid_cov') or 0.0) for r in rs]),
             'avg_fork_calls': _avg([float((r.get('tool_stats', {}) or {}).get('fork_calls') or 0.0) for r in rs]),
             'avg_fork_tokens': _avg([float((r.get('tool_stats', {}) or {}).get('fork_tokens') or 0.0) for r in rs]),
+            'avg_context_controller_calls': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_calls') or 0.0) for r in rs]),
+            'avg_context_controller_none': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_none') or 0.0) for r in rs]),
+            'avg_context_controller_unfold': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold') or 0.0) for r in rs]),
+            'avg_context_controller_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_fork') or 0.0) for r in rs]),
+            'avg_context_controller_unfold_then_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold_then_fork') or 0.0) for r in rs]),
         })
     return out
 

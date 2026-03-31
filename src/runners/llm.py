@@ -959,8 +959,8 @@ def run_llm(
     def _avg(xs): return sum(xs)/max(1,len(xs))
     lines = []
     lines.append(f"# LLM Report ({benchmark.name})\n")
-    lines.append("| method | n | accuracy | accuracy_strict | avg_total_tokens | p95_total_tokens | avg_steps | avg_elapsed_sec | avg_tool_calls | avg_fork_calls | avg_fork_tokens | avg_search | avg_open | avg_repeat_search | json_fail | json_recover | avg_docid_coverage |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| method | n | accuracy | accuracy_strict | avg_total_tokens | p95_total_tokens | avg_steps | avg_elapsed_sec | avg_tool_calls | avg_fork_calls | avg_fork_tokens | avg_ctx_calls | avg_ctx_none | avg_ctx_unfold | avg_ctx_fork | avg_ctx_unfold_then_fork | avg_search | avg_open | avg_repeat_search | json_fail | json_recover | avg_docid_coverage |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for name, rs in by_method.items():
         n = len(rs)
         acc = sum(1 for x in rs if x["correct"]) / max(1, n)
@@ -974,6 +974,11 @@ def run_llm(
         avg_tools = _avg([(x.get("tool_stats", {}).get("tool_calls_total") or 0) for x in rs])
         avg_fork_calls = _avg([(x.get("tool_stats", {}).get("fork_calls") or 0) for x in rs])
         avg_fork_tokens = _avg([(x.get("tool_stats", {}).get("fork_tokens") or 0) for x in rs])
+        avg_ctx_calls = _avg([(x.get("tool_stats", {}).get("context_controller_calls") or 0) for x in rs])
+        avg_ctx_none = _avg([(x.get("tool_stats", {}).get("context_controller_none") or 0) for x in rs])
+        avg_ctx_unfold = _avg([(x.get("tool_stats", {}).get("context_controller_unfold") or 0) for x in rs])
+        avg_ctx_fork = _avg([(x.get("tool_stats", {}).get("context_controller_fork") or 0) for x in rs])
+        avg_ctx_utf = _avg([(x.get("tool_stats", {}).get("context_controller_unfold_then_fork") or 0) for x in rs])
         avg_search = _avg([(x.get("tool_stats", {}).get("search_calls") or 0) for x in rs])
         avg_open = _avg([(x.get("tool_stats", {}).get("open_page_calls") or 0) for x in rs])
         avg_rep = _avg([(x.get("tool_stats", {}).get("repeated_search_count") or 0) for x in rs])
@@ -982,8 +987,8 @@ def run_llm(
         avg_cov = _avg([x.get("docid_cov",0.0) for x in rs])
         lines.append(
             f"| {name} | {n} | {acc:.3f} | {acc_strict:.3f} | {avg_tok:.1f} | {p95_tok:.1f} | {avg_steps:.1f} | {avg_elapsed:.2f} | "
-            f"{avg_tools:.1f} | {avg_fork_calls:.1f} | {avg_fork_tokens:.1f} | {avg_search:.1f} | {avg_open:.1f} | {avg_rep:.1f} | "
-            f"{json_fail} | {json_rec} | {avg_cov:.3f} |"
+            f"{avg_tools:.1f} | {avg_fork_calls:.1f} | {avg_fork_tokens:.1f} | {avg_ctx_calls:.1f} | {avg_ctx_none:.1f} | {avg_ctx_unfold:.1f} | {avg_ctx_fork:.1f} | {avg_ctx_utf:.1f} | "
+            f"{avg_search:.1f} | {avg_open:.1f} | {avg_rep:.1f} | {json_fail} | {json_rec} | {avg_cov:.3f} |"
         )
 
     with open(out_report_path, "w", encoding="utf-8") as f:
