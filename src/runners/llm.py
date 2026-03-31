@@ -430,6 +430,30 @@ def run_llm(
                 trace_unfold_candidates=True,
             ),
         ),
+        "GoC-Mixed-Heuristic-PaperFair": MethodSpec(
+            "GoC-Mixed-Heuristic-PaperFair",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-Mixed-Learned-PaperFair": MethodSpec(
+            "GoC-Mixed-Learned-PaperFair",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
         "SimilarityOnly-Prove": MethodSpec(
             "SimilarityOnly-Prove",
             lambda: SimilarityOnlyMemory(
@@ -649,7 +673,7 @@ def run_llm(
         fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
         if str(ms_name) == "GoC-ForkOnly":
             cfg = replace(cfg, adaptive_unfold=False)
-        if str(ms_name) in {"GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned"}:
+        if str(ms_name) in {"GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned", "GoC-Mixed-Heuristic-PaperFair", "GoC-Mixed-Learned-PaperFair"}:
             cfg = replace(
                 cfg,
                 enable_scoped_fork=True,
@@ -723,6 +747,45 @@ def run_llm(
             )
             if not context_controller_model_path:
                 raise ValueError("GoC-Mixed-Learned requires --context_controller_model_path")
+        if str(ms_name) == "GoC-Mixed-Heuristic-PaperFair":
+            cfg = replace(
+                cfg,
+                enable_context_controller=True,
+                context_controller_policy="uncertainty_aware",
+                context_controller_trace=bool(context_controller_trace),
+                context_controller_fork_gate_mode="integrated",
+                context_controller_disable_none_action=False,
+                context_controller_fallback_action="unfold",
+                proof_closure_guard=False,
+                proof_closure_search_planner=False,
+                proof_closure_auto_open=False,
+                proof_closure_autofinish=False,
+                proof_closure_system_hint=False,
+                proof_closure_repair=False,
+                proof_closure_fork_verify=False,
+                proof_closure_finish_probe=False,
+            )
+        if str(ms_name) == "GoC-Mixed-Learned-PaperFair":
+            cfg = replace(
+                cfg,
+                enable_context_controller=True,
+                context_controller_policy="phase18_tree",
+                context_controller_trace=bool(context_controller_trace),
+                context_controller_fork_gate_mode="integrated",
+                context_controller_disable_none_action=False,
+                context_controller_fallback_action="unfold",
+                context_controller_model_path=str(context_controller_model_path) if context_controller_model_path else None,
+                proof_closure_guard=False,
+                proof_closure_search_planner=False,
+                proof_closure_auto_open=False,
+                proof_closure_autofinish=False,
+                proof_closure_system_hint=False,
+                proof_closure_repair=False,
+                proof_closure_fork_verify=False,
+                proof_closure_finish_probe=False,
+            )
+            if not context_controller_model_path:
+                raise ValueError("GoC-Mixed-Learned-PaperFair requires --context_controller_model_path")
         if str(ms_name) == "SimilarityOnly-Prove-Repair":
             cfg = replace(
                 cfg,
