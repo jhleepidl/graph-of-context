@@ -223,7 +223,7 @@ def main() -> None:
             'fork_weak_merge_max_chars': int(args.fork_weak_merge_max_chars),
         },
         'context_controller_kwargs': {
-            'enable_context_controller': bool(args.enable_context_controller),
+            'enable_context_controller': bool(effective_enable_context_controller),
             'context_controller_policy': str(args.context_controller_policy),
             'context_controller_trace': bool(args.context_controller_trace),
             'context_controller_support_gap_threshold': float(args.context_controller_support_gap_threshold),
@@ -358,7 +358,7 @@ def main() -> None:
             fork_k=int(args.fork_k),
             fork_include_recent_active=True,
             fork_recent_active_n=4,
-            enable_context_controller=bool(args.enable_context_controller),
+            enable_context_controller=bool(effective_enable_context_controller),
             context_controller_policy=str(args.context_controller_policy),
             context_controller_trace=bool(args.context_controller_trace),
             context_controller_support_gap_threshold=float(args.context_controller_support_gap_threshold),

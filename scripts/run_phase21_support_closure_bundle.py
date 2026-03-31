@@ -61,6 +61,8 @@ def main() -> None:
         cmd.extend(['--context_controller_model_path', args.context_controller_model_path])
     if args.context_controller_policy:
         cmd.extend(['--context_controller_policy', args.context_controller_policy])
+    if args.enable_context_controller:
+        cmd.append('--enable_context_controller')
     raise SystemExit(subprocess.call(cmd))
 
 

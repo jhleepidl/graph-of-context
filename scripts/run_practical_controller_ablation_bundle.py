@@ -77,6 +77,8 @@ def main() -> None:
         cmd.extend(['--context_controller_model_path', args.context_controller_model_path])
     if inferred_policy:
         cmd.extend(['--context_controller_policy', inferred_policy])
+    if any(m in methods for m in ('GoC-Mixed-Heuristic', 'GoC-Mixed-Learned')):
+        cmd.append('--enable_context_controller')
     raise SystemExit(subprocess.call(cmd))
 
 
