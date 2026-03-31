@@ -8,8 +8,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _dedupe(seq):
+    out = []
+    seen = set()
+    for x in seq:
+        key = str(x).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description='Run Phase 21 support-closure benchmark bundle.')
+    ap = argparse.ArgumentParser(description='Run support-closure benchmark bundle.')
     ap.add_argument('--model', type=str, default='gpt-4.1-mini')
     ap.add_argument('--dotenv', type=str, default='.env')
     ap.add_argument('--task_limit', type=int, default=24)
@@ -22,9 +34,10 @@ def main() -> None:
     ap.add_argument('--fork_merge_policy', type=str, default='weak')
     ap.add_argument('--run_fork_verify', action='store_true', default=False, help='Also include GoC-SimSeed-Fork-Verify.')
     ap.add_argument('--context_controller_model_path', type=str, default=None, help='Optional learned controller model path for learned-controller methods.')
+    ap.add_argument('--context_controller_policy', type=str, default=None, help='Optional learned controller policy label (e.g. phase18_tree or phase18_logreg).')
     args = ap.parse_args()
 
-    methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
+    methods = _dedupe([m.strip() for m in str(args.methods).split(',') if m.strip()])
     if args.run_fork_verify and 'GoC-SimSeed-Fork-Verify' not in methods:
         methods.append('GoC-SimSeed-Fork-Verify')
     if 'GoC-Mixed-Learned' in methods and not args.context_controller_model_path:
@@ -46,6 +59,8 @@ def main() -> None:
     ]
     if args.context_controller_model_path:
         cmd.extend(['--context_controller_model_path', args.context_controller_model_path])
+    if args.context_controller_policy:
+        cmd.extend(['--context_controller_policy', args.context_controller_policy])
     raise SystemExit(subprocess.call(cmd))
 
 

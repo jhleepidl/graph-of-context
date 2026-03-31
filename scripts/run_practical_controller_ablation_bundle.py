@@ -5,6 +5,31 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _dedupe(seq):
+    out = []
+    seen = set()
+    for x in seq:
+        key = str(x).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _infer_controller_policy(model_path: str | None, requested: str | None) -> str | None:
+    req = str(requested or '').strip()
+    if req and req.lower() != 'auto':
+        return req
+    name = str(model_path or '').lower()
+    if 'logreg' in name:
+        return 'phase18_logreg'
+    if 'tree' in name:
+        return 'phase18_tree'
+    return 'phase18_tree' if model_path else None
+
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_METHODS = "FullHistory-Prove,SimilarityOnly-Prove,ProxySummary-Prove,GoC-Closure-Only,GoC-ForkOnly,GoC-Mixed-Heuristic"
 
@@ -19,12 +44,20 @@ def main() -> None:
     ap.add_argument('--task_slices', type=str, default='support_closure,provenance_required')
     ap.add_argument('--max_steps', type=int, default=44)
     ap.add_argument('--methods', type=str, default=DEFAULT_METHODS, help=f'Comma-separated method list. Default: {DEFAULT_METHODS}')
-    ap.add_argument('--context_controller_model_path', type=str, default=None, help='Path to a learned context-controller model. If provided and GoC-Mixed-Learned is absent from --methods, it is appended automatically.')
+    ap.add_argument('--learned_only', action='store_true', default=False, help='Run only GoC-Mixed-Learned. Useful after baselines have already been measured, to avoid rerunning every method.')
+    ap.add_argument('--context_controller_model_path', type=str, default=None, help='Path to a learned context-controller model (.pkl payload from train_phase18_controller.py). If provided and GoC-Mixed-Learned is absent from --methods, it is appended automatically.')
+    ap.add_argument('--context_controller_policy', type=str, default='auto', help='Learned controller policy label. Use auto to infer phase18_tree or phase18_logreg from the model filename.')
     args = ap.parse_args()
 
-    methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
-    if args.context_controller_model_path and 'GoC-Mixed-Learned' not in methods:
-        methods.append('GoC-Mixed-Learned')
+    if args.learned_only:
+        if not args.context_controller_model_path:
+            raise SystemExit('--learned_only requires --context_controller_model_path')
+        methods = ['GoC-Mixed-Learned']
+    else:
+        methods = _dedupe([m.strip() for m in str(args.methods).split(',') if m.strip()])
+        if args.context_controller_model_path and 'GoC-Mixed-Learned' not in methods:
+            methods.append('GoC-Mixed-Learned')
+
     if 'GoC-Mixed-Learned' in methods and not args.context_controller_model_path:
         raise SystemExit('GoC-Mixed-Learned requires --context_controller_model_path')
 
@@ -37,10 +70,13 @@ def main() -> None:
         '--parallel_tasks', str(args.parallel_tasks),
         '--task_slices', args.task_slices,
         '--max_steps', str(args.max_steps),
-        '--methods', ','.join(methods),
+        '--methods', ','.join(_dedupe(methods)),
     ]
+    inferred_policy = _infer_controller_policy(args.context_controller_model_path, args.context_controller_policy)
     if args.context_controller_model_path:
         cmd.extend(['--context_controller_model_path', args.context_controller_model_path])
+    if inferred_policy:
+        cmd.extend(['--context_controller_policy', inferred_policy])
     raise SystemExit(subprocess.call(cmd))
 
 

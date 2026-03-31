@@ -58,6 +58,21 @@ def _default_max_steps(profile: str) -> int:
     return 35
 
 
+
+
+def _seed_log_dir(bundle_root: Path, seed_runs: Path, raw: str | None, seed: int) -> Path | None:
+    raw_s = str(raw or '').strip()
+    if not raw_s:
+        return None
+    if '{seed}' in raw_s or '{bundle_root}' in raw_s:
+        rendered = raw_s.replace('{seed}', str(seed)).replace('{bundle_root}', str(bundle_root))
+        out = Path(rendered)
+    else:
+        base = Path(raw_s)
+        out = (base if base.is_absolute() else (seed_runs / base)) / f'seed_{seed}'
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
 def _summarize_jsonl(jsonl_path: Path) -> List[Dict[str, Any]]:
     rows = [json.loads(line) for line in jsonl_path.read_text(encoding='utf-8').splitlines() if line.strip()]
     by_method: Dict[str, List[Dict[str, Any]]] = {}
@@ -90,6 +105,7 @@ def main() -> None:
     ap.add_argument('--task_limit', type=int, default=24)
     ap.add_argument('--max_steps', type=int, default=None)
     ap.add_argument('--parallel_tasks', type=int, default=1)
+    ap.add_argument('--log_dir', type=str, default=None, help='Optional per-task trace log directory. Relative paths are created under each seed run directory; use {seed} or {bundle_root} placeholders if desired.')
     ap.add_argument('--budget_active', type=int, default=1200)
     ap.add_argument('--budget_unfold', type=int, default=650)
     ap.add_argument('--unfold_k', type=int, default=8)
@@ -189,6 +205,7 @@ def main() -> None:
         'model': args.model,
         'task_limit': task_limit,
         'max_steps': max_steps,
+        'log_dir': str(args.log_dir) if args.log_dir else None,
         'methods': methods,
         'seeds': seeds,
         'task_slices': [s.strip() for s in str(args.task_slices).split(',') if s.strip()],
@@ -300,6 +317,7 @@ def main() -> None:
         )
         out_jsonl = seed_runs / 'phase19_results.jsonl'
         out_report = seed_runs / 'phase19_report.md'
+        seed_log_dir = _seed_log_dir(bundle_root, seed_runs, args.log_dir, seed)
         run_llm(
             benchmark=bench,
             data_dir=str(seed_data),
@@ -321,6 +339,7 @@ def main() -> None:
             parallel_tasks=int(args.parallel_tasks),
             prompt_context_chars=0,
             log_context_chars=2500,
+            log_dir=(str(seed_log_dir) if seed_log_dir else None),
             stage_aware_unfold_on_final=True,
             stage_aware_unfold_on_commit=True,
             enable_unfold_trigger=True,
