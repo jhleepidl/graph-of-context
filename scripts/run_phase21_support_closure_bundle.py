@@ -37,6 +37,9 @@ def main() -> None:
     ap.add_argument('--fork_trigger_mode', type=str, default='evidence_gated')
     ap.add_argument('--fork_merge_policy', type=str, default='weak')
     ap.add_argument('--run_fork_verify', action='store_true', default=False, help='Also include GoC-SimSeed-Fork-Verify.')
+    ap.add_argument('--paper_fair', action='store_true', default=False, help='Map mixed-method names to their paper-fair variants that disable benchmark-aware proof hooks.')
+    ap.add_argument('--paper_fair_only', action='store_true', default=False, help='Run only GoC-Mixed-Learned-PaperFair. Requires --context_controller_model_path.')
+    ap.add_argument('--paper_fair_heuristic_only', action='store_true', default=False, help='Run only GoC-Mixed-Heuristic-PaperFair.')
     ap.add_argument('--context_controller_model_path', type=str, default=None, help='Optional learned controller model path for learned-controller methods.')
     ap.add_argument('--context_controller_policy', type=str, default=None, help='Optional learned controller policy label (e.g. phase18_tree or phase18_logreg).')
     ap.add_argument('--enable_context_controller', action='store_true', default=False, help='Explicitly enable downstream context-controller runtime wiring.')
@@ -44,10 +47,27 @@ def main() -> None:
     args, passthrough = ap.parse_known_args()
 
     methods = _dedupe([m.strip() for m in str(args.methods).split(',') if m.strip()])
+    mode_flags = [bool(args.paper_fair_only), bool(args.paper_fair_heuristic_only)]
+    if sum(1 for x in mode_flags if x) > 1:
+        raise SystemExit('Use at most one of --paper_fair_only or --paper_fair_heuristic_only')
+    if args.paper_fair_heuristic_only:
+        methods = ['GoC-Mixed-Heuristic-PaperFair']
+    elif args.paper_fair_only:
+        methods = ['GoC-Mixed-Learned-PaperFair']
+    elif args.paper_fair:
+        mapped=[]
+        for m in methods:
+            if m == 'GoC-Mixed-Learned':
+                mapped.append('GoC-Mixed-Learned-PaperFair')
+            elif m == 'GoC-Mixed-Heuristic':
+                mapped.append('GoC-Mixed-Heuristic-PaperFair')
+            else:
+                mapped.append(m)
+        methods = _dedupe(mapped)
     if args.run_fork_verify and 'GoC-SimSeed-Fork-Verify' not in methods:
         methods.append('GoC-SimSeed-Fork-Verify')
-    if 'GoC-Mixed-Learned' in methods and not args.context_controller_model_path:
-        raise SystemExit('GoC-Mixed-Learned requires --context_controller_model_path')
+    if any(m in methods for m in ('GoC-Mixed-Learned', 'GoC-Mixed-Learned-PaperFair')) and not args.context_controller_model_path:
+        raise SystemExit('Learned mixed methods require --context_controller_model_path')
 
     cmd = [
         sys.executable, str(ROOT / 'scripts' / 'run_phase19_e2e_fork_bundle.py'),

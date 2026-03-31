@@ -160,6 +160,9 @@ def main() -> None:
     ap.add_argument('--fork_controller_allow_open_only', action='store_true', default=True)
     ap.add_argument('--no_fork_controller_allow_open_only', action='store_false', dest='fork_controller_allow_open_only')
     ap.add_argument('--methods', type=str, default='FullHistory,SimilarityOnly,GoC,GoC-Fork-Dep,GoC-Fork-Sim,GoC-Fork-Full')
+    ap.add_argument('--paper_fair', action='store_true', default=False, help='Map mixed-method names to their paper-fair variants that disable benchmark-aware proof hooks.')
+    ap.add_argument('--paper_fair_only', action='store_true', default=False, help='Run only GoC-Mixed-Learned-PaperFair. Requires --context_controller_model_path.')
+    ap.add_argument('--paper_fair_heuristic_only', action='store_true', default=False, help='Run only GoC-Mixed-Heuristic-PaperFair.')
     ap.add_argument('--seeds', type=str, default='7,13,23')
     ap.add_argument('--n_entities', type=int, default=100)
     ap.add_argument('--n_tasks', type=int, default=48)
@@ -204,9 +207,26 @@ def main() -> None:
     max_steps = int(args.max_steps) if args.max_steps is not None else _default_max_steps(str(args.benchmark_profile))
 
     methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
+    mode_flags = [bool(args.paper_fair_only), bool(args.paper_fair_heuristic_only)]
+    if sum(1 for x in mode_flags if x) > 1:
+        raise SystemExit('Use at most one of --paper_fair_only or --paper_fair_heuristic_only')
+    if args.paper_fair_heuristic_only:
+        methods = ['GoC-Mixed-Heuristic-PaperFair']
+    elif args.paper_fair_only:
+        methods = ['GoC-Mixed-Learned-PaperFair']
+    elif args.paper_fair:
+        mapped=[]
+        for m in methods:
+            if m == 'GoC-Mixed-Learned':
+                mapped.append('GoC-Mixed-Learned-PaperFair')
+            elif m == 'GoC-Mixed-Heuristic':
+                mapped.append('GoC-Mixed-Heuristic-PaperFair')
+            else:
+                mapped.append(m)
+        methods = list(dict.fromkeys(mapped))
     seeds = [int(s.strip()) for s in str(args.seeds).split(',') if s.strip()]
     task_slices = [s.strip() for s in str(args.task_slices).split(',') if s.strip()]
-    uses_context_controller = any(m in {'GoC-Mixed-Heuristic', 'GoC-Mixed-Learned'} for m in methods)
+    uses_context_controller = any(m in {'GoC-Mixed-Heuristic', 'GoC-Mixed-Learned', 'GoC-Mixed-Heuristic-PaperFair', 'GoC-Mixed-Learned-PaperFair'} for m in methods)
     effective_enable_context_controller = bool(args.enable_context_controller or uses_context_controller)
     bench = SyntheticBrowseComp()
 

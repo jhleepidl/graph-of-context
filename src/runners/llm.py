@@ -659,7 +659,7 @@ def run_llm(
             cfg = replace(cfg, goc_annotation_mode="hybrid_depends")
         elif str(ms_name) == "GoC-TraceFirst":
             cfg = replace(cfg, goc_annotation_mode="tracefirst")
-        if str(ms_name) in {"FullHistory-Prove", "ProxySummary-Prove", "SimilarityOnly-Prove", "SimilarityOnly-Prove-Repair", "SimilarityOnly-Prove-Fork-Verify", "SimilarityOnly-Prove-Fork-Selective", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify", "GoC-Closure-Only", "GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned"}:
+        if str(ms_name) in {"FullHistory-Prove", "ProxySummary-Prove", "SimilarityOnly-Prove", "SimilarityOnly-Prove-Repair", "SimilarityOnly-Prove-Fork-Verify", "SimilarityOnly-Prove-Fork-Selective", "GoC-SimSeed-Closure", "GoC-SimSeed-Fork-Verify", "GoC-Closure-Only", "GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned", "GoC-Mixed-Heuristic-PaperFair", "GoC-Mixed-Learned-PaperFair"}:
             cfg = replace(
                 cfg,
                 proof_closure_guard=True,
@@ -667,6 +667,19 @@ def run_llm(
                 proof_closure_auto_open=True,
                 proof_closure_autofinish=True,
                 proof_closure_system_hint=True,
+            )
+
+        if str(ms_name) in {"GoC-Mixed-Heuristic-PaperFair", "GoC-Mixed-Learned-PaperFair"}:
+            cfg = replace(
+                cfg,
+                proof_closure_guard=False,
+                proof_closure_search_planner=False,
+                proof_closure_auto_open=False,
+                proof_closure_autofinish=False,
+                proof_closure_system_hint=False,
+                proof_closure_repair=False,
+                proof_closure_fork_verify=False,
+                proof_closure_finish_probe=False,
             )
 
         fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
@@ -698,7 +711,7 @@ def run_llm(
                 fork_allow_kinds=fork_allow_tuple,
                 fork_deny_kinds=fork_deny_tuple,
             )
-        if str(ms_name) == "GoC-Mixed-Heuristic":
+        if str(ms_name) in {"GoC-Mixed-Heuristic", "GoC-Mixed-Heuristic-PaperFair"}:
             cfg = replace(
                 cfg,
                 enable_context_controller=True,
@@ -721,7 +734,7 @@ def run_llm(
                 proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_min_missing_docids=1,
             )
-        if str(ms_name) == "GoC-Mixed-Learned":
+        if str(ms_name) in {"GoC-Mixed-Learned", "GoC-Mixed-Learned-PaperFair"}:
             cfg = replace(
                 cfg,
                 enable_context_controller=True,
@@ -745,47 +758,8 @@ def run_llm(
                 proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_min_missing_docids=1,
             )
-            if not context_controller_model_path:
-                raise ValueError("GoC-Mixed-Learned requires --context_controller_model_path")
-        if str(ms_name) == "GoC-Mixed-Heuristic-PaperFair":
-            cfg = replace(
-                cfg,
-                enable_context_controller=True,
-                context_controller_policy="uncertainty_aware",
-                context_controller_trace=bool(context_controller_trace),
-                context_controller_fork_gate_mode="integrated",
-                context_controller_disable_none_action=False,
-                context_controller_fallback_action="unfold",
-                proof_closure_guard=False,
-                proof_closure_search_planner=False,
-                proof_closure_auto_open=False,
-                proof_closure_autofinish=False,
-                proof_closure_system_hint=False,
-                proof_closure_repair=False,
-                proof_closure_fork_verify=False,
-                proof_closure_finish_probe=False,
-            )
-        if str(ms_name) == "GoC-Mixed-Learned-PaperFair":
-            cfg = replace(
-                cfg,
-                enable_context_controller=True,
-                context_controller_policy="phase18_tree",
-                context_controller_trace=bool(context_controller_trace),
-                context_controller_fork_gate_mode="integrated",
-                context_controller_disable_none_action=False,
-                context_controller_fallback_action="unfold",
-                context_controller_model_path=str(context_controller_model_path) if context_controller_model_path else None,
-                proof_closure_guard=False,
-                proof_closure_search_planner=False,
-                proof_closure_auto_open=False,
-                proof_closure_autofinish=False,
-                proof_closure_system_hint=False,
-                proof_closure_repair=False,
-                proof_closure_fork_verify=False,
-                proof_closure_finish_probe=False,
-            )
-            if not context_controller_model_path:
-                raise ValueError("GoC-Mixed-Learned-PaperFair requires --context_controller_model_path")
+            if not context_controller_model_path and str(ms_name) in {"GoC-Mixed-Learned", "GoC-Mixed-Learned-PaperFair"}:
+                raise ValueError(f"{ms_name} requires --context_controller_model_path")
         if str(ms_name) == "SimilarityOnly-Prove-Repair":
             cfg = replace(
                 cfg,
