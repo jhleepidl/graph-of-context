@@ -99,6 +99,8 @@ def _summarize_jsonl(jsonl_path: Path) -> List[Dict[str, Any]]:
             'avg_context_controller_unfold': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold') or 0.0) for r in rs]),
             'avg_context_controller_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_fork') or 0.0) for r in rs]),
             'avg_context_controller_unfold_then_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold_then_fork') or 0.0) for r in rs]),
+            'avg_premature_finish_blocked': _avg([float((r.get('tool_stats', {}) or {}).get('premature_finish_blocked') or 0.0) for r in rs]),
+            'no_finish_rate': _avg([1.0 if str(r.get('explanation') or '').startswith('max_steps reached') else 0.0 for r in rs]),
         })
     return out
 
@@ -420,6 +422,8 @@ def main() -> None:
             'avg_docid_cov_mean': _avg([float(r['avg_docid_cov']) for r in rs]),
             'avg_fork_calls_mean': _avg([float(r['avg_fork_calls']) for r in rs]),
             'avg_fork_tokens_mean': _avg([float(r['avg_fork_tokens']) for r in rs]),
+            'avg_premature_finish_blocked_mean': _avg([float(r.get('avg_premature_finish_blocked') or 0.0) for r in rs]),
+            'no_finish_rate_mean': _avg([float(r.get('no_finish_rate') or 0.0) for r in rs]),
         })
 
     import csv
@@ -432,11 +436,11 @@ def main() -> None:
     with open(analysis_root / 'phase19_e2e_summary.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 End-to-End Fork Summary\n\n')
         if summary_rows:
-            hdr = '| method | n_seeds | acc | acc_strict | avg_tokens | p95_tokens | avg_steps | docid_cov | avg_fork_calls | avg_fork_tokens |\n'
-            sep = '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n'
+            hdr = '| method | n_seeds | acc | acc_strict | avg_tokens | p95_tokens | avg_steps | docid_cov | avg_fork_calls | avg_fork_tokens | avg_finish_blocked | no_finish_rate |\n'
+            sep = '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n'
             f.write(hdr); f.write(sep)
             for r in summary_rows:
-                f.write(f"| {r['method']} | {r['n_seeds']} | {r['accuracy_mean']:.3f} | {r['accuracy_strict_mean']:.3f} | {r['avg_total_tokens_mean']:.1f} | {r['p95_total_tokens_mean']:.1f} | {r['avg_steps_mean']:.1f} | {r['avg_docid_cov_mean']:.3f} | {r['avg_fork_calls_mean']:.2f} | {r['avg_fork_tokens_mean']:.1f} |\n")
+                f.write(f"| {r['method']} | {r['n_seeds']} | {r['accuracy_mean']:.3f} | {r['accuracy_strict_mean']:.3f} | {r['avg_total_tokens_mean']:.1f} | {r['p95_total_tokens_mean']:.1f} | {r['avg_steps_mean']:.1f} | {r['avg_docid_cov_mean']:.3f} | {r['avg_fork_calls_mean']:.2f} | {r['avg_fork_tokens_mean']:.1f} | {r['avg_premature_finish_blocked_mean']:.2f} | {r['no_finish_rate_mean']:.3f} |\n")
 
     (bundle_root / 'run_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps({'bundle_root': str(bundle_root), 'summary_csv': str(out_csv)}, ensure_ascii=False))

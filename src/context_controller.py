@@ -248,6 +248,12 @@ class ContextController:
         branch_score = self._as_float(features.get("branch_score", 0.0), 0.0)
         candidate_count = int(features.get("candidate_count", 0) or 0)
         has_conflict = bool(features.get("has_conflict", False))
+        support_gap = self._as_float(features.get("support_gap_score", 0.0), 0.0)
+        ambiguity = self._as_float(features.get("ambiguity_score", 0.0), 0.0)
+        pivot_risk = self._as_float(features.get("pivot_risk", 0.0), 0.0)
+        pressure = self._as_float(features.get("evidence_pressure_score", 0.0), 0.0)
+        blocked_finish_active = bool(features.get("blocked_finish_active", False))
+        open_page_calls = int(features.get("open_page_calls", 0) or 0)
         if action == "fork" and not fork_ready:
             action = self.learned_fallback_action if self.learned_fallback_action != "fork" else "unfold"
             reason = "learned_fork_gate_blocked"
@@ -258,6 +264,27 @@ class ContextController:
             action = self.learned_fallback_action if action == "fork" else "unfold"
             reason = "learned_low_branch_fallback"
             meta["learned_branch_score"] = float(branch_score)
+
+        low_pressure_noop = (
+            action in {"unfold", "unfold_then_fork"}
+            and not blocked_finish_active
+            and open_page_calls >= 1
+            and candidate_count < 2
+            and not has_conflict
+            and support_gap < 0.05
+            and ambiguity < 0.20
+            and pivot_risk < 0.40
+            and pressure < 0.28
+        )
+        if low_pressure_noop:
+            action = "none"
+            reason = "learned_low_pressure_noop_override"
+            meta.update({
+                "support_gap_score": float(support_gap),
+                "ambiguity_score": float(ambiguity),
+                "pivot_risk": float(pivot_risk),
+                "evidence_pressure_score": float(pressure),
+            })
 
         if action not in self.VALID_ACTIONS:
             action = "unfold"

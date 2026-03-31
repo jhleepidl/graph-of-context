@@ -61,6 +61,8 @@ def _method_summary(method: str, rs: List[Dict]) -> Dict:
         'avg_context_controller_unfold': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold') or 0.0) for r in rs]),
         'avg_context_controller_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_fork') or 0.0) for r in rs]),
         'avg_context_controller_unfold_then_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold_then_fork') or 0.0) for r in rs]),
+        'avg_premature_finish_blocked': _avg([float((r.get('tool_stats', {}) or {}).get('premature_finish_blocked') or 0.0) for r in rs]),
+        'no_finish_rate': _avg([1.0 if str(r.get('explanation') or '').startswith('max_steps reached') else 0.0 for r in rs]),
     }
 
 
@@ -105,10 +107,10 @@ def main() -> None:
             slice_summary.append(rec)
 
     with open(analysis / 'phase19_e2e_summary.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=['method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_proof_docid_cov','proof_complete_rate','proof_complete_correct_rate','avg_fork_calls','avg_fork_tokens','avg_context_controller_calls','avg_context_controller_none','avg_context_controller_unfold','avg_context_controller_fork','avg_context_controller_unfold_then_fork'])
+        w = csv.DictWriter(f, fieldnames=['method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_proof_docid_cov','proof_complete_rate','proof_complete_correct_rate','avg_fork_calls','avg_fork_tokens','avg_context_controller_calls','avg_context_controller_none','avg_context_controller_unfold','avg_context_controller_fork','avg_context_controller_unfold_then_fork','avg_premature_finish_blocked','no_finish_rate'])
         w.writeheader(); [w.writerow(r) for r in summary]
     with open(analysis / 'phase19_slice_summary.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=['task_slice','method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_proof_docid_cov','proof_complete_rate','proof_complete_correct_rate','avg_fork_calls','avg_fork_tokens','avg_context_controller_calls','avg_context_controller_none','avg_context_controller_unfold','avg_context_controller_fork','avg_context_controller_unfold_then_fork'])
+        w = csv.DictWriter(f, fieldnames=['task_slice','method','n_seeds','n','accuracy','accuracy_strict','avg_total_tokens','p95_total_tokens','avg_steps','avg_docid_cov','avg_proof_docid_cov','proof_complete_rate','proof_complete_correct_rate','avg_fork_calls','avg_fork_tokens','avg_context_controller_calls','avg_context_controller_none','avg_context_controller_unfold','avg_context_controller_fork','avg_context_controller_unfold_then_fork','avg_premature_finish_blocked','no_finish_rate'])
         w.writeheader(); [w.writerow(r) for r in slice_summary]
 
     plt.figure(figsize=(6.2, 4.3))
@@ -134,17 +136,17 @@ def main() -> None:
 
     with open(analysis / 'phase19_e2e_summary.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 End-to-End Fork Summary\n\n')
-        f.write('| method | n_seeds | acc | acc_strict | avg_tokens | p95_tokens | avg_steps | docid_cov | proof_docid_cov | proof_complete | proof_complete_correct | avg_fork_calls | avg_fork_tokens | avg_ctx_calls | avg_ctx_none | avg_ctx_unfold | avg_ctx_fork | avg_ctx_unfold_then_fork |\n')
-        f.write('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
+        f.write('| method | n_seeds | acc | acc_strict | avg_tokens | p95_tokens | avg_steps | docid_cov | proof_docid_cov | proof_complete | proof_complete_correct | avg_fork_calls | avg_fork_tokens | avg_ctx_calls | avg_ctx_none | avg_ctx_unfold | avg_ctx_fork | avg_ctx_unfold_then_fork | avg_finish_blocked | no_finish_rate |\n')
+        f.write('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
         for r in summary:
-            f.write(f"| {r['method']} | {r['n_seeds']} | {r['accuracy']:.3f} | {r['accuracy_strict']:.3f} | {r['avg_total_tokens']:.1f} | {r['p95_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_proof_docid_cov']:.3f} | {r['proof_complete_rate']:.3f} | {r['proof_complete_correct_rate']:.3f} | {r['avg_fork_calls']:.2f} | {r['avg_fork_tokens']:.1f} | {r['avg_context_controller_calls']:.2f} | {r['avg_context_controller_none']:.2f} | {r['avg_context_controller_unfold']:.2f} | {r['avg_context_controller_fork']:.2f} | {r['avg_context_controller_unfold_then_fork']:.2f} |\n")
+            f.write(f"| {r['method']} | {r['n_seeds']} | {r['accuracy']:.3f} | {r['accuracy_strict']:.3f} | {r['avg_total_tokens']:.1f} | {r['p95_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_proof_docid_cov']:.3f} | {r['proof_complete_rate']:.3f} | {r['proof_complete_correct_rate']:.3f} | {r['avg_fork_calls']:.2f} | {r['avg_fork_tokens']:.1f} | {r['avg_context_controller_calls']:.2f} | {r['avg_context_controller_none']:.2f} | {r['avg_context_controller_unfold']:.2f} | {r['avg_context_controller_fork']:.2f} | {r['avg_context_controller_unfold_then_fork']:.2f} | {r['avg_premature_finish_blocked']:.2f} | {r['no_finish_rate']:.3f} |\n")
 
     with open(analysis / 'phase19_slice_summary.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 Slice Summary\n\n')
-        f.write('| task_slice | method | n | acc | avg_tokens | avg_steps | docid_cov | proof_docid_cov | proof_complete_correct | avg_fork_calls | avg_ctx_calls | avg_ctx_unfold | avg_ctx_fork | avg_ctx_unfold_then_fork |\n')
-        f.write('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
+        f.write('| task_slice | method | n | acc | avg_tokens | avg_steps | docid_cov | proof_docid_cov | proof_complete_correct | avg_fork_calls | avg_ctx_calls | avg_ctx_unfold | avg_ctx_fork | avg_ctx_unfold_then_fork | avg_finish_blocked | no_finish_rate |\n')
+        f.write('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
         for r in slice_summary:
-            f.write(f"| {r['task_slice']} | {r['method']} | {r['n']} | {r['accuracy']:.3f} | {r['avg_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_proof_docid_cov']:.3f} | {r['proof_complete_correct_rate']:.3f} | {r['avg_fork_calls']:.2f} | {r['avg_context_controller_calls']:.2f} | {r['avg_context_controller_unfold']:.2f} | {r['avg_context_controller_fork']:.2f} | {r['avg_context_controller_unfold_then_fork']:.2f} |\n")
+            f.write(f"| {r['task_slice']} | {r['method']} | {r['n']} | {r['accuracy']:.3f} | {r['avg_total_tokens']:.1f} | {r['avg_steps']:.1f} | {r['avg_docid_cov']:.3f} | {r['avg_proof_docid_cov']:.3f} | {r['proof_complete_correct_rate']:.3f} | {r['avg_fork_calls']:.2f} | {r['avg_context_controller_calls']:.2f} | {r['avg_context_controller_unfold']:.2f} | {r['avg_context_controller_fork']:.2f} | {r['avg_context_controller_unfold_then_fork']:.2f} | {r['avg_premature_finish_blocked']:.2f} | {r['no_finish_rate']:.3f} |\n")
 
     with open(analysis / 'phase19_recommendation.md', 'w', encoding='utf-8') as f:
         f.write('# Phase 19 Recommendation\n\n')

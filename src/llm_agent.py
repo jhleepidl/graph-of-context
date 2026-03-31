@@ -443,6 +443,7 @@ class ToolLoopLLMAgent:
         # Adaptive unfolding bookkeeping
         self._adaptive_unfold_calls: int = 0
         self._last_finish_block_reason: Optional[str] = None
+        self._last_finish_attempt: Optional[Dict[str, Any]] = None
 
         # Two-stage commit helpers
         self._q1_text: str = ""                       # extracted Q1 for multi-turn benches (if present)
@@ -1687,6 +1688,9 @@ class ToolLoopLLMAgent:
             'budget_utilization': float(budget_utilization),
             'search_calls': int(self.counters.get('search_calls', 0) or 0),
             'open_page_calls': int(self.counters.get('open_page_calls', 0) or 0),
+            'premature_finish_blocked_total': int(self.counters.get('premature_finish_blocked', 0) or 0),
+            'blocked_finish_active': bool(self._last_finish_block_reason),
+            'last_finish_block_reason': str(self._last_finish_block_reason or ''),
             'support_gap_score': float(support_gap_score),
             'missing_terms_count': int(len(missing_terms)),
             'missing_terms': list(missing_terms[:12]),
@@ -3879,6 +3883,157 @@ class ToolLoopLLMAgent:
         except Exception:
             pass
 
+    def _record_finish_block(self, reason: str) -> None:
+        reason_s = str(reason or "unknown_finish_block")
+        self.counters["premature_finish_blocked"] += 1
+        self.counters[f"finish_block_reason__{reason_s}"] += 1
+        self._last_finish_block_reason = reason_s
+
+    def _prompt_est_accum_payload(self) -> Dict[str, int]:
+        return {
+            "total": int(self.counters.get("prompt_est_total", 0)),
+            "system": int(self.counters.get("prompt_est_system", 0)),
+            "user_base": int(self.counters.get("prompt_est_user_base", 0)),
+            "followups": int(self.counters.get("prompt_est_followups", 0)),
+            "active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
+            "active_tool_lines": int(self.counters.get("prompt_est_active_tool_lines", 0)),
+            "active_obs_lines": int(self.counters.get("prompt_est_active_obs_lines", 0)),
+            "active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
+            "active_summary_lines": int(self.counters.get("prompt_est_active_summary_lines", 0)),
+            "active_meta_lines": int(self.counters.get("prompt_est_active_meta_lines", 0)),
+            "active_other_lines": int(self.counters.get("prompt_est_active_other_lines", 0)),
+        }
+
+    def _mem_event_stats_payload(self) -> Dict[str, int]:
+        return {
+            "fold_events": int(self.counters.get("mem_fold_events", 0)),
+            "fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
+            "fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
+            "unfold_events": int(self.counters.get("mem_unfold_events", 0)),
+            "unfold_added_tokens_est": int(self.counters.get("mem_unfold_added_tokens_est", 0)),
+            "rag_unfold_events": int(self.counters.get("mem_rag_unfold_events", 0)),
+            "pef_fold_events": int(self.counters.get("mem_pef_fold_events", 0)),
+            "pef_roll_fold_events": int(self.counters.get("mem_pef_roll_fold_events", 0)),
+        }
+
+    def _tool_stats_payload(self, *, top_rep: Optional[List[Tuple[str, int]]] = None) -> Dict[str, Any]:
+        if top_rep is None:
+            top_rep = self.search_query_counts.most_common(5)
+        return {
+            "tool_calls_proposed_total": int(self.counters.get("tool_calls_proposed_total", 0)),
+            "tool_calls_total": int(self.counters["tool_calls_total"]),
+            "search_calls": int(self.counters["search_calls"]),
+            "open_page_calls": int(self.counters["open_page_calls"]),
+            "open_page_cache_hits": int(self.counters.get("open_page_cache_hits", 0)),
+            "policy_overrides": int(self.counters.get("policy_overrides", 0)),
+            "constraints_written": int(self.counters.get("constraints_written", 0)),
+            "constraints_write_errors": int(self.counters.get("constraints_write_errors", 0)),
+            "duplicate_open_blocked": int(self.counters.get("duplicate_open_blocked", 0)),
+            "blocked_search_query": int(self.counters.get("blocked_search_query", 0)),
+            "unproductive_searches": int(self.counters.get("unproductive_searches", 0)),
+            "search_queries_cooled_down": int(self.counters.get("search_queries_cooled_down", 0)),
+            "candidate_first_overrides": int(self.counters.get("candidate_first_overrides", 0)),
+            "search_cycle_break_overrides": int(self.counters.get("search_cycle_break_overrides", 0)),
+            "adaptive_unfold_calls": int(self.counters.get("adaptive_unfold_calls", 0)),
+            "adaptive_unfold_activated_nodes": int(self.counters.get("adaptive_unfold_activated_nodes", 0)),
+            "adaptive_unfold_errors": int(self.counters.get("adaptive_unfold_errors", 0)),
+            "mode_switch_overrides": int(self.counters.get("mode_switch_overrides", 0)),
+            "return_calls": int(self.counters.get("tool_calls_return", 0)),
+            "return_in_main_ignored": int(self.counters.get("return_in_main_ignored", 0)),
+            "malformed_branch_args": int(self.counters.get("malformed_branch_args", 0)),
+            "malformed_return_args": int(self.counters.get("malformed_return_args", 0)),
+            "malformed_search_args": int(self.counters.get("malformed_search_args", 0)),
+            "malformed_open_page_args": int(self.counters.get("malformed_open_page_args", 0)),
+            "repeated_search_count": int(self.counters["repeated_search_count"]),
+            "unique_search_queries": int(len(self.search_query_counts)),
+            "top_repeated_queries": [{"query": q, "count": c} for q, c in top_rep if c >= 2],
+            "json_parse_failures": int(self.counters["json_parse_failures"]),
+            "json_recoveries": int(self.counters["json_recoveries"]),
+            "finish_answer_salvaged": int(self.counters.get("finish_answer_salvaged", 0)),
+            "finish_hotpot_json_salvaged": int(self.counters.get("finish_hotpot_json_salvaged", 0)),
+            "finish_hotpot_json_salvage_errors": int(self.counters.get("finish_hotpot_json_salvage_errors", 0)),
+            "context_controller_enabled": bool(getattr(self.cfg, "enable_context_controller", False)),
+            "context_controller_calls": int(self.counters.get("context_controller_calls", 0)),
+            "context_controller_executed": int(self.counters.get("context_controller_executed", 0)),
+            "context_controller_fork_blocked": int(self.counters.get("context_controller_fork_blocked", 0)),
+            "context_controller_none": int(self.counters.get("context_controller_none", 0)),
+            "context_controller_unfold": int(self.counters.get("context_controller_unfold", 0)),
+            "context_controller_fork": int(self.counters.get("context_controller_fork", 0)),
+            "context_controller_unfold_then_fork": int(self.counters.get("context_controller_unfold_then_fork", 0)),
+            "finish_docids_auto_appended": int(self.counters.get("finish_docids_auto_appended", 0)),
+            "finish_invalid_project_blocked": int(self.counters.get("finish_invalid_project_blocked", 0)),
+            "premature_finish_blocked": int(self.counters.get("premature_finish_blocked", 0)),
+            "last_finish_block_reason": str(self._last_finish_block_reason or ""),
+            "finish_block_reason_counts": {
+                str(k).replace("finish_block_reason__", ""): int(v)
+                for k, v in self.counters.items()
+                if str(k).startswith("finish_block_reason__")
+            },
+            "deadline_finish_from_structured_autofinish": int(self.counters.get("deadline_finish_from_structured_autofinish", 0)),
+            "deadline_finish_from_last_attempt": int(self.counters.get("deadline_finish_from_last_attempt", 0)),
+            "mem_fold_events": int(self.counters.get("mem_fold_events", 0)),
+            "mem_fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
+            "mem_fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
+            "mem_unfold_events": int(self.counters.get("mem_unfold_events", 0)),
+            "mem_unfold_added_tokens_est": int(self.counters.get("mem_unfold_added_tokens_est", 0)),
+            "mem_rag_unfold_events": int(self.counters.get("mem_rag_unfold_events", 0)),
+            "prompt_est_total": int(self.counters.get("prompt_est_total", 0)),
+            "prompt_est_active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
+            "prompt_est_active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
+            "fork_calls": int(self.counters.get("fork_calls", 0)),
+            "fork_tokens": int(self.counters.get("fork_tokens", 0)),
+            "fork_empty_view": int(self.counters.get("fork_empty_view", 0)),
+            "fork_errors": int(self.counters.get("fork_errors", 0)),
+            "fork_gate_checks": int(self.counters.get("fork_gate_checks", 0)),
+            "fork_gate_ready": int(self.counters.get("fork_gate_ready", 0)),
+            "fork_gate_blocked": int(self.counters.get("fork_gate_blocked", 0)),
+            "fork_gate_reason_counts": {
+                str(k).replace("fork_gate_reason__", ""): int(v)
+                for k, v in self.counters.items()
+                if str(k).startswith("fork_gate_reason__")
+            },
+            "fork_deferred": int(self.counters.get("fork_deferred", 0)),
+            "proof_closure_fork_verify_attempts": int(self.counters.get("proof_closure_fork_verify_attempts", 0)),
+            "proof_closure_fork_verify_calls": int(self.counters.get("proof_closure_fork_verify_calls", 0)),
+            "proof_closure_fork_verify_no_result": int(self.counters.get("proof_closure_fork_verify_no_result", 0)),
+            "proof_closure_fork_verify_errors": int(self.counters.get("proof_closure_fork_verify_errors", 0)),
+            "proof_closure_fork_verify_skipped_slice": int(self.counters.get("proof_closure_fork_verify_skipped_slice", 0)),
+            "proof_closure_fork_verify_skipped_low_severity": int(self.counters.get("proof_closure_fork_verify_skipped_low_severity", 0)),
+            "proof_closure_fork_verify_skipped_not_stuck": int(self.counters.get("proof_closure_fork_verify_skipped_not_stuck", 0)),
+            "proof_closure_repair_calls": int(self.counters.get("proof_closure_repair_calls", 0)),
+            "proof_closure_repair_searches": int(self.counters.get("proof_closure_repair_searches", 0)),
+            "proof_closure_repair_opens": int(self.counters.get("proof_closure_repair_opens", 0)),
+            "proof_closure_repair_no_progress": int(self.counters.get("proof_closure_repair_no_progress", 0)),
+            "proof_closure_repair_skipped_slice": int(self.counters.get("proof_closure_repair_skipped_slice", 0)),
+            "proof_closure_repair_skipped_not_ready": int(self.counters.get("proof_closure_repair_skipped_not_ready", 0)),
+            "proof_closure_repair_no_query": int(self.counters.get("proof_closure_repair_no_query", 0)),
+            "forced_finish": int(self.counters.get("forced_finish", 0)),
+        }
+
+    def _build_result_payload(
+        self,
+        *,
+        answer: str,
+        explanation: str,
+        confidence: str,
+        steps: int,
+        elapsed: float,
+        top_rep: Optional[List[Tuple[str, int]]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "answer": str(answer or ""),
+            "explanation": str(explanation or ""),
+            "confidence": str(confidence or ""),
+            "evidence_docids": list(self.evidence_docids),
+            "active_context": self.mem.get_active_text(),
+            "usage": dict(self.usage_accum),
+            "prompt_est_accum": self._prompt_est_accum_payload(),
+            "mem_event_stats": self._mem_event_stats_payload(),
+            "steps": int(steps),
+            "elapsed_sec": float(elapsed),
+            "tool_stats": self._tool_stats_payload(top_rep=top_rep),
+        }
+
     def _json_recovery_prompt(self) -> str:
         return (
             "Your previous message was invalid. Output exactly ONE JSON object and NOTHING else.\n"
@@ -4179,6 +4334,7 @@ class ToolLoopLLMAgent:
         self._adaptive_unfold_calls = 0
         self._forced_unfold_done = False
         self._last_finish_block_reason = None
+        self._last_finish_attempt = None
 
         self._open_trace(run_tag=run_tag, method=method, task_id=task_id)
         self._open_internal_graph_log(task_id=task_id)
@@ -6074,8 +6230,7 @@ class ToolLoopLLMAgent:
 
                     # Multi-turn tasks: do not allow finishing before follow-up turns are delivered.
                     if pending_user_turns:
-                        self.counters["premature_finish_blocked"] += 1
-                        self._last_finish_block_reason = "pending_user_turns"
+                        self._record_finish_block("pending_user_turns")
                         _fb_msg = "[SYSTEM] finish blocked: there is a follow-up user message pending. Call `return` to receive it."
                         if (not commit_flow) and bool(auto_inject_enabled):
                             _fb_msg = _fb_msg + " (or continue until it is auto-injected)."
@@ -6086,8 +6241,7 @@ class ToolLoopLLMAgent:
                         continue
 
                     if (step + 1) < int(self.cfg.min_steps_before_finish):
-                        self.counters["premature_finish_blocked"] += 1
-                        self._last_finish_block_reason = "min_steps"
+                        self._record_finish_block("min_steps")
                         self.mem.record_msg(
                             f"[SYSTEM] finish blocked: need at least {self.cfg.min_steps_before_finish} steps. "
                             "Next call should be search/open_page."
@@ -6098,8 +6252,7 @@ class ToolLoopLLMAgent:
                         continue
 
                     if open_calls < int(self.cfg.min_open_pages_before_finish):
-                        self.counters["premature_finish_blocked"] += 1
-                        self._last_finish_block_reason = "no_open_page"
+                        self._record_finish_block("no_open_page")
                         self.mem.record_msg(
                             f"[SYSTEM] finish blocked: need at least {self.cfg.min_open_pages_before_finish} open_page calls for evidence. "
                             "Next call MUST be search -> open_page."
@@ -6159,8 +6312,7 @@ class ToolLoopLLMAgent:
                             ans = pair
                             args["answer"] = ans
                         else:
-                            self.counters["premature_finish_blocked"] += 1
-                            self._last_finish_block_reason = "project_city_pair_format"
+                            self._record_finish_block("project_city_pair_format")
                             self.mem.record_msg(
                                 "[SYSTEM] finish blocked: answer must contain a parseable '<Project_####> | <City_#>' pair. "
                                 "If your explanation already identifies the winner, put ONLY that pair into finish.args.answer."
@@ -6186,8 +6338,7 @@ class ToolLoopLLMAgent:
                             selected_proj = dep_status.get("selected_project")
                             selected_city = dep_status.get("selected_approval_city")
                             if unresolved or missing_profiles:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "structured_dependency_incomplete"
+                                self._record_finish_block("structured_dependency_incomplete")
                                 msg = "[SYSTEM] finish blocked: for this dependency task, resolve EVERY candidate handle and open EVERY candidate OFFICIAL PROFILE before answering."
                                 if unresolved:
                                     msg += f" Still unresolved: {', '.join(unresolved[:3])}."
@@ -6198,22 +6349,19 @@ class ToolLoopLLMAgent:
                             pair_proj = normalize_project_city_pair(ans).split(" | ")[0] if normalize_project_city_pair(ans) else None
                             pair_city = normalize_project_city_pair(ans).split(" | ")[1] if normalize_project_city_pair(ans) else None
                             if selected_proj and pair_proj and pair_proj != selected_proj:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "structured_dependency_wrong_project"
+                                self._record_finish_block("structured_dependency_wrong_project")
                                 self.mem.record_msg(
                                     f"[SYSTEM] finish blocked: comparing parsed OFFICIAL PROFILE start_year values, the earliest candidate project is {selected_proj}. Re-check the comparison before answering."
                                 )
                                 continue
                             if selected_proj and not selected_city:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "structured_dependency_missing_approval"
+                                self._record_finish_block("structured_dependency_missing_approval")
                                 self.mem.record_msg(
                                     f"[SYSTEM] finish blocked: you still need the OPERATING CITY APPROVAL for {selected_proj}. Do not use headquarters as the final operating city."
                                 )
                                 continue
                             if selected_proj and selected_city and pair_city and pair_city != selected_city:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "structured_dependency_wrong_city"
+                                self._record_finish_block("structured_dependency_wrong_city")
                                 self.mem.record_msg(
                                     f"[SYSTEM] finish blocked: the approved current operating city for {selected_proj} from opened evidence is {selected_city}. Do not answer with headquarters or a stale city."
                                 )
@@ -6234,8 +6382,7 @@ class ToolLoopLLMAgent:
                             pair_proj = pair_norm.split(" | ")[0] if pair_norm else None
                             pair_city = pair_norm.split(" | ")[1] if pair_norm else None
                             if unresolved or missing_profiles:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "proof_closure_incomplete_candidates"
+                                self._record_finish_block("proof_closure_incomplete_candidates")
                                 msg = "[SYSTEM] finish blocked: this proof-closure task requires resolving the candidate set before answering."
                                 if unresolved:
                                     msg += f" Still unresolved: {', '.join(unresolved[:3])}."
@@ -6244,8 +6391,7 @@ class ToolLoopLLMAgent:
                                 self.mem.record_msg(msg)
                                 continue
                             if missing_support_types or missing_proof_docids:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "proof_closure_missing_support"
+                                self._record_finish_block("proof_closure_missing_support")
                                 msg = "[SYSTEM] finish blocked: you have not opened the full support chain needed for a proof-complete answer."
                                 if missing_support_types:
                                     msg += f" Still missing support types for {selected_proj}: {', '.join(missing_support_types[:3])}."
@@ -6254,15 +6400,13 @@ class ToolLoopLLMAgent:
                                 self.mem.record_msg(msg)
                                 continue
                             if selected_proj and pair_proj and pair_proj != selected_proj:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "proof_closure_wrong_project"
+                                self._record_finish_block("proof_closure_wrong_project")
                                 self.mem.record_msg(
                                     f"[SYSTEM] finish blocked: from the opened candidate profiles, the selected project should be {selected_proj}. Re-check the comparison before answering."
                                 )
                                 continue
                             if selected_proj and selected_city and pair_city and pair_city != selected_city:
-                                self.counters["premature_finish_blocked"] += 1
-                                self._last_finish_block_reason = "proof_closure_wrong_city"
+                                self._record_finish_block("proof_closure_wrong_city")
                                 self.mem.record_msg(
                                     f"[SYSTEM] finish blocked: the current-support chain for {selected_proj} yields {selected_city}. Do not answer with a stale or unsupported city."
                                 )
@@ -6348,8 +6492,7 @@ class ToolLoopLLMAgent:
                                     })
                                 else:
                                     # If we cannot salvage (no anchor), block and reprompt.
-                                    self.counters["premature_finish_blocked"] += 1
-                                    self._last_finish_block_reason = "finish_answer_schema"
+                                    self._record_finish_block("finish_answer_schema")
                                     self.mem.record_msg(
                                         "[SYSTEM] finish blocked: for HotpotQA, finish.args.answer MUST be JSON with keys {a1, supporting_titles} and no extra text. "
                                         "Example: {\"a1\":\"yes\",\"supporting_titles\":[\"Title1\",\"Title2\"]}."
@@ -6565,9 +6708,16 @@ class ToolLoopLLMAgent:
                             args["answer"] = ans
                             self.counters["finish_answer_salvaged"] += 1
 
+                    if ans:
+                        self._last_finish_attempt = {
+                            "answer": str(ans),
+                            "explanation": str(expl0 or args.get("explanation", "") or ""),
+                            "confidence": str(args.get("confidence", "") or ""),
+                            "step": int(step),
+                        }
+
                     if not ans:
-                        self.counters["premature_finish_blocked"] += 1
-                        self._last_finish_block_reason = "empty_answer"
+                        self._record_finish_block("empty_answer")
                         self.mem.record_msg("[SYSTEM] finish blocked: empty answer. Put the final answer into finish.args.answer (a non-empty short string).")
                         self.mem.record_msg('[SYSTEM] Example: {"tool":"finish","args":{"answer":"<SHORT ANSWER>","explanation":"Evidence docids: D_TRUTH_0001"}}')
                         self._trace({"type": "finish_blocked", "task_id": task_id, "method": method, "run_tag": run_tag, "step": step, "reason": "empty_answer"})
@@ -6621,8 +6771,7 @@ class ToolLoopLLMAgent:
                                     self.counters["finish_docids_auto_appended"] += 1
                                 else:
                                     # Fallback: block if we truly have no evidence docids recorded.
-                                    self.counters["premature_finish_blocked"] += 1
-                                    self._last_finish_block_reason = "missing_docids_no_evidence"
+                                    self._record_finish_block("missing_docids_no_evidence")
                                     self.mem.record_msg("[SYSTEM] finish blocked: explanation missing evidence docids. Cite docids from open_page.")
                                     self.mem.record_msg("[SYSTEM] You attempted to finish without evidence docids, and no opened docids were recorded. Call open_page first.")
                                     self._trace({"type": "finish_blocked", "task_id": task_id, "method": method, "run_tag": run_tag, "step": step, "reason": "missing_docids_no_evidence"})
@@ -6636,119 +6785,14 @@ class ToolLoopLLMAgent:
                     # Drain memory events that may have been buffered before finishing
                     self._drain_mem_events(task_id, method, run_tag, step)
 
-                    result = {
-                        "answer": args.get("answer", ""),
-                        "explanation": args.get("explanation", ""),
-                        "confidence": args.get("confidence", ""),
-                        "evidence_docids": list(self.evidence_docids),
-                        "active_context": self.mem.get_active_text(),
-                        "usage": dict(self.usage_accum),
-                        "prompt_est_accum": {
-                            "total": int(self.counters.get("prompt_est_total", 0)),
-                            "system": int(self.counters.get("prompt_est_system", 0)),
-                            "user_base": int(self.counters.get("prompt_est_user_base", 0)),
-                            "followups": int(self.counters.get("prompt_est_followups", 0)),
-                            "active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
-                            "active_tool_lines": int(self.counters.get("prompt_est_active_tool_lines", 0)),
-                            "active_obs_lines": int(self.counters.get("prompt_est_active_obs_lines", 0)),
-                            "active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
-                            "active_summary_lines": int(self.counters.get("prompt_est_active_summary_lines", 0)),
-                            "active_meta_lines": int(self.counters.get("prompt_est_active_meta_lines", 0)),
-                            "active_other_lines": int(self.counters.get("prompt_est_active_other_lines", 0)),
-                        },
-                        "mem_event_stats": {
-                            "fold_events": int(self.counters.get("mem_fold_events", 0)),
-                            "fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
-                            "fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
-                            "unfold_events": int(self.counters.get("mem_unfold_events", 0)),
-                            "unfold_added_tokens_est": int(self.counters.get("mem_unfold_added_tokens_est", 0)),
-                            "rag_unfold_events": int(self.counters.get("mem_rag_unfold_events", 0)),
-                            "pef_fold_events": int(self.counters.get("mem_pef_fold_events", 0)),
-                            "pef_roll_fold_events": int(self.counters.get("mem_pef_roll_fold_events", 0)),
-                        },
-                        "steps": step + 1,
-                        "elapsed_sec": elapsed,
-                        "tool_stats": {
-                            "tool_calls_proposed_total": int(self.counters.get("tool_calls_proposed_total", 0)),
-                            "tool_calls_total": int(self.counters["tool_calls_total"]),
-                            "search_calls": int(self.counters["search_calls"]),
-                            "open_page_calls": int(self.counters["open_page_calls"]),
-                            "open_page_cache_hits": int(self.counters.get("open_page_cache_hits", 0)),
-                            "policy_overrides": int(self.counters.get("policy_overrides", 0)),
-                            "constraints_written": int(self.counters.get("constraints_written", 0)),
-                            "constraints_write_errors": int(self.counters.get("constraints_write_errors", 0)),
-                            "duplicate_open_blocked": int(self.counters.get("duplicate_open_blocked", 0)),
-                            "blocked_search_query": int(self.counters.get("blocked_search_query", 0)),
-                            "unproductive_searches": int(self.counters.get("unproductive_searches", 0)),
-                            "search_queries_cooled_down": int(self.counters.get("search_queries_cooled_down", 0)),
-                            "candidate_first_overrides": int(self.counters.get("candidate_first_overrides", 0)),
-                            "search_cycle_break_overrides": int(self.counters.get("search_cycle_break_overrides", 0)),
-                            "adaptive_unfold_calls": int(self.counters.get("adaptive_unfold_calls", 0)),
-                            "adaptive_unfold_activated_nodes": int(self.counters.get("adaptive_unfold_activated_nodes", 0)),
-                            "adaptive_unfold_errors": int(self.counters.get("adaptive_unfold_errors", 0)),
-                            "mode_switch_overrides": int(self.counters.get("mode_switch_overrides", 0)),
-                            "return_calls": int(self.counters.get("tool_calls_return", 0)),
-                            "return_in_main_ignored": int(self.counters.get("return_in_main_ignored", 0)),
-                            "malformed_branch_args": int(self.counters.get("malformed_branch_args", 0)),
-                            "malformed_return_args": int(self.counters.get("malformed_return_args", 0)),
-                            "malformed_search_args": int(self.counters.get("malformed_search_args", 0)),
-                            "malformed_open_page_args": int(self.counters.get("malformed_open_page_args", 0)),
-                            "repeated_search_count": int(self.counters["repeated_search_count"]),
-                            "unique_search_queries": int(len(self.search_query_counts)),
-                            "top_repeated_queries": [{"query": q, "count": c} for q, c in top_rep if c >= 2],
-                            "json_parse_failures": int(self.counters["json_parse_failures"]),
-                            "json_recoveries": int(self.counters["json_recoveries"]),
-                            "finish_answer_salvaged": int(self.counters.get("finish_answer_salvaged", 0)),
-                            "finish_hotpot_json_salvaged": int(self.counters.get("finish_hotpot_json_salvaged", 0)),
-                            "finish_hotpot_json_salvage_errors": int(self.counters.get("finish_hotpot_json_salvage_errors", 0)),
-                            "context_controller_enabled": bool(getattr(self.cfg, "enable_context_controller", False)),
-                            "context_controller_calls": int(self.counters.get("context_controller_calls", 0)),
-                            "context_controller_none": int(self.counters.get("context_controller_none", 0)),
-                            "context_controller_unfold": int(self.counters.get("context_controller_unfold", 0)),
-                            "context_controller_fork": int(self.counters.get("context_controller_fork", 0)),
-                            "context_controller_unfold_then_fork": int(self.counters.get("context_controller_unfold_then_fork", 0)),
-                            "finish_docids_auto_appended": int(self.counters.get("finish_docids_auto_appended", 0)),
-                            "finish_invalid_project_blocked": int(self.counters.get("finish_invalid_project_blocked", 0)),
-                            "premature_finish_blocked": int(self.counters.get("premature_finish_blocked", 0)),
-                            "mem_fold_events": int(self.counters.get("mem_fold_events", 0)),
-                            "mem_fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
-                            "mem_fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
-                            "mem_unfold_events": int(self.counters.get("mem_unfold_events", 0)),
-                            "mem_unfold_added_tokens_est": int(self.counters.get("mem_unfold_added_tokens_est", 0)),
-                            "mem_rag_unfold_events": int(self.counters.get("mem_rag_unfold_events", 0)),
-                            "prompt_est_total": int(self.counters.get("prompt_est_total", 0)),
-                            "prompt_est_active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
-                            "prompt_est_active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
-                            "fork_calls": int(self.counters.get("fork_calls", 0)),
-                            "fork_tokens": int(self.counters.get("fork_tokens", 0)),
-                            "fork_empty_view": int(self.counters.get("fork_empty_view", 0)),
-                            "fork_errors": int(self.counters.get("fork_errors", 0)),
-                            "fork_gate_checks": int(self.counters.get("fork_gate_checks", 0)),
-                            "fork_gate_ready": int(self.counters.get("fork_gate_ready", 0)),
-                            "fork_gate_blocked": int(self.counters.get("fork_gate_blocked", 0)),
-                            "fork_gate_reason_counts": {
-                                str(k).replace("fork_gate_reason__", ""): int(v)
-                                for k, v in self.counters.items()
-                                if str(k).startswith("fork_gate_reason__")
-                            },
-                            "fork_deferred": int(self.counters.get("fork_deferred", 0)),
-                            "proof_closure_fork_verify_attempts": int(self.counters.get("proof_closure_fork_verify_attempts", 0)),
-                            "proof_closure_fork_verify_calls": int(self.counters.get("proof_closure_fork_verify_calls", 0)),
-                            "proof_closure_fork_verify_no_result": int(self.counters.get("proof_closure_fork_verify_no_result", 0)),
-                            "proof_closure_fork_verify_errors": int(self.counters.get("proof_closure_fork_verify_errors", 0)),
-                            "proof_closure_fork_verify_skipped_slice": int(self.counters.get("proof_closure_fork_verify_skipped_slice", 0)),
-                            "proof_closure_fork_verify_skipped_low_severity": int(self.counters.get("proof_closure_fork_verify_skipped_low_severity", 0)),
-                            "proof_closure_fork_verify_skipped_not_stuck": int(self.counters.get("proof_closure_fork_verify_skipped_not_stuck", 0)),
-                            "proof_closure_repair_calls": int(self.counters.get("proof_closure_repair_calls", 0)),
-                            "proof_closure_repair_searches": int(self.counters.get("proof_closure_repair_searches", 0)),
-                            "proof_closure_repair_opens": int(self.counters.get("proof_closure_repair_opens", 0)),
-                            "proof_closure_repair_no_progress": int(self.counters.get("proof_closure_repair_no_progress", 0)),
-                            "proof_closure_repair_skipped_slice": int(self.counters.get("proof_closure_repair_skipped_slice", 0)),
-                            "proof_closure_repair_skipped_not_ready": int(self.counters.get("proof_closure_repair_skipped_not_ready", 0)),
-                            "proof_closure_repair_no_query": int(self.counters.get("proof_closure_repair_no_query", 0)),
-
-                        }
-                    }
+                    result = self._build_result_payload(
+                        answer=args.get("answer", ""),
+                        explanation=args.get("explanation", ""),
+                        confidence=args.get("confidence", ""),
+                        steps=step + 1,
+                        elapsed=elapsed,
+                        top_rep=top_rep,
+                    )
                     self._trace({"type": "finish", "task_id": task_id, "method": method, "run_tag": run_tag, "step": step, "result": {
                         "answer": result["answer"],
                         "explanation": result["explanation"][:2000],
@@ -6777,91 +6821,61 @@ class ToolLoopLLMAgent:
             # Drain any remaining memory events
             self._drain_mem_events(task_id, method, run_tag, step=self.cfg.max_steps)
 
-            result = {
-                "answer": "",
-                "explanation": "max_steps reached (no finish)",
-                "confidence": "0%",
-                "evidence_docids": list(self.evidence_docids),
-                "active_context": self.mem.get_active_text(),
-                "usage": dict(self.usage_accum),
-                        "prompt_est_accum": {
-                            "total": int(self.counters.get("prompt_est_total", 0)),
-                            "system": int(self.counters.get("prompt_est_system", 0)),
-                            "user_base": int(self.counters.get("prompt_est_user_base", 0)),
-                            "followups": int(self.counters.get("prompt_est_followups", 0)),
-                            "active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
-                            "active_tool_lines": int(self.counters.get("prompt_est_active_tool_lines", 0)),
-                            "active_obs_lines": int(self.counters.get("prompt_est_active_obs_lines", 0)),
-                            "active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
-                            "active_summary_lines": int(self.counters.get("prompt_est_active_summary_lines", 0)),
-                            "active_meta_lines": int(self.counters.get("prompt_est_active_meta_lines", 0)),
-                            "active_other_lines": int(self.counters.get("prompt_est_active_other_lines", 0)),
-                        },
-                        "mem_event_stats": {
-                            "fold_events": int(self.counters.get("mem_fold_events", 0)),
-                            "fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
-                            "fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
-                            "unfold_events": int(self.counters.get("mem_unfold_events", 0)),
-                            "unfold_added_tokens_est": int(self.counters.get("mem_unfold_added_tokens_est", 0)),
-                            "rag_unfold_events": int(self.counters.get("mem_rag_unfold_events", 0)),
-                            "pef_fold_events": int(self.counters.get("mem_pef_fold_events", 0)),
-                            "pef_roll_fold_events": int(self.counters.get("mem_pef_roll_fold_events", 0)),
-                        },
-                "steps": self.cfg.max_steps,
-                "elapsed_sec": elapsed,
-                "tool_stats": {
-                    "tool_calls_proposed_total": int(self.counters.get("tool_calls_proposed_total", 0)),
-                    "tool_calls_total": int(self.counters["tool_calls_total"]),
-                    "search_calls": int(self.counters["search_calls"]),
-                    "open_page_calls": int(self.counters["open_page_calls"]),
-                    "open_page_cache_hits": int(self.counters.get("open_page_cache_hits", 0)),
-                    "policy_overrides": int(self.counters.get("policy_overrides", 0)),
-                    "constraints_written": int(self.counters.get("constraints_written", 0)),
-                    "constraints_write_errors": int(self.counters.get("constraints_write_errors", 0)),
-                    "duplicate_open_blocked": int(self.counters.get("duplicate_open_blocked", 0)),
-                    "blocked_search_query": int(self.counters.get("blocked_search_query", 0)),
-                    "unproductive_searches": int(self.counters.get("unproductive_searches", 0)),
-                    "search_queries_cooled_down": int(self.counters.get("search_queries_cooled_down", 0)),
-                    "candidate_first_overrides": int(self.counters.get("candidate_first_overrides", 0)),
-                    "search_cycle_break_overrides": int(self.counters.get("search_cycle_break_overrides", 0)),
-                    "adaptive_unfold_calls": int(self.counters.get("adaptive_unfold_calls", 0)),
-                    "adaptive_unfold_activated_nodes": int(self.counters.get("adaptive_unfold_activated_nodes", 0)),
-                    "adaptive_unfold_errors": int(self.counters.get("adaptive_unfold_errors", 0)),
-                    "mode_switch_overrides": int(self.counters.get("mode_switch_overrides", 0)),
-                    "repeated_search_count": int(self.counters["repeated_search_count"]),
-                    "unique_search_queries": int(len(self.search_query_counts)),
-                    "top_repeated_queries": [{"query": q, "count": c} for q, c in top_rep if c >= 2],
-                    "json_parse_failures": int(self.counters["json_parse_failures"]),
-                    "json_recoveries": int(self.counters["json_recoveries"]),
-                    "context_controller_enabled": bool(getattr(self.cfg, "enable_context_controller", False)),
-                    "context_controller_calls": int(self.counters.get("context_controller_calls", 0)),
-                    "context_controller_none": int(self.counters.get("context_controller_none", 0)),
-                    "context_controller_unfold": int(self.counters.get("context_controller_unfold", 0)),
-                    "context_controller_fork": int(self.counters.get("context_controller_fork", 0)),
-                    "context_controller_unfold_then_fork": int(self.counters.get("context_controller_unfold_then_fork", 0)),
-                    "premature_finish_blocked": int(self.counters.get("premature_finish_blocked", 0)),
-                            "mem_fold_events": int(self.counters.get("mem_fold_events", 0)),
-                            "mem_fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
-                            "mem_fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
-                            "mem_unfold_events": int(self.counters.get("mem_unfold_events", 0)),
-                            "mem_unfold_added_tokens_est": int(self.counters.get("mem_unfold_added_tokens_est", 0)),
-                            "mem_rag_unfold_events": int(self.counters.get("mem_rag_unfold_events", 0)),
-                            "prompt_est_total": int(self.counters.get("prompt_est_total", 0)),
-                            "prompt_est_active_context_total": int(self.counters.get("prompt_est_active_context_total", 0)),
-                            "prompt_est_active_noise_lines": int(self.counters.get("prompt_est_active_noise_lines", 0)),
+            no_finish_answer = ""
+            no_finish_explanation = "max_steps reached (no finish)"
+            no_finish_confidence = "0%"
 
-                },
-            }
-            # Attempt best-effort auto-finish using ONLY opened evidence
+            # Attempt best-effort auto-finish using ONLY opened evidence.
             if self.cfg.force_finish_on_deadline and self.counters.get("open_page_calls", 0) >= 1:
                 ans, expl = self._try_autofinish(user_question, task_meta=task_meta)
                 if ans:
-                    result["answer"] = ans
-                    result["explanation"] = expl or result.get("explanation", "")
-                    result["confidence"] = "auto"
+                    no_finish_answer = ans
+                    no_finish_explanation = expl or no_finish_explanation
+                    no_finish_confidence = "auto"
                     self.counters["forced_finish"] += 1
+                    self.counters["deadline_finish_from_structured_autofinish"] += 1
                     self._trace({"type":"forced_finish","task_id":task_id,"method":method,"run_tag":run_tag,"step":self.cfg.max_steps,"answer":ans})
 
+            if not no_finish_answer and isinstance(self._last_finish_attempt, dict):
+                last_reason = str(self._last_finish_block_reason or "")
+                soft_block_reasons = {
+                    "missing_docids_no_evidence",
+                    "finish_answer_schema",
+                    "project_city_pair_format",
+                }
+                last_answer = str(self._last_finish_attempt.get("answer") or "").strip()
+                if last_answer and last_reason in soft_block_reasons:
+                    last_expl = str(self._last_finish_attempt.get("explanation") or "").strip()
+                    if self.cfg.require_docids_in_finish:
+                        cited = re.findall(r"\bD_[A-Z0-9_\-]+\b", last_expl or "")
+                        valid = set(self.evidence_docids) | set(self.opened_cache.keys())
+                        has_valid = any(d in valid for d in cited)
+                        if (not has_valid) and self.evidence_docids:
+                            tail = ", ".join(self.evidence_docids[-3:])
+                            last_expl = (last_expl + "\n" if last_expl else "") + f"Evidence docids: {tail}"
+                    no_finish_answer = last_answer
+                    no_finish_explanation = last_expl or no_finish_explanation
+                    no_finish_confidence = str(self._last_finish_attempt.get("confidence") or "auto")
+                    self.counters["forced_finish"] += 1
+                    self.counters["deadline_finish_from_last_attempt"] += 1
+                    self._trace({
+                        "type": "forced_finish_from_last_attempt",
+                        "task_id": task_id,
+                        "method": method,
+                        "run_tag": run_tag,
+                        "step": self.cfg.max_steps,
+                        "last_finish_block_reason": last_reason,
+                        "answer": no_finish_answer,
+                    })
+
+            result = self._build_result_payload(
+                answer=no_finish_answer,
+                explanation=no_finish_explanation,
+                confidence=no_finish_confidence,
+                steps=self.cfg.max_steps,
+                elapsed=elapsed,
+                top_rep=top_rep,
+            )
             self._trace({"type": "finish", "task_id": task_id, "method": method, "run_tag": run_tag, "step": self.cfg.max_steps, "result": result})
             if self.cfg.verbose:
                 print(f"[{run_tag}][{method}][{task_id}] NO_FINISH steps={result['steps']} tok={result['usage'].get('total_tokens')} tools={result['tool_stats']['tool_calls_total']} elapsed={elapsed:.1f}s")
