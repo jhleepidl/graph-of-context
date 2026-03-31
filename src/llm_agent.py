@@ -337,6 +337,8 @@ class ToolLoopConfig:
     # Logging truncation (does NOT affect the prompt when prompt_context_chars==0).
     log_context_chars: int = 2500         # tail included in traces/logs
     log_output_chars: int = 4000          # truncate long model outputs in trace
+    step_debug_trace: bool = True         # emit compact per-step state snapshots into trace JSONL
+    step_debug_max_list_items: int = 8    # cap list payload size inside debug snapshots
 
 class ToolLoopLLMAgent:
     """Tool-using agent (JSON-only protocol) with robust parsing and optional tracing.
@@ -443,6 +445,7 @@ class ToolLoopLLMAgent:
         # Adaptive unfolding bookkeeping
         self._adaptive_unfold_calls: int = 0
         self._last_finish_block_reason: Optional[str] = None
+        self._last_nonempty_finish_block_reason: Optional[str] = None
         self._last_finish_attempt: Optional[Dict[str, Any]] = None
 
         # Two-stage commit helpers
@@ -468,6 +471,7 @@ class ToolLoopLLMAgent:
         self._trace_path: Optional[Path] = None
         self._internal_graph_fp = None
         self._internal_graph_path: Optional[Path] = None
+        self._trace_event_count: int = 0
 
     def _open_trace(self, run_tag: str, method: str, task_id: str):
         if not self.cfg.log_dir:
@@ -477,6 +481,7 @@ class ToolLoopLLMAgent:
         safe = re.sub(r"[^a-zA-Z0-9_\-]+", "_", f"{run_tag}_{method}_{task_id}")
         self._trace_path = log_dir / f"trace_{safe}.jsonl"
         self._trace_fp = open(self._trace_path, "w", encoding="utf-8")
+        self._trace_event_count = 0
         # write one meta line for version/debug
         self._trace({
             "type": "run_meta",
@@ -498,6 +503,121 @@ class ToolLoopLLMAgent:
             return
         self._trace_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
         self._trace_fp.flush()
+        self._trace_event_count += 1
+
+    def _debug_preview(self, value: Any, *, max_chars: int = 240) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            s = value.strip()
+            return s[:max_chars]
+        if isinstance(value, (list, tuple)):
+            lim = max(1, int(getattr(self.cfg, 'step_debug_max_list_items', 8) or 8))
+            return [self._debug_preview(v, max_chars=max_chars) for v in list(value)[:lim]]
+        if isinstance(value, dict):
+            out = {}
+            for k, v in list(value.items())[: max(1, int(getattr(self.cfg, 'step_debug_max_list_items', 8) or 8))]:
+                out[str(k)] = self._debug_preview(v, max_chars=max_chars)
+            return out
+        return str(value)[:max_chars]
+
+    def _trace_step_snapshot(
+        self,
+        *,
+        task_id: str,
+        method: str,
+        run_tag: str,
+        step: int,
+        phase: str,
+        current_user_prompt: str = '',
+        task_meta: Optional[Dict[str, Any]] = None,
+        proposed_tool: Optional[str] = None,
+        executed_tool: Optional[str] = None,
+        args: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self._trace_fp or not bool(getattr(self.cfg, 'step_debug_trace', True)):
+            return
+        active_text = ''
+        active_tokens = 0
+        try:
+            active_text = str(self.mem.get_active_text() if hasattr(self.mem, 'get_active_text') else '')
+            active_tokens = int(approx_token_count(active_text)) if active_text else 0
+        except Exception:
+            active_tokens = 0
+        opened_docids = [str(d) for d in self.opened_cache.keys() if str(d)]
+        evidence_docids = [str(d) for d in self.evidence_docids if str(d)]
+        lim = max(1, int(getattr(self.cfg, 'step_debug_max_list_items', 8) or 8))
+        payload: Dict[str, Any] = {
+            'type': 'step_debug',
+            'task_id': task_id,
+            'method': method,
+            'run_tag': run_tag,
+            'step': int(step),
+            'phase': str(phase),
+            'current_user_prompt_head': str(current_user_prompt or '')[:240],
+            'proposed_tool': str(proposed_tool or ''),
+            'executed_tool': str(executed_tool or ''),
+            'args_preview': self._debug_preview(args or {}, max_chars=240),
+            'active_tokens_est': int(active_tokens),
+            'active_context_tail': active_text[-min(len(active_text), int(getattr(self.cfg, 'log_context_chars', 2500) or 2500), 900):] if active_text else '',
+            'search_calls': int(self.counters.get('search_calls', 0) or 0),
+            'open_page_calls': int(self.counters.get('open_page_calls', 0) or 0),
+            'fork_calls': int(self.counters.get('fork_calls', 0) or 0),
+            'context_controller_calls': int(self.counters.get('context_controller_calls', 0) or 0),
+            'context_controller_none': int(self.counters.get('context_controller_none', 0) or 0),
+            'context_controller_unfold': int(self.counters.get('context_controller_unfold', 0) or 0),
+            'context_controller_fork': int(self.counters.get('context_controller_fork', 0) or 0),
+            'context_controller_unfold_then_fork': int(self.counters.get('context_controller_unfold_then_fork', 0) or 0),
+            'premature_finish_blocked': int(self.counters.get('premature_finish_blocked', 0) or 0),
+            'active_finish_block_reason': str(self._last_finish_block_reason or ''),
+            'last_finish_block_reason': str(self._last_nonempty_finish_block_reason or self._last_finish_block_reason or ''),
+            'last_finish_attempt': self._debug_preview(self._last_finish_attempt or {}, max_chars=240),
+            'last_progress_step': int(self._last_progress_step or 0),
+            'last_exec_tool': str(self._last_exec_tool or ''),
+            'exec_tool_streak': int(self._exec_tool_streak or 0),
+            'opened_docids_tail': opened_docids[-lim:],
+            'evidence_docids_tail': evidence_docids[-lim:],
+            'trace_events_written_so_far': int(self._trace_event_count or 0),
+        }
+        if task_meta:
+            payload['task_slice'] = str(task_meta.get('task_slice') or '')
+            payload['decision_requires_support_closure'] = bool(task_meta.get('decision_requires_support_closure'))
+            payload['target_project'] = str(task_meta.get('target_project') or '')
+            if self._is_support_closure_task(task_meta):
+                try:
+                    status = self._structured_support_closure_status(task_meta)
+                    payload['support_closure_status'] = {
+                        'selected_project': status.get('selected_project'),
+                        'selected_city': status.get('selected_city'),
+                        'selected_approval_city': status.get('selected_approval_city'),
+                        'selected_exception_city': status.get('selected_exception_city'),
+                        'selected_revoked': bool(status.get('selected_revoked')),
+                        'unresolved_handles': list(status.get('unresolved_handles') or [])[:lim],
+                        'missing_profiles': list(status.get('missing_profiles') or [])[:lim],
+                        'missing_support_types': list(status.get('missing_support_types') or [])[:lim],
+                        'missing_proof_docids': list(status.get('missing_proof_docids') or [])[:lim],
+                        'proof_docid_cov': float(status.get('proof_docid_cov') or 0.0),
+                    }
+                except Exception as e:
+                    payload['support_closure_status_error'] = str(e)[:160]
+            else:
+                try:
+                    dep = self._structured_dependency_status(task_meta)
+                    payload['dependency_status'] = {
+                        'selected_project': dep.get('selected_project'),
+                        'selected_approval_city': dep.get('selected_approval_city'),
+                        'unresolved_handles': list(dep.get('unresolved_handles') or [])[:lim],
+                        'missing_profiles': list(dep.get('missing_profiles') or [])[:lim],
+                        'projects': list(dep.get('projects') or [])[:lim],
+                    }
+                except Exception as e:
+                    payload['dependency_status_error'] = str(e)[:160]
+        if extra:
+            payload['extra'] = self._debug_preview(extra, max_chars=320)
+        self._trace(payload)
 
     def _open_internal_graph_log(self, *, task_id: str):
         if not bool(getattr(self.cfg, "save_goc_internal_graph", False)):
@@ -2935,6 +3055,54 @@ class ToolLoopLLMAgent:
             "proof_docid_cov": proof_cov,
         }
 
+    def _support_closure_finish_allowance(self, task_meta: Optional[Dict[str, Any]], answer: str) -> Dict[str, Any]:
+        task_meta = task_meta or {}
+        ans = str(answer or "").strip()
+        if (not ans) or (not self._is_support_closure_task(task_meta)):
+            return {"allow": False, "reason": "not_support_closure"}
+
+        pair_norm = normalize_project_city_pair(ans)
+        if not pair_norm:
+            return {"allow": False, "reason": "pair_unparseable"}
+        pair_proj, pair_city = [x.strip() for x in pair_norm.split(" | ", 1)]
+        status = self._structured_support_closure_status(task_meta)
+        selected_proj = str(status.get("selected_project") or "").strip()
+        selected_city = str(status.get("selected_city") or "").strip()
+        target_project = str(task_meta.get("target_project") or "").strip()
+        missing_support_types = list(status.get("missing_support_types") or [])
+        missing_proof_docids = list(status.get("missing_proof_docids") or [])
+        unresolved = list(status.get("unresolved_handles") or [])
+        missing_profiles = list(status.get("missing_profiles") or [])
+        proof_cov = float(status.get("proof_docid_cov") or 0.0)
+
+        support_complete = (not missing_support_types) and (not missing_proof_docids)
+        pair_matches_selected = bool(
+            selected_proj
+            and pair_proj == selected_proj
+            and ((not selected_city) or pair_city == selected_city)
+        )
+        target_validated = bool(target_project and selected_proj and target_project == selected_proj)
+        allow = bool(support_complete and pair_matches_selected and (target_validated or proof_cov >= 1.0))
+        reason = "support_complete_selected_pair" if allow else "support_gap_or_pair_mismatch"
+        return {
+            "allow": allow,
+            "reason": reason,
+            "pair_norm": pair_norm,
+            "pair_project": pair_proj,
+            "pair_city": pair_city,
+            "selected_project": selected_proj,
+            "selected_city": selected_city,
+            "target_project": target_project,
+            "missing_support_types": missing_support_types,
+            "missing_proof_docids": missing_proof_docids,
+            "unresolved_handles": unresolved,
+            "missing_profiles": missing_profiles,
+            "proof_docid_cov": proof_cov,
+            "support_complete": support_complete,
+            "pair_matches_selected": pair_matches_selected,
+            "target_validated": target_validated,
+        }
+
     def _next_support_closure_query(self, task_meta: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
         status = self._structured_support_closure_status(task_meta)
         unresolved = list(status.get("unresolved_handles") or [])
@@ -3888,6 +4056,7 @@ class ToolLoopLLMAgent:
         self.counters["premature_finish_blocked"] += 1
         self.counters[f"finish_block_reason__{reason_s}"] += 1
         self._last_finish_block_reason = reason_s
+        self._last_nonempty_finish_block_reason = reason_s
 
     def _prompt_est_accum_payload(self) -> Dict[str, int]:
         return {
@@ -3963,7 +4132,8 @@ class ToolLoopLLMAgent:
             "finish_docids_auto_appended": int(self.counters.get("finish_docids_auto_appended", 0)),
             "finish_invalid_project_blocked": int(self.counters.get("finish_invalid_project_blocked", 0)),
             "premature_finish_blocked": int(self.counters.get("premature_finish_blocked", 0)),
-            "last_finish_block_reason": str(self._last_finish_block_reason or ""),
+            "active_finish_block_reason": str(self._last_finish_block_reason or ""),
+            "last_finish_block_reason": str(self._last_nonempty_finish_block_reason or self._last_finish_block_reason or ""),
             "finish_block_reason_counts": {
                 str(k).replace("finish_block_reason__", ""): int(v)
                 for k, v in self.counters.items()
@@ -3971,6 +4141,8 @@ class ToolLoopLLMAgent:
             },
             "deadline_finish_from_structured_autofinish": int(self.counters.get("deadline_finish_from_structured_autofinish", 0)),
             "deadline_finish_from_last_attempt": int(self.counters.get("deadline_finish_from_last_attempt", 0)),
+            "deadline_finish_from_last_attempt_relaxed": int(self.counters.get("deadline_finish_from_last_attempt_relaxed", 0)),
+            "proof_closure_candidate_shortcut_allows": int(self.counters.get("proof_closure_candidate_shortcut_allows", 0)),
             "mem_fold_events": int(self.counters.get("mem_fold_events", 0)),
             "mem_fold_removed_tokens_est": int(self.counters.get("mem_fold_removed_tokens_est", 0)),
             "mem_fold_overflow_tokens_est": int(self.counters.get("mem_fold_overflow_tokens_est", 0)),
@@ -4008,6 +4180,8 @@ class ToolLoopLLMAgent:
             "proof_closure_repair_skipped_not_ready": int(self.counters.get("proof_closure_repair_skipped_not_ready", 0)),
             "proof_closure_repair_no_query": int(self.counters.get("proof_closure_repair_no_query", 0)),
             "forced_finish": int(self.counters.get("forced_finish", 0)),
+            "trace_event_count": int(self._trace_event_count or 0),
+            "debug_trace_path": str(self._trace_path) if self._trace_path else "",
         }
 
     def _build_result_payload(
@@ -4334,6 +4508,7 @@ class ToolLoopLLMAgent:
         self._adaptive_unfold_calls = 0
         self._forced_unfold_done = False
         self._last_finish_block_reason = None
+        self._last_nonempty_finish_block_reason = None
         self._last_finish_attempt = None
 
         self._open_trace(run_tag=run_tag, method=method, task_id=task_id)
@@ -4433,6 +4608,17 @@ class ToolLoopLLMAgent:
                     oc = int(self.counters.get("open_page_calls", 0))
                     if (step >= int(mt_min_step)) and (oc >= int(mt_min_open_pages)):
                         _inject_next_user_turn("auto", step_for_trace=step)
+
+                self._trace_step_snapshot(
+                    task_id=task_id,
+                    method=method,
+                    run_tag=run_tag,
+                    step=step,
+                    phase='step_start',
+                    current_user_prompt=current_user_prompt,
+                    task_meta=task_meta,
+                    extra={'remaining_steps': int(remaining), 'pending_user_turns': int(len(pending_user_turns))},
+                )
 
                 # Stage-aware unfold: on COMMIT (commit stages), proactively unfold around the
                 # subtask question before the model emits committed titles. This counters folding
@@ -5105,6 +5291,18 @@ class ToolLoopLLMAgent:
                     })
                 if call2 is None:
                     # Tool call blocked; consume the step but do not execute any tool.
+                    self._trace_step_snapshot(
+                        task_id=task_id,
+                        method=method,
+                        run_tag=run_tag,
+                        step=step,
+                        phase="policy_block",
+                        current_user_prompt=current_user_prompt,
+                        task_meta=task_meta,
+                        proposed_tool=str(proposed_tool or ""),
+                        args=(call.get("args", {}) if isinstance(call, dict) else {}),
+                        extra={"policy_event": policy_evt or {}},
+                    )
                     if self.cfg.verbose:
                         print(f"[{run_tag}][{method}][{task_id}] POLICY_BLOCK proposed={proposed_tool}", flush=True)
                     continue
@@ -5112,6 +5310,20 @@ class ToolLoopLLMAgent:
                 tool = call2["tool"]
                 args = call2.get("args", {}) or {}
                 in_branch = (self.mem.current_thread != "main") if hasattr(self.mem, "current_thread") else False
+
+                self._trace_step_snapshot(
+                    task_id=task_id,
+                    method=method,
+                    run_tag=run_tag,
+                    step=step,
+                    phase="tool_selected",
+                    current_user_prompt=current_user_prompt,
+                    task_meta=task_meta,
+                    proposed_tool=str(proposed_tool or ""),
+                    executed_tool=str(tool or ""),
+                    args=args,
+                    extra={"policy_event": policy_evt or {}, "in_branch": bool(in_branch)},
+                )
 
                 # Count executed tools
                 self.counters["tool_calls_total"] += 1
@@ -6381,15 +6593,30 @@ class ToolLoopLLMAgent:
                             pair_norm = normalize_project_city_pair(ans)
                             pair_proj = pair_norm.split(" | ")[0] if pair_norm else None
                             pair_city = pair_norm.split(" | ")[1] if pair_norm else None
+                            finish_allowance = self._support_closure_finish_allowance(task_meta, ans)
                             if unresolved or missing_profiles:
-                                self._record_finish_block("proof_closure_incomplete_candidates")
-                                msg = "[SYSTEM] finish blocked: this proof-closure task requires resolving the candidate set before answering."
-                                if unresolved:
-                                    msg += f" Still unresolved: {', '.join(unresolved[:3])}."
-                                elif missing_profiles:
-                                    msg += f" Missing OFFICIAL PROFILE evidence for: {', '.join(missing_profiles[:3])}."
-                                self.mem.record_msg(msg)
-                                continue
+                                if not bool(finish_allowance.get("allow", False)):
+                                    self._record_finish_block("proof_closure_incomplete_candidates")
+                                    msg = "[SYSTEM] finish blocked: this proof-closure task requires resolving the candidate set before answering."
+                                    if unresolved:
+                                        msg += f" Still unresolved: {', '.join(unresolved[:3])}."
+                                    elif missing_profiles:
+                                        msg += f" Missing OFFICIAL PROFILE evidence for: {', '.join(missing_profiles[:3])}."
+                                    self.mem.record_msg(msg)
+                                    continue
+                                self.counters["proof_closure_candidate_shortcut_allows"] += 1
+                                self._trace({
+                                    "type": "finish_guard_relaxed",
+                                    "task_id": task_id,
+                                    "method": method,
+                                    "run_tag": run_tag,
+                                    "step": step,
+                                    "reason": "proof_closure_candidate_shortcut",
+                                    "selected_project": finish_allowance.get("selected_project"),
+                                    "selected_city": finish_allowance.get("selected_city"),
+                                    "pair_norm": finish_allowance.get("pair_norm"),
+                                    "proof_docid_cov": finish_allowance.get("proof_docid_cov"),
+                                })
                             if missing_support_types or missing_proof_docids:
                                 self._record_finish_block("proof_closure_missing_support")
                                 msg = "[SYSTEM] finish blocked: you have not opened the full support chain needed for a proof-complete answer."
@@ -6716,6 +6943,24 @@ class ToolLoopLLMAgent:
                             "step": int(step),
                         }
 
+                    self._trace_step_snapshot(
+                        task_id=task_id,
+                        method=method,
+                        run_tag=run_tag,
+                        step=step,
+                        phase="finish_attempt",
+                        current_user_prompt=current_user_prompt,
+                        task_meta=task_meta,
+                        proposed_tool=str(proposed_tool or ""),
+                        executed_tool="finish",
+                        args={"answer": ans, "explanation": expl0, "confidence": args.get("confidence", "")},
+                        extra={
+                            "open_page_calls": int(open_calls),
+                            "pending_user_turns": int(len(pending_user_turns)),
+                            "support_allowance": (self._support_closure_finish_allowance(task_meta, ans) if ans and self._is_support_closure_task(task_meta) else {"allow": False, "reason": "not_applicable"}),
+                        },
+                    )
+
                     if not ans:
                         self._record_finish_block("empty_answer")
                         self.mem.record_msg("[SYSTEM] finish blocked: empty answer. Put the final answer into finish.args.answer (a non-empty short string).")
@@ -6734,6 +6979,7 @@ class ToolLoopLLMAgent:
                         if (not proj) or (proj not in allowed):
                             self.counters["finish_invalid_project_blocked"] += 1
                             self._last_finish_block_reason = "invalid_project"
+                            self._last_nonempty_finish_block_reason = "invalid_project"
                             if self._should_block_finish("invalid_project"):
                                 self.mem.record_msg(
                                     "[SYSTEM] finish blocked: answer project must be one of the GIVEN projects from the question. "
@@ -6813,6 +7059,19 @@ class ToolLoopLLMAgent:
 
                 # Drain memory events (fold/unfold decisions) emitted during this step
                 self._drain_mem_events(task_id, method, run_tag, step)
+                self._trace_step_snapshot(
+                    task_id=task_id,
+                    method=method,
+                    run_tag=run_tag,
+                    step=step,
+                    phase="step_end",
+                    current_user_prompt=current_user_prompt,
+                    task_meta=task_meta,
+                    proposed_tool=str(proposed_tool or ""),
+                    executed_tool=str(tool or ""),
+                    args=args,
+                    extra={"fork_ran_this_step": bool(fork_ran_this_step)},
+                )
 
             # No finish
             top_rep = self.search_query_counts.most_common(5)
@@ -6837,14 +7096,26 @@ class ToolLoopLLMAgent:
                     self._trace({"type":"forced_finish","task_id":task_id,"method":method,"run_tag":run_tag,"step":self.cfg.max_steps,"answer":ans})
 
             if not no_finish_answer and isinstance(self._last_finish_attempt, dict):
-                last_reason = str(self._last_finish_block_reason or "")
+                last_reason = str(self._last_nonempty_finish_block_reason or self._last_finish_block_reason or "")
                 soft_block_reasons = {
                     "missing_docids_no_evidence",
                     "finish_answer_schema",
                     "project_city_pair_format",
                 }
                 last_answer = str(self._last_finish_attempt.get("answer") or "").strip()
-                if last_answer and last_reason in soft_block_reasons:
+                allow_last_attempt = bool(last_answer and last_reason in soft_block_reasons)
+                allowance_reason = str(last_reason or "")
+                finish_allowance: Dict[str, Any] = {"allow": False, "reason": "not_checked"}
+                if last_answer and self._is_support_closure_task(task_meta):
+                    finish_allowance = self._support_closure_finish_allowance(task_meta, last_answer)
+                    if bool(finish_allowance.get("allow", False)) and last_reason in {
+                        "proof_closure_incomplete_candidates",
+                        "proof_closure_missing_support",
+                        "proof_closure_wrong_city",
+                    }:
+                        allow_last_attempt = True
+                        allowance_reason = f"{last_reason}:support_complete_selected_pair"
+                if allow_last_attempt:
                     last_expl = str(self._last_finish_attempt.get("explanation") or "").strip()
                     if self.cfg.require_docids_in_finish:
                         cited = re.findall(r"\bD_[A-Z0-9_\-]+\b", last_expl or "")
@@ -6858,6 +7129,8 @@ class ToolLoopLLMAgent:
                     no_finish_confidence = str(self._last_finish_attempt.get("confidence") or "auto")
                     self.counters["forced_finish"] += 1
                     self.counters["deadline_finish_from_last_attempt"] += 1
+                    if allowance_reason.endswith("support_complete_selected_pair"):
+                        self.counters["deadline_finish_from_last_attempt_relaxed"] += 1
                     self._trace({
                         "type": "forced_finish_from_last_attempt",
                         "task_id": task_id,
@@ -6865,8 +7138,23 @@ class ToolLoopLLMAgent:
                         "run_tag": run_tag,
                         "step": self.cfg.max_steps,
                         "last_finish_block_reason": last_reason,
+                        "allowance_reason": allowance_reason,
                         "answer": no_finish_answer,
+                        "support_closure_finish_allowance": finish_allowance,
                     })
+
+            self._trace_step_snapshot(
+                task_id=task_id,
+                method=method,
+                run_tag=run_tag,
+                step=self.cfg.max_steps,
+                phase='deadline_exit',
+                current_user_prompt=current_user_prompt,
+                task_meta=task_meta,
+                executed_tool='finish',
+                args={'answer': no_finish_answer, 'explanation': no_finish_explanation, 'confidence': no_finish_confidence},
+                extra={'forced_finish': bool(no_finish_answer), 'top_repeated_queries': top_rep[:3]},
+            )
 
             result = self._build_result_payload(
                 answer=no_finish_answer,

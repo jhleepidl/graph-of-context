@@ -40,6 +40,7 @@ def main() -> None:
     ap.add_argument('--context_controller_model_path', type=str, default=None, help='Optional learned controller model path for learned-controller methods.')
     ap.add_argument('--context_controller_policy', type=str, default=None, help='Optional learned controller policy label (e.g. phase18_tree or phase18_logreg).')
     ap.add_argument('--enable_context_controller', action='store_true', default=False, help='Explicitly enable downstream context-controller runtime wiring.')
+    ap.add_argument('--log_dir', type=str, default=None, help='Optional per-task debug trace directory to pass to the phase19 bundle.')
     args, passthrough = ap.parse_known_args()
 
     methods = _dedupe([m.strip() for m in str(args.methods).split(',') if m.strip()])
@@ -68,6 +69,8 @@ def main() -> None:
         cmd.extend(['--context_controller_policy', args.context_controller_policy])
     if args.enable_context_controller:
         cmd.append('--enable_context_controller')
+    if str(args.log_dir or '').strip():
+        cmd.extend(['--log_dir', str(args.log_dir)])
 
     if passthrough:
         cmd.extend(passthrough)

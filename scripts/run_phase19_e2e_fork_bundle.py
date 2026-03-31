@@ -69,7 +69,10 @@ def _seed_log_dir(bundle_root: Path, seed_runs: Path, raw: str | None, seed: int
         out = Path(rendered)
     else:
         base = Path(raw_s)
-        out = (base if base.is_absolute() else (seed_runs / base)) / f'seed_{seed}'
+        if base.is_absolute():
+            out = base / f'seed_{seed}'
+        else:
+            out = seed_runs / base
     out.mkdir(parents=True, exist_ok=True)
     return out
 

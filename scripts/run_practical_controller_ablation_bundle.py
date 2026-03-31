@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument('--learned_only', action='store_true', default=False, help='Run only GoC-Mixed-Learned. Useful after baselines have already been measured, to avoid rerunning every method.')
     ap.add_argument('--context_controller_model_path', type=str, default=None, help='Path to a learned context-controller model (.pkl payload). If provided and GoC-Mixed-Learned is absent from --methods, it is appended automatically.')
     ap.add_argument('--context_controller_policy', type=str, default='auto', help='Learned controller policy label. Use auto to infer phase18_tree or phase18_logreg from the model filename.')
+    ap.add_argument('--log_dir', type=str, default='traces', help='Per-task debug trace directory to bundle. Relative paths live under each seed run dir. Use empty string to disable.')
     args, passthrough = ap.parse_known_args()
 
     if args.learned_only:
@@ -81,6 +82,8 @@ def main() -> None:
         cmd.extend(['--enable_context_controller'])
     if inferred_policy:
         cmd.extend(['--context_controller_policy', inferred_policy])
+    if str(args.log_dir or '').strip():
+        cmd.extend(['--log_dir', str(args.log_dir)])
     if passthrough:
         cmd.extend(passthrough)
     raise SystemExit(subprocess.call(cmd))
