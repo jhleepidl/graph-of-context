@@ -687,13 +687,13 @@ def run_llm(
                 context_controller_disable_none_action=False,
                 context_controller_fallback_action="unfold",
                 proof_closure_repair=True,
-                proof_closure_repair_min_step=max(12, int(fork_min_step)),
-                proof_closure_repair_max_calls=2,
+                proof_closure_repair_min_step=max(8, int(fork_min_step)),
+                proof_closure_repair_max_calls=4,
                 proof_closure_repair_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_verify=True,
-                proof_closure_fork_min_step=max(12, int(fork_min_step)),
-                proof_closure_fork_late_window=8,
-                proof_closure_fork_max_calls=1,
+                proof_closure_fork_min_step=max(10, int(fork_min_step)),
+                proof_closure_fork_late_window=10,
+                proof_closure_fork_max_calls=2,
                 proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_min_missing_docids=1,
             )
@@ -711,13 +711,13 @@ def run_llm(
                 # When the learned policy stalls, use the same support-gap recovery
                 # tools that already helped the prove/repair baselines.
                 proof_closure_repair=True,
-                proof_closure_repair_min_step=max(12, int(fork_min_step)),
-                proof_closure_repair_max_calls=2,
+                proof_closure_repair_min_step=max(8, int(fork_min_step)),
+                proof_closure_repair_max_calls=4,
                 proof_closure_repair_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_verify=True,
-                proof_closure_fork_min_step=max(12, int(fork_min_step)),
-                proof_closure_fork_late_window=8,
-                proof_closure_fork_max_calls=1,
+                proof_closure_fork_min_step=max(10, int(fork_min_step)),
+                proof_closure_fork_late_window=10,
+                proof_closure_fork_max_calls=2,
                 proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_min_missing_docids=1,
             )
@@ -1005,6 +1005,7 @@ def run_llm(
         avg_ctx_unfold = _avg([(x.get("tool_stats", {}).get("context_controller_unfold") or 0) for x in rs])
         avg_ctx_fork = _avg([(x.get("tool_stats", {}).get("context_controller_fork") or 0) for x in rs])
         avg_ctx_utf = _avg([(x.get("tool_stats", {}).get("context_controller_unfold_then_fork") or 0) for x in rs])
+        avg_finish_probe = _avg([(x.get("tool_stats", {}).get("proof_closure_finish_probe") or 0) for x in rs])
         avg_finish_blocked = _avg([(x.get("tool_stats", {}).get("premature_finish_blocked") or 0) for x in rs])
         no_finish_rate = _avg([1.0 if str(x.get("explanation") or "").startswith("max_steps reached") else 0.0 for x in rs])
         avg_search = _avg([(x.get("tool_stats", {}).get("search_calls") or 0) for x in rs])

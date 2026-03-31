@@ -102,6 +102,7 @@ def _summarize_jsonl(jsonl_path: Path) -> List[Dict[str, Any]]:
             'avg_context_controller_unfold': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold') or 0.0) for r in rs]),
             'avg_context_controller_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_fork') or 0.0) for r in rs]),
             'avg_context_controller_unfold_then_fork': _avg([float((r.get('tool_stats', {}) or {}).get('context_controller_unfold_then_fork') or 0.0) for r in rs]),
+            'avg_proof_closure_finish_probe': _avg([float((r.get('tool_stats', {}) or {}).get('proof_closure_finish_probe') or 0.0) for r in rs]),
             'avg_premature_finish_blocked': _avg([float((r.get('tool_stats', {}) or {}).get('premature_finish_blocked') or 0.0) for r in rs]),
             'no_finish_rate': _avg([1.0 if str(r.get('explanation') or '').startswith('max_steps reached') else 0.0 for r in rs]),
         })

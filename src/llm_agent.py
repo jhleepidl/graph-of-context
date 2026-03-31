@@ -140,6 +140,10 @@ class ToolLoopConfig:
     proof_closure_repair_min_step: int = 12
     proof_closure_repair_max_calls: int = 2
     proof_closure_repair_allowed_slices: Tuple[str, ...] = ("support_closure", "provenance_required")
+    proof_closure_finish_probe: bool = True
+    proof_closure_finish_probe_min_step: int = 14
+    proof_closure_finish_probe_late_window: int = 6
+    proof_closure_finish_probe_min_cov: float = 0.75
 
     # Candidate-first policy (helps long-horizon tasks with an explicit candidate set)
     # If the question lists a set of candidates (e.g., Project_#### list), prefer opening
@@ -3120,6 +3124,9 @@ class ToolLoopLLMAgent:
                 return f"{selected} legacy operating exception", "support_closure_missing_exception"
             if "revocation" in missing_types:
                 return f"{selected} exception revocation", "support_closure_missing_revocation"
+        missing_docids = [str(d).strip() for d in (status.get("missing_proof_docids") or []) if str(d).strip()]
+        if missing_docids:
+            return missing_docids[0], "support_closure_missing_proof_docid"
         return None, None
 
     def _maybe_run_support_closure_repair(
@@ -3156,7 +3163,18 @@ class ToolLoopLLMAgent:
         search_calls = int(self.counters.get('search_calls', 0) or 0)
         open_page_calls = int(self.counters.get('open_page_calls', 0) or 0)
         repeated_searches = int(self.counters.get('repeated_search_count', 0) or 0)
-        if not (blocked or late or repeated_searches >= 1 or search_calls >= 2 or open_page_calls >= 8):
+        blocked_finishes = int(self.counters.get('premature_finish_blocked', 0) or 0)
+        candidate_resolved = not bool(status.get('unresolved_handles') or status.get('missing_profiles'))
+        support_gap_only = candidate_resolved and bool(status.get('missing_support_types') or status.get('missing_proof_docids'))
+        if not (
+            blocked
+            or late
+            or repeated_searches >= 1
+            or blocked_finishes >= 1
+            or search_calls >= 2
+            or open_page_calls >= 8
+            or (support_gap_only and (open_page_calls >= 3 or search_calls >= 1 or int(step) >= max(min_step + 2, 10)))
+        ):
             self.counters['proof_closure_repair_skipped_not_ready'] += 1
             return False
         desired_q, reason = self._next_support_closure_query(task_meta)
@@ -3299,6 +3317,69 @@ class ToolLoopLLMAgent:
         parts.append("List the exact next pages or support items that should be opened before answering.")
         return " | ".join([p for p in parts if p])
 
+    def _maybe_emit_support_closure_finish_probe(
+        self,
+        *,
+        step: int,
+        task_meta: Dict[str, Any],
+        task_id: str,
+        method: str,
+        run_tag: str,
+    ) -> bool:
+        if not bool(getattr(self.cfg, "proof_closure_finish_probe", True)):
+            return False
+        if not self._is_support_closure_task(task_meta):
+            return False
+        min_step = int(getattr(self.cfg, "proof_closure_finish_probe_min_step", 14) or 14)
+        if int(step) < min_step:
+            return False
+        status = self._structured_support_closure_status(task_meta)
+        unresolved = list(status.get("unresolved_handles") or [])
+        missing_profiles = list(status.get("missing_profiles") or [])
+        missing_support_types = list(status.get("missing_support_types") or [])
+        missing_proof_docids = list(status.get("missing_proof_docids") or [])
+        selected = str(status.get("selected_project") or "").strip()
+        city = str(status.get("selected_city") or "").strip()
+        if not selected or not city:
+            return False
+        proof_cov = float(status.get("proof_docid_cov") or 0.0)
+        min_cov = float(getattr(self.cfg, "proof_closure_finish_probe_min_cov", 0.75) or 0.75)
+        fully_closed = (not unresolved and not missing_profiles and not missing_support_types and not missing_proof_docids)
+        nearly_closed = (not unresolved and not missing_profiles and proof_cov >= min_cov and len(missing_support_types) <= 1 and len(missing_proof_docids) <= 1)
+        if not (fully_closed or nearly_closed):
+            return False
+        max_steps = int(getattr(self.cfg, "max_steps", 40) or 40)
+        late_window = int(getattr(self.cfg, "proof_closure_finish_probe_late_window", 6) or 6)
+        late = int(step) >= max(1, max_steps - late_window)
+        repeated_searches = int(self.counters.get('repeated_search_count', 0) or 0)
+        blocked_finishes = int(self.counters.get('premature_finish_blocked', 0) or 0)
+        finish_attempts = int(self.counters.get('finish_calls', 0) or 0)
+        if not (late or repeated_searches >= 1 or blocked_finishes >= 1 or finish_attempts == 0):
+            return False
+        key = f"finish_probe:{selected}:{city}:{int(step)}"
+        msg = (
+            f"[SYSTEM] Proof-closure status: the opened evidence is now sufficient to answer or nearly sufficient. "
+            f"Target pair is {selected} | {city}. If no contradictory evidence appears, finish now using the exact `Project_#### | City` format and cite the opened support docids."
+        )
+        self.mem.record_msg(msg)
+        self.counters['proof_closure_finish_probe'] += 1
+        self._policy_record_constraint_once(key=key, text=msg)
+        self._trace({
+            'type': 'proof_closure_finish_probe',
+            'task_id': task_id,
+            'method': method,
+            'run_tag': run_tag,
+            'step': int(step),
+            'selected_project': selected,
+            'selected_city': city,
+            'proof_docid_cov': proof_cov,
+            'missing_support_types': list(missing_support_types),
+            'missing_proof_docids': list(missing_proof_docids),
+            'fully_closed': bool(fully_closed),
+            'nearly_closed': bool(nearly_closed),
+        })
+        return True
+
     def _maybe_run_support_closure_fork_verify(
         self,
         *,
@@ -3318,7 +3399,7 @@ class ToolLoopLLMAgent:
         if not hasattr(self.mem, 'build_fork_view') or not hasattr(self.mem, 'record_fork_result'):
             return False
         max_calls = int(getattr(self.cfg, "proof_closure_fork_max_calls", 1) or 1)
-        if int(self.counters.get("fork_calls", 0) or 0) >= max_calls:
+        if int(self.counters.get("proof_closure_fork_verify_calls", 0) or 0) >= max_calls:
             return False
         min_step = int(getattr(self.cfg, "proof_closure_fork_min_step", 12) or 12)
         if int(step) < min_step:
@@ -3365,13 +3446,16 @@ class ToolLoopLLMAgent:
         # Best-practice gating: use verifier only on the truly hard closure slice and only
         # after the agent has shown signs of getting stuck. Provenance-required tasks were already
         # strong with proof-first similarity; for those, verifier mostly added cost without gains.
+        candidate_resolved = not bool(unresolved_handles or missing_profiles)
+        support_gap_only = candidate_resolved and bool(missing_support_types or missing_proof_docids)
         proactive_hard_slice = (
             slice_name == 'support_closure'
             and int(step) >= max(min_step, max_steps - 12)
             and (search_calls >= 2 or open_page_calls >= 6 or rewrite_calls >= 1)
             and (blocked_finishes >= 1 or repeated_searches >= 2 or late or planner_stall)
         )
-        if not (late or blocked or planner_stall or proactive_hard_slice):
+        support_gap_stall = support_gap_only and (blocked_finishes >= 1 or repeated_searches >= 1 or late or open_page_calls >= 6)
+        if not (late or blocked or planner_stall or proactive_hard_slice or support_gap_stall):
             self.counters['proof_closure_fork_verify_skipped_not_stuck'] += 1
             return False
         self.counters['proof_closure_fork_verify_attempts'] += 1
@@ -3466,6 +3550,12 @@ class ToolLoopLLMAgent:
                 expected_titles.append(f"Legacy Operating Exception - {selected}")
             if "revocation" in missing_types:
                 expected_titles.append(f"Exception Revocation - {selected}")
+
+        missing_proof_docids = {str(d).strip() for d in (status.get("missing_proof_docids") or []) if str(d).strip()}
+        for r in results or []:
+            did = str(r.get("docid") or "").strip()
+            if did and did not in self.opened_cache and did in missing_proof_docids:
+                return did
 
         norms = {self._normalize_query(t): t for t in expected_titles if t}
         if not norms:
@@ -4172,6 +4262,7 @@ class ToolLoopLLMAgent:
             "proof_closure_fork_verify_skipped_slice": int(self.counters.get("proof_closure_fork_verify_skipped_slice", 0)),
             "proof_closure_fork_verify_skipped_low_severity": int(self.counters.get("proof_closure_fork_verify_skipped_low_severity", 0)),
             "proof_closure_fork_verify_skipped_not_stuck": int(self.counters.get("proof_closure_fork_verify_skipped_not_stuck", 0)),
+            "proof_closure_finish_probe": int(self.counters.get("proof_closure_finish_probe", 0)),
             "proof_closure_repair_calls": int(self.counters.get("proof_closure_repair_calls", 0)),
             "proof_closure_repair_searches": int(self.counters.get("proof_closure_repair_searches", 0)),
             "proof_closure_repair_opens": int(self.counters.get("proof_closure_repair_opens", 0)),
@@ -4861,7 +4952,9 @@ class ToolLoopLLMAgent:
                             run_tag=run_tag,
                         )
                         if _ctl_executed:
-                            fork_ran_this_step = True
+                            ctl_action = str(getattr(_ctl_decision, 'action', '') or '').strip().lower()
+                            if ctl_action in {'fork', 'unfold_then_fork'}:
+                                fork_ran_this_step = True
                             ctx = self.mem.get_active_text()
                 except Exception:
                     self.counters['context_controller_errors'] += 1
@@ -4906,6 +4999,20 @@ class ToolLoopLLMAgent:
                         ctx = self.mem.get_active_text()
                 except Exception:
                     self.counters['proof_closure_fork_verify_errors'] += 1
+
+                # Late-stage finish probe: when the support chain is already closed (or nearly closed),
+                # inject a compact system reminder so the agent actually attempts finish instead of looping.
+                try:
+                    if isinstance(task_meta, dict):
+                        self._maybe_emit_support_closure_finish_probe(
+                            step=step,
+                            task_meta=task_meta,
+                            task_id=task_id,
+                            method=method,
+                            run_tag=run_tag,
+                        )
+                except Exception:
+                    self.counters['proof_closure_finish_probe_errors'] += 1
 
                 # Generic scoped-fork trigger for single-stage benchmarks (e.g., BrowseComp-like tasks)
                 # that do not expose explicit /COMMIT or /FINAL prompts. When fork_trigger_mode is "always",
