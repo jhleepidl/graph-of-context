@@ -6,23 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-PAPER_FAIR_MAP = {
-    'FullHistory': 'FullHistory-PaperFair',
-    'FullHistory-Prove': 'FullHistory-PaperFair',
-    'SimilarityOnly': 'SimilarityOnly-PaperFair',
-    'SimilarityOnly-Prove': 'SimilarityOnly-PaperFair',
-    'ProxySummary': 'ProxySummary-PaperFair',
-    'ProxySummary-Prove': 'ProxySummary-PaperFair',
-    'GoC-Closure-Only': 'GoC-Closure-Only-PaperFair',
-    'GoC-ForkOnly': 'GoC-ForkOnly-PaperFair',
-    'GoC-Mixed-Heuristic': 'GoC-Mixed-Heuristic-PaperFair',
-    'GoC-Mixed-Learned': 'GoC-Mixed-Learned-PaperFair',
-}
-
-
-def _map_paper_fair(methods):
-    return _dedupe([PAPER_FAIR_MAP.get(m, m) for m in methods])
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 if str(ROOT) not in sys.path:
@@ -199,6 +182,10 @@ def main() -> None:
     ap.add_argument('--structured_dependency_candidates', type=int, default=None)
     ap.add_argument('--task_slices', type=str, default='', help='Optional comma-separated task_slice filter applied after task generation/load.')
     ap.add_argument('--smoke', action='store_true')
+    ap.add_argument('--openai_api_mode', type=str, default='auto', help='OpenAI client API mode (auto or responses).')
+    ap.add_argument('--openai_reasoning_effort', type=str, default=None, help='Optional reasoning effort for GPT-5.* models.')
+    ap.add_argument('--openai_verbosity', type=str, default=None, help='Optional verbosity for GPT-5.* models.')
+    ap.add_argument('--openai_max_output_tokens', type=int, default=None, help='Optional max_output_tokens override for the OpenAI Responses API.')
     args = ap.parse_args()
 
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -379,6 +366,10 @@ def main() -> None:
             },
             model=str(args.model),
             dotenv_path=str(args.dotenv),
+            openai_api_mode=str(args.openai_api_mode),
+            openai_reasoning_effort=(None if args.openai_reasoning_effort is None else str(args.openai_reasoning_effort)),
+            openai_verbosity=(None if args.openai_verbosity is None else str(args.openai_verbosity)),
+            openai_max_output_tokens=(None if args.openai_max_output_tokens is None else int(args.openai_max_output_tokens)),
             max_steps=max_steps,
             max_json_retries=2,
             budget_active=int(args.budget_active),

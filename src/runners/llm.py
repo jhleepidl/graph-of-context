@@ -38,6 +38,10 @@ def run_llm(
     model: str = "gpt-4o-mini",
     dotenv_path: str = ".env",
     controller_model: Optional[str] = None,
+    openai_api_mode: str = "auto",
+    openai_reasoning_effort: Optional[str] = None,
+    openai_verbosity: Optional[str] = None,
+    openai_max_output_tokens: Optional[int] = None,
 
     # Bandit controller (GoC-Bandit)
     bandit_model_path: Optional[str] = None,
@@ -220,10 +224,13 @@ def run_llm(
     # Build an LLM client.
     llm = make_openai_client(
         model=model,
-        api_mode="auto",
+        api_mode=openai_api_mode,
         temperature=0.0,
         force_json=True,
         dotenv_path=dotenv_path,
+        reasoning_effort=openai_reasoning_effort,
+        verbosity=openai_verbosity,
+        max_output_tokens=openai_max_output_tokens,
     )
 
     # Optional controller model for agentic unfold/fold (Option-B).
@@ -231,10 +238,13 @@ def run_llm(
     if controller_model:
         controller_llm = make_openai_client(
             model=controller_model,
-            api_mode="auto",
+            api_mode=openai_api_mode,
             temperature=0.0,
             force_json=True,
             dotenv_path=dotenv_path,
+            reasoning_effort=openai_reasoning_effort,
+            verbosity=openai_verbosity,
+            max_output_tokens=openai_max_output_tokens,
         )
 
     all_method_specs: Dict[str, MethodSpec] = {
