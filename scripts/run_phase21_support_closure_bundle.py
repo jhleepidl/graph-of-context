@@ -21,10 +21,7 @@ def _dedupe(seq):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description='Run support-closure benchmark bundle.',
-        allow_abbrev=False,
-    )
+    ap = argparse.ArgumentParser(description='Run support-closure benchmark bundle.')
     ap.add_argument('--model', type=str, default='gpt-4.1-mini')
     ap.add_argument('--dotenv', type=str, default='.env')
     ap.add_argument('--task_limit', type=int, default=24)
@@ -38,8 +35,7 @@ def main() -> None:
     ap.add_argument('--run_fork_verify', action='store_true', default=False, help='Also include GoC-SimSeed-Fork-Verify.')
     ap.add_argument('--context_controller_model_path', type=str, default=None, help='Optional learned controller model path for learned-controller methods.')
     ap.add_argument('--context_controller_policy', type=str, default=None, help='Optional learned controller policy label (e.g. phase18_tree or phase18_logreg).')
-    ap.add_argument('--enable_context_controller', action='store_true', default=False, help='Explicitly enable downstream context-controller runtime wiring.')
-    args, passthrough = ap.parse_known_args()
+    args = ap.parse_args()
 
     methods = _dedupe([m.strip() for m in str(args.methods).split(',') if m.strip()])
     if args.run_fork_verify and 'GoC-SimSeed-Fork-Verify' not in methods:
@@ -67,12 +63,6 @@ def main() -> None:
         cmd.extend(['--context_controller_policy', args.context_controller_policy])
     if args.enable_context_controller:
         cmd.append('--enable_context_controller')
-
-    # Forward any additional downstream-only flags instead of failing in this middle wrapper.
-    # This prevents new phase19 bundle arguments from breaking this pass-through script.
-    if passthrough:
-        cmd.extend(passthrough)
-
     raise SystemExit(subprocess.call(cmd))
 
 

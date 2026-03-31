@@ -195,6 +195,8 @@ def main() -> None:
     methods = [m.strip() for m in str(args.methods).split(',') if m.strip()]
     seeds = [int(s.strip()) for s in str(args.seeds).split(',') if s.strip()]
     task_slices = [s.strip() for s in str(args.task_slices).split(',') if s.strip()]
+    uses_context_controller = any(m in {'GoC-Mixed-Heuristic', 'GoC-Mixed-Learned'} for m in methods)
+    effective_enable_context_controller = bool(args.enable_context_controller or uses_context_controller)
     bench = SyntheticBrowseComp()
 
     manifest: Dict[str, Any] = {
