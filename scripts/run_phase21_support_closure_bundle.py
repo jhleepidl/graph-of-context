@@ -6,6 +6,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+PAPER_FAIR_MAP = {
+    'FullHistory': 'FullHistory-PaperFair',
+    'FullHistory-Prove': 'FullHistory-PaperFair',
+    'SimilarityOnly': 'SimilarityOnly-PaperFair',
+    'SimilarityOnly-Prove': 'SimilarityOnly-PaperFair',
+    'ProxySummary': 'ProxySummary-PaperFair',
+    'ProxySummary-Prove': 'ProxySummary-PaperFair',
+    'GoC-Closure-Only': 'GoC-Closure-Only-PaperFair',
+    'GoC-ForkOnly': 'GoC-ForkOnly-PaperFair',
+    'GoC-Mixed-Heuristic': 'GoC-Mixed-Heuristic-PaperFair',
+    'GoC-Mixed-Learned': 'GoC-Mixed-Learned-PaperFair',
+}
+
+
+def _map_paper_fair(methods):
+    return _dedupe([PAPER_FAIR_MAP.get(m, m) for m in methods])
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -55,15 +72,7 @@ def main() -> None:
     elif args.paper_fair_only:
         methods = ['GoC-Mixed-Learned-PaperFair']
     elif args.paper_fair:
-        mapped=[]
-        for m in methods:
-            if m == 'GoC-Mixed-Learned':
-                mapped.append('GoC-Mixed-Learned-PaperFair')
-            elif m == 'GoC-Mixed-Heuristic':
-                mapped.append('GoC-Mixed-Heuristic-PaperFair')
-            else:
-                mapped.append(m)
-        methods = _dedupe(mapped)
+        methods = _map_paper_fair(methods)
     if args.run_fork_verify and 'GoC-SimSeed-Fork-Verify' not in methods:
         methods.append('GoC-SimSeed-Fork-Verify')
     if any(m in methods for m in ('GoC-Mixed-Learned', 'GoC-Mixed-Learned-PaperFair')) and not args.context_controller_model_path:

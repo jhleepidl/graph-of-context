@@ -6,6 +6,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+PAPER_FAIR_MAP = {
+    'FullHistory': 'FullHistory-PaperFair',
+    'FullHistory-Prove': 'FullHistory-PaperFair',
+    'SimilarityOnly': 'SimilarityOnly-PaperFair',
+    'SimilarityOnly-Prove': 'SimilarityOnly-PaperFair',
+    'ProxySummary': 'ProxySummary-PaperFair',
+    'ProxySummary-Prove': 'ProxySummary-PaperFair',
+    'GoC-Closure-Only': 'GoC-Closure-Only-PaperFair',
+    'GoC-ForkOnly': 'GoC-ForkOnly-PaperFair',
+    'GoC-Mixed-Heuristic': 'GoC-Mixed-Heuristic-PaperFair',
+    'GoC-Mixed-Learned': 'GoC-Mixed-Learned-PaperFair',
+}
+
+
+def _map_paper_fair(methods):
+    return _dedupe([PAPER_FAIR_MAP.get(m, m) for m in methods])
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 if str(ROOT) not in sys.path:

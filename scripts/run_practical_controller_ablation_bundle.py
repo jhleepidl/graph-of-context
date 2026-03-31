@@ -32,6 +32,22 @@ def _infer_controller_policy(model_path: str | None, requested: str | None) -> s
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_METHODS = "FullHistory-Prove,SimilarityOnly-Prove,ProxySummary-Prove,GoC-Closure-Only,GoC-ForkOnly,GoC-Mixed-Heuristic"
+PAPER_FAIR_MAP = {
+    'FullHistory': 'FullHistory-PaperFair',
+    'FullHistory-Prove': 'FullHistory-PaperFair',
+    'SimilarityOnly': 'SimilarityOnly-PaperFair',
+    'SimilarityOnly-Prove': 'SimilarityOnly-PaperFair',
+    'ProxySummary': 'ProxySummary-PaperFair',
+    'ProxySummary-Prove': 'ProxySummary-PaperFair',
+    'GoC-Closure-Only': 'GoC-Closure-Only-PaperFair',
+    'GoC-ForkOnly': 'GoC-ForkOnly-PaperFair',
+    'GoC-Mixed-Heuristic': 'GoC-Mixed-Heuristic-PaperFair',
+    'GoC-Mixed-Learned': 'GoC-Mixed-Learned-PaperFair',
+}
+
+
+def _map_paper_fair(methods):
+    return _dedupe([PAPER_FAIR_MAP.get(m, m) for m in methods])
 
 
 def main() -> None:
@@ -48,22 +64,40 @@ def main() -> None:
     ap.add_argument('--max_steps', type=int, default=44)
     ap.add_argument('--methods', type=str, default=DEFAULT_METHODS, help=f'Comma-separated method list. Default: {DEFAULT_METHODS}')
     ap.add_argument('--learned_only', action='store_true', default=False, help='Run only GoC-Mixed-Learned. Useful after baselines have already been measured, to avoid rerunning every method.')
+    ap.add_argument('--paper_fair', action='store_true', default=False, help='Map supported methods to their paper-fair variants.')
+    ap.add_argument('--paper_fair_baselines_only', action='store_true', default=False, help='Run the main practical baseline set in paper-fair mode.')
     ap.add_argument('--context_controller_model_path', type=str, default=None, help='Path to a learned context-controller model (.pkl payload). If provided and GoC-Mixed-Learned is absent from --methods, it is appended automatically.')
     ap.add_argument('--context_controller_policy', type=str, default='auto', help='Learned controller policy label. Use auto to infer phase18_tree or phase18_logreg from the model filename.')
     ap.add_argument('--log_dir', type=str, default='traces', help='Per-task debug trace directory to bundle. Relative paths live under each seed run dir. Use empty string to disable.')
     args, passthrough = ap.parse_known_args()
 
+    if args.learned_only and args.paper_fair_baselines_only:
+        raise SystemExit('Use at most one of --learned_only or --paper_fair_baselines_only')
+
     if args.learned_only:
         if not args.context_controller_model_path:
             raise SystemExit('--learned_only requires --context_controller_model_path')
         methods = ['GoC-Mixed-Learned']
+    elif args.paper_fair_baselines_only:
+        methods = [
+            'FullHistory-PaperFair',
+            'SimilarityOnly-PaperFair',
+            'ProxySummary-PaperFair',
+            'GoC-Closure-Only-PaperFair',
+            'GoC-ForkOnly-PaperFair',
+            'GoC-Mixed-Heuristic-PaperFair',
+            'GoC-Mixed-Learned-PaperFair',
+        ]
     else:
         methods = _dedupe([m.strip() for m in str(args.methods).split(',') if m.strip()])
-        if args.context_controller_model_path and 'GoC-Mixed-Learned' not in methods:
+        if args.context_controller_model_path and 'GoC-Mixed-Learned' not in methods and 'GoC-Mixed-Learned-PaperFair' not in methods:
             methods.append('GoC-Mixed-Learned')
 
-    if 'GoC-Mixed-Learned' in methods and not args.context_controller_model_path:
-        raise SystemExit('GoC-Mixed-Learned requires --context_controller_model_path')
+    if args.paper_fair:
+        methods = _map_paper_fair(methods)
+
+    if any(m in methods for m in ('GoC-Mixed-Learned', 'GoC-Mixed-Learned-PaperFair')) and not args.context_controller_model_path:
+        raise SystemExit('GoC-Mixed-Learned methods require --context_controller_model_path')
 
     cmd = [
         sys.executable, str(ROOT / 'scripts' / 'run_phase21_support_closure_bundle.py'),

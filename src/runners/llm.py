@@ -243,6 +243,10 @@ def run_llm(
             "FullHistory-Prove",
             lambda: FullHistoryMemory(budget_active=budget_active, budget_unfold=budget_unfold),
         ),
+        "FullHistory-PaperFair": MethodSpec(
+            "FullHistory-PaperFair",
+            lambda: FullHistoryMemory(budget_active=budget_active, budget_unfold=budget_unfold),
+        ),
         "ContextFolding-Discard": MethodSpec("ContextFolding-Discard", lambda: ContextFoldingDiscardMemory(budget_active=budget_active, budget_unfold=budget_unfold)),
         "LinearSummary": MethodSpec("LinearSummary", lambda: LinearSummaryMemory(budget_active=budget_active, budget_unfold=budget_unfold, summary_every=linear_summary_every)),
         "SimpleRAG": MethodSpec(
@@ -259,6 +263,10 @@ def run_llm(
         "AgentFold-Range": MethodSpec("AgentFold-Range", lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk)),
         "ProxySummary-Prove": MethodSpec(
             "ProxySummary-Prove",
+            lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk),
+        ),
+        "ProxySummary-PaperFair": MethodSpec(
+            "ProxySummary-PaperFair",
             lambda: AgentFoldRangeMemory(budget_active=budget_active, budget_unfold=budget_unfold, fold_chunk=agentfold_fold_chunk),
         ),
         "GoC": MethodSpec(
@@ -358,6 +366,16 @@ def run_llm(
                 storage_faiss_dim=faiss_dim,
             ),
         ),
+        "SimilarityOnly-PaperFair": MethodSpec(
+            "SimilarityOnly-PaperFair",
+            lambda: SimilarityOnlyMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+            ),
+        ),
         "GoC-SimSeed": MethodSpec(
             "GoC-SimSeed",
             lambda: SimilaritySeedGoCMemory(
@@ -394,8 +412,32 @@ def run_llm(
                 trace_unfold_candidates=True,
             ),
         ),
+        "GoC-Closure-Only-PaperFair": MethodSpec(
+            "GoC-Closure-Only-PaperFair",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
         "GoC-ForkOnly": MethodSpec(
             "GoC-ForkOnly",
+            lambda: SimilaritySeedGoCMemory(
+                budget_active=budget_active,
+                budget_unfold=budget_unfold,
+                unfold_k=unfold_k,
+                storage_retriever_kind=retriever_kind,
+                storage_faiss_dim=faiss_dim,
+                docid_index_mode="docid_title",
+                trace_unfold_candidates=True,
+            ),
+        ),
+        "GoC-ForkOnly-PaperFair": MethodSpec(
+            "GoC-ForkOnly-PaperFair",
             lambda: SimilaritySeedGoCMemory(
                 budget_active=budget_active,
                 budget_unfold=budget_unfold,
@@ -684,9 +726,9 @@ def run_llm(
 
         fork_deny_tuple = tuple(fork_deny_kinds) if fork_deny_kinds is not None else ("tool",)
         fork_allow_tuple = tuple(fork_allow_kinds) if fork_allow_kinds is not None else None
-        if str(ms_name) == "GoC-ForkOnly":
+        if str(ms_name) in {"GoC-ForkOnly", "GoC-ForkOnly-PaperFair"}:
             cfg = replace(cfg, adaptive_unfold=False)
-        if str(ms_name) in {"GoC-ForkOnly", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned", "GoC-Mixed-Heuristic-PaperFair", "GoC-Mixed-Learned-PaperFair"}:
+        if str(ms_name) in {"GoC-ForkOnly", "GoC-ForkOnly-PaperFair", "GoC-Mixed-Heuristic", "GoC-Mixed-Learned", "GoC-Mixed-Heuristic-PaperFair", "GoC-Mixed-Learned-PaperFair"}:
             cfg = replace(
                 cfg,
                 enable_scoped_fork=True,
@@ -711,7 +753,7 @@ def run_llm(
                 fork_allow_kinds=fork_allow_tuple,
                 fork_deny_kinds=fork_deny_tuple,
             )
-        if str(ms_name) == "GoC-Mixed-Heuristic":
+        if str(ms_name) in {"GoC-Mixed-Heuristic", "GoC-Mixed-Heuristic-PaperFair"}:
             cfg = replace(
                 cfg,
                 enable_context_controller=True,
@@ -734,7 +776,7 @@ def run_llm(
                 proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
                 proof_closure_fork_min_missing_docids=1,
             )
-        if str(ms_name) == "GoC-Mixed-Learned":
+        if str(ms_name) in {"GoC-Mixed-Learned", "GoC-Mixed-Learned-PaperFair"}:
             cfg = replace(
                 cfg,
                 enable_context_controller=True,
