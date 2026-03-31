@@ -802,6 +802,23 @@ def run_llm(
             )
             if not context_controller_model_path and str(ms_name) in {"GoC-Mixed-Learned", "GoC-Mixed-Learned-PaperFair"}:
                 raise ValueError(f"{ms_name} requires --context_controller_model_path")
+
+        # Keep all *-PaperFair variants genuinely paper-fair by disabling benchmark-aware
+        # proof-closing helpers after any method-specific overrides above. This prevents
+        # later mixed-method blocks from re-enabling repair/verify, and it also disables
+        # finish probes for baseline variants whose defaults would otherwise stay on.
+        if str(ms_name).endswith("-PaperFair"):
+            cfg = replace(
+                cfg,
+                proof_closure_guard=False,
+                proof_closure_search_planner=False,
+                proof_closure_auto_open=False,
+                proof_closure_autofinish=False,
+                proof_closure_system_hint=False,
+                proof_closure_repair=False,
+                proof_closure_fork_verify=False,
+                proof_closure_finish_probe=False,
+            )
         if str(ms_name) == "SimilarityOnly-Prove-Repair":
             cfg = replace(
                 cfg,
