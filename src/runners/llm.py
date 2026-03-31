@@ -681,8 +681,21 @@ def run_llm(
                 context_controller_policy="uncertainty_aware",
                 context_controller_trace=bool(context_controller_trace),
                 context_controller_fork_gate_mode="integrated",
-                context_controller_disable_none_action=True,
+                # Allow the controller to choose a real no-op on low-pressure steps.
+                # The earlier hard disable forced repeated unfold actions even when
+                # the controller or runtime would otherwise prefer to hold.
+                context_controller_disable_none_action=False,
                 context_controller_fallback_action="unfold",
+                proof_closure_repair=True,
+                proof_closure_repair_min_step=max(12, int(fork_min_step)),
+                proof_closure_repair_max_calls=2,
+                proof_closure_repair_allowed_slices=("support_closure", "provenance_required"),
+                proof_closure_fork_verify=True,
+                proof_closure_fork_min_step=max(12, int(fork_min_step)),
+                proof_closure_fork_late_window=8,
+                proof_closure_fork_max_calls=1,
+                proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
+                proof_closure_fork_min_missing_docids=1,
             )
         if str(ms_name) == "GoC-Mixed-Learned":
             cfg = replace(
@@ -691,9 +704,22 @@ def run_llm(
                 context_controller_policy="phase18_tree",
                 context_controller_trace=bool(context_controller_trace),
                 context_controller_fork_gate_mode="integrated",
-                context_controller_disable_none_action=True,
+                # Let the learned controller emit `none` when pressure is low.
+                context_controller_disable_none_action=False,
                 context_controller_fallback_action="unfold",
                 context_controller_model_path=str(context_controller_model_path) if context_controller_model_path else None,
+                # When the learned policy stalls, use the same support-gap recovery
+                # tools that already helped the prove/repair baselines.
+                proof_closure_repair=True,
+                proof_closure_repair_min_step=max(12, int(fork_min_step)),
+                proof_closure_repair_max_calls=2,
+                proof_closure_repair_allowed_slices=("support_closure", "provenance_required"),
+                proof_closure_fork_verify=True,
+                proof_closure_fork_min_step=max(12, int(fork_min_step)),
+                proof_closure_fork_late_window=8,
+                proof_closure_fork_max_calls=1,
+                proof_closure_fork_allowed_slices=("support_closure", "provenance_required"),
+                proof_closure_fork_min_missing_docids=1,
             )
             if not context_controller_model_path:
                 raise ValueError("GoC-Mixed-Learned requires --context_controller_model_path")
